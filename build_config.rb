@@ -6,6 +6,7 @@
 MRuby::Build.new do |conf|
   conf.toolchain :gcc
   conf.gembox 'default'
+  conf.gem File.expand_path('mrbgems/mruby-rm2', File.dirname(__FILE__))
   conf.enable_debug
   conf.enable_test
 end
@@ -34,6 +35,8 @@ MRuby::CrossBuild.new('rm2') do |conf|
   # mruby-io/mruby-dir HAL symbols (mrb_hal_io_*, mrb_hal_dir_*) undefined
   # at link time. The device is ARM Linux, so the posix port is correct.
   conf.ports :posix
+
+  conf.gem File.expand_path('mrbgems/mruby-rm2', File.dirname(__FILE__))
 
   conf.build_mrbtest_lib_only
   conf.disable_cxx_exception
