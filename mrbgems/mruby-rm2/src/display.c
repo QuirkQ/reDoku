@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -149,6 +150,7 @@ rm2_display_open(mrb_state* mrb, mrb_value klass) {
   size_t total;
   void* mem;
   rm2_display* d;
+  struct stat st;
 
   mrb_get_args(mrb, "|z", &path);
 
@@ -176,19 +178,26 @@ rm2_display_open(mrb_state* mrb, mrb_value klass) {
 
   if (read_exact(sock, &granted, sizeof(granted)) < 0)
     fail_close(mrb, sock, -1, "read Init reply");
+  if (granted.pixel_format != 0 || granted.width <= 0 || granted.height <= 0) {
+    close(sock);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "server granted an unsupported buffer format");
+  }
   fb_fd = recv_fd(sock);
   if (fb_fd < 0) {
     close(sock);
     mrb_raise(mrb, E_RUNTIME_ERROR, "server sent no framebuffer fd");
   }
-  if (granted.pixel_format != 0 || granted.width <= 0 || granted.height <= 0) {
-    close(fb_fd);
-    close(sock);
-    mrb_raise(mrb, E_RUNTIME_ERROR, "server granted an unsupported buffer format");
-  }
 
   /* RGB565 plane + 1-byte gray plane (PLAN.md §3). */
   total = (size_t)granted.width * granted.height * 3;
+  if (fstat(fb_fd, &st) < 0)
+    fail_close(mrb, fb_fd, sock, "fstat framebuffer fd");
+  if ((size_t)st.st_size < total) {
+    close(fb_fd);
+    close(sock);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "framebuffer fd smaller than granted format");
+  }
+
   mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
   close(fb_fd); /* the mapping keeps the buffer alive */
   if (mem == MAP_FAILED)
@@ -237,6 +246,47 @@ rm2_display_closed_p(mrb_state* mrb, mrb_value self) {
   return mrb_bool_value(d == NULL || d->fb == NULL);
 }
 
+static mrb_value
+rm2_display_fill_rect(mrb_state* mrb, mrb_value self) {
+  mrb_int x, y, w, h, gray;
+  rm2_display* d;
+  mrb_int x2, y2, row, col;
+  uint16_t px;
+
+  mrb_get_args(mrb, "iiiii", &x, &y, &w, &h, &gray);
+  d = get_open_display(mrb, self);
+
+  if (gray < 0 || gray > 255)
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "gray must be 0..255");
+
+  x2 = x + w; /* exclusive */
+  y2 = y + h;
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  if (x2 > d->width) x2 = d->width;
+  if (y2 > d->height) y2 = d->height;
+  if (x >= x2 || y >= y2) return self;
+
+  px = (uint16_t)((gray >> 3) | ((gray >> 2) << 5) | ((gray >> 3) << 11));
+  for (row = y; row < y2; row++) {
+    uint16_t* p = d->fb + (size_t)row * d->width + x;
+    for (col = x; col < x2; col++) *p++ = px;
+  }
+  return self;
+}
+
+static mrb_value
+rm2_display_pixel(mrb_state* mrb, mrb_value self) {
+  mrb_int x, y;
+  rm2_display* d;
+
+  mrb_get_args(mrb, "ii", &x, &y);
+  d = get_open_display(mrb, self);
+  if (x < 0 || x >= d->width || y < 0 || y >= d->height)
+    mrb_raise(mrb, E_RANGE_ERROR, "pixel out of bounds");
+  return mrb_int_value(mrb, d->fb[(size_t)y * d->width + x]);
+}
+
 void
 rm2_display_init(mrb_state* mrb, struct RClass* rm2) {
   struct RClass* cls =
@@ -247,4 +297,6 @@ rm2_display_init(mrb_state* mrb, struct RClass* rm2) {
   mrb_define_method(mrb, cls, "height", rm2_display_height, MRB_ARGS_NONE());
   mrb_define_method(mrb, cls, "close", rm2_display_close, MRB_ARGS_NONE());
   mrb_define_method(mrb, cls, "closed?", rm2_display_closed_p, MRB_ARGS_NONE());
+  mrb_define_method(mrb, cls, "fill_rect", rm2_display_fill_rect, MRB_ARGS_REQ(5));
+  mrb_define_method(mrb, cls, "pixel", rm2_display_pixel, MRB_ARGS_REQ(2));
 }
