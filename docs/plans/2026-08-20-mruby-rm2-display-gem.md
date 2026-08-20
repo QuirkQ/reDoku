@@ -380,6 +380,7 @@ define `mrb_mruby_rm2_gem_test` and links it into `mrbtest` only.
 #define _GNU_SOURCE
 #include <mruby.h>
 #include <mruby/class.h>
+#include <mruby/error.h>
 #include <mruby/string.h>
 
 #include <errno.h>
@@ -892,7 +893,10 @@ mrb_mruby_rm2_gem_final(mrb_state* mrb) {
 
 Run: `make test`
 Expected: `KO: 0`, `Crash: 0`. This also proves the cross target compiles
-the new C files (its mrbtest library builds fake_server.c for ARM).
+the new gem sources (`src/display.c`, `src/gem.c` enter its `libmruby.a`).
+The test scaffolding (`test/fake_server.c`) compiles for the host target
+only — the cross target's `build_mrbtest_lib_only` skips test-file
+generation, which is fine: the fake server exists to run host-side.
 
 - [ ] **Step 7: Commit**
 
