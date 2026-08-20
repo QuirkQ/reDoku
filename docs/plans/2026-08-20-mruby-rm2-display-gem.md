@@ -920,6 +920,48 @@ shared mapping.
 - Consumes: `rm2_display` struct, `get_open_display`, `RM2::TestServer` from Task 4.
 - Produces: `Display#fill_rect(x, y, w, h, gray) → self` (gray 0–255, rect clamped to the framebuffer, out-of-range gray raises `ArgumentError`); `Display#pixel(x, y) → Integer` (RGB565 value; out-of-bounds raises `RangeError`). Task 6+ and the game renderer rely on these exact signatures.
 
+**Carried hardening from Task 4's review** (apply during Step 3, same
+commit — behavior-preserving for all tested paths, so no new tests; the
+fake server always sends a correctly-sized fd):
+
+In `rm2_display_open`, replace the reply-handling sequence (from the
+`read_exact(sock, &granted, …)` call through the `mmap` call) with the
+following, which (a) validates the granted format *before* the blocking
+`recv_fd` so a bad grant raises instead of hanging, and (b) `fstat`s the
+received fd before mapping — mmap never validates length, and a server
+granting more than the fd holds would otherwise hand `fill_rect`/`pixel`
+a SIGBUS:
+
+```c
+  if (read_exact(sock, &granted, sizeof(granted)) < 0)
+    fail_close(mrb, sock, -1, "read Init reply");
+  if (granted.pixel_format != 0 || granted.width <= 0 || granted.height <= 0) {
+    close(sock);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "server granted an unsupported buffer format");
+  }
+  fb_fd = recv_fd(sock);
+  if (fb_fd < 0) {
+    close(sock);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "server sent no framebuffer fd");
+  }
+
+  /* RGB565 plane + 1-byte gray plane (PLAN.md §3). */
+  total = (size_t)granted.width * granted.height * 3;
+  if (fstat(fb_fd, &st) < 0)
+    fail_close(mrb, fb_fd, sock, "fstat framebuffer fd");
+  if ((size_t)st.st_size < total) {
+    close(fb_fd);
+    close(sock);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "framebuffer fd smaller than granted format");
+  }
+
+  mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+```
+
+This needs `#include <sys/stat.h>` with the other system includes and a
+`struct stat st;` declaration alongside the other locals in
+`rm2_display_open`.
+
 - [ ] **Step 1: Write the failing tests (append to test/display.rb)**
 
 ```ruby
