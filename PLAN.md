@@ -88,9 +88,10 @@ are `int32 tag` + raw little-endian struct, strict request/reply:
 | 3 | `UpdateBatchHeader{int32 count}` + count×32 B | | 1 B ack |
 | 4 | `OpenInputDevice{char path[64]; int32 flags}` | 68 B | 1 B bool, then `SCM_RIGHTS` fd if true |
 
-**Framebuffer** — mmap the received memfd, `MAP_SHARED`, size **7,886,016 B**:
-RGB565 plane 1404×1872×2 (stride = width×2, no padding), followed by a 1-byte
-gray plane we never touch but must include in the mapping size. Gray→RGB565:
+**Framebuffer** — mmap the received memfd, `MAP_SHARED`, size **7,884,864 B**
+(= 1404×1872×3): RGB565 plane 1404×1872×2 (stride = width×2, no padding),
+followed by a 1-byte-per-pixel gray plane we never touch but must include in
+the mapping size. Gray→RGB565:
 `(g>>3) | ((g>>2)<<5) | ((g>>3)<<11)`; white `0xFFFF`, black `0x0000`.
 
 **Waveforms** (`waveform = mode | 0xf000`; flags: `SYNC=1`, `FAST_DRAW=2`):
@@ -133,31 +134,39 @@ into uinput clones. This is our remote screenshot + synthetic-pen test rig (§9)
 
 ## 4. Repository layout
 
+Idiomatic mruby: everything — C shim, game logic, and the executable — is an
+mrbgem with the canonical layout (`mrbgem.rake`, `src/`, `mrblib/`, `test/`,
+`tools/<bin>/`). mruby itself is **not vendored**: like the rM2-stuff fork, it
+lives in a sibling checkout (`../mruby`, 4.0.0) mounted into the build
+container; builds run mruby's own rake with `MRUBY_CONFIG`/`MRUBY_BUILD_DIR`
+pointing back into this repo, so the mruby tree stays pristine.
+
 ```
 reDoku/
 ├── PLAN.md                  # this document
-├── Makefile                 # build / deploy / test / shell entry points
-├── docker/Dockerfile        # ghcr.io/toltec-dev/base:v4.0 + mruby sources
-├── vendor/                  # pinned mruby checkout (fetch script or submodule)
-├── shim/                    # mrbgem "mruby-rm2" (C)
-│   ├── mrbgem.rake
-│   └── src/{display.c,input.c,control.c,inotify.c,signals.c}
-├── game/                    # all Ruby
-│   ├── main.rb              # entry: game / --watch / --record modes
-│   ├── sudoku/{grid.rb,solver.rb,generator.rb,rater.rb}
-│   ├── recognizer/{recognizer.rb,templates.rb,normalize.rb}
-│   ├── ui/{layout.rb,render.rb,font.rb,screens.rb}
-│   └── app/{game.rb,input_router.rb,stroke_capture.rb,watcher.rb}
+├── Makefile                 # build / deploy / test / shell entry points (Docker wrappers)
+├── build_config.rb          # mruby build config: host (test) + rm2 (cross) targets
+├── docker/Dockerfile        # ghcr.io/toltec-dev/base:v4.0 + host toolchain + CRuby
+├── mrbgems/
+│   ├── mruby-rm2/           # C shim gem: display/input/control/inotify/signals
+│   │   ├── mrbgem.rake
+│   │   ├── src/             # C sources (display.c, later input.c, control.c, …)
+│   │   ├── mrblib/          # thin Ruby sugar (constants, kwargs wrappers)
+│   │   └── test/            # mrbtest suites + fake rm2fb server (C, gem_test hook)
+│   ├── mruby-redoku/        # game logic gem, pure Ruby (mrblib/: sudoku/,
+│   │   │                    #   recognizer/, ui/, app/; test/: unit suites)
+│   │   └── …
+│   └── mruby-bin-redoku/    # binary gem: tools/redoku/redoku.c (main), bintest/
+├── examples/                # demo scripts run with the cross-built bin/mruby
 ├── assets/
 │   ├── fonts/               # BDF bitmap fonts (public domain, e.g. Spleen)
 │   └── templates/           # digit stroke templates (generated + recorded)
 ├── tools/                   # host-side Ruby (CRuby on the Mac)
 │   ├── rmctl.rb             # screenshot / inject pen via TCP :8888
-│   ├── fontpack.rb          # BDF → packed glyph tables in game/ui/font_data.rb
+│   ├── fontpack.rb          # BDF → packed glyph tables (Ruby data)
 │   └── mkdecoy.rb           # generate decoy Sudoku PDF + xochitl metadata
 ├── device/                  # install.sh, uninstall.sh, backup.sh, systemd units, xochitl drop-in
-├── build_config/redoku.rb   # mruby cross-build config (device + host-linux targets)
-└── test/                    # mruby tests (run on host-linux mruby in Docker)
+└── build/                   # mruby build output (gitignored)
 ```
 
 ## 5. The game binary
@@ -206,16 +215,18 @@ with a timeout that doubles as the recognition-idle timer:
 
 ### mruby build
 
-mruby 4.0.0, pinned. Gembox: `default` minus unneeded bits, plus `mruby-io`,
-`mruby-pack`, `mruby-math`, `mruby-random`, `mruby-time`, `mruby-sprintf`,
-and our `mruby-rm2`. Two targets in `build_config/redoku.rb`:
+mruby 4.0.0, sibling checkout `../mruby`. The `default` gembox already
+carries everything we need (`mruby-io`, `mruby-pack`, `mruby-math`,
+`mruby-random`, `mruby-time`, `mruby-sprintf`, `mruby-errno`, plus the
+`mruby`/`mirb`/`mrbc` binaries); we add our own gems on top. Two targets in
+`build_config.rb`:
 
-- **device**: cross-compile with `/opt/x-tools/arm-remarkable-linux-gnueabihf`
+- **rm2** (device): cross-compile with `/opt/x-tools/arm-remarkable-linux-gnueabihf`
   from `ghcr.io/toltec-dev/base:v4.0` (glibc 2.35, matched to firmware
   ≥ 3.18.2.3 — dynamic libc is safe; a static-musl fallback exists if that
   ever bites)
-- **host-linux**: same gems compiled natively inside the container, used by
-  the test suite and the fake display server
+- **host** (test): same gems compiled natively inside the container; runs
+  `mrbtest` against the fake display server
 
 Game Ruby code is compiled to `.mrb` bytecode and linked into the binary.
 
@@ -325,7 +336,8 @@ Portrait, full screen 1404×1872:
   need land as commits on the fork, upstreamable later.
 - `make deploy` — scp binaries + `device/` scripts to the device, run
   `install.sh` (idempotent)
-- `make test` — Docker: host-linux mruby runs `test/` suites
+- `make test` — Docker: mruby's rake builds the host target and runs
+  `mrbtest` (every gem's `test/` suite, incl. the fake-server protocol tests)
 - `make screenshot` / `make inject STROKES=…` — `tools/rmctl.rb` against
   device port 8888
 
@@ -335,10 +347,13 @@ Portrait, full screen 1404×1872:
    classification, layout hit-testing — pure Ruby, no shim. Recognizer gets a
    corpus test: recorded strokes (captured once via `--record` during M3) must
    classify ≥ threshold accuracy; erase-gesture corpus likewise.
-2. **Protocol (Docker)**: a ~100-line fake display server in Ruby (CRuby,
-   Linux-only: unix sockets, memfd, SCM_RIGHTS) exercises the C shim:
-   init handshake, update packing (y-first inclusive corners!), input fd
-   passing, reconnect-on-EPIPE.
+2. **Protocol (Docker)**: a fake rm2fb server written in C inside
+   `mruby-rm2/test/` using mrbtest's `mrb_<gem>_gem_test` scaffolding hook
+   (the same pattern mruby-io uses to test its socket code). It forks a
+   child speaking the real wire protocol (unix socket, memfd, SCM_RIGHTS)
+   and logs received messages for byte-exact assertions: init handshake,
+   update packing (y-first inclusive corners!), input fd passing,
+   reconnect-on-EPIPE.
 3. **Integration (device)**: scripted end-to-end via TCP 8888 — inject a
    recorded "write 5 in cell (3,4)" stroke sequence, pull a screenshot,
    assert the printed 5 appears in the right cell region. Semi-automated:
