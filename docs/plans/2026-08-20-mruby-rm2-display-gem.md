@@ -177,6 +177,12 @@ MRuby::CrossBuild.new('rm2') do |conf|
 
   conf.gembox 'default'
 
+  # Cross builds select NO platform port by default (lib/mruby/build.rb
+  # effective_ports returns [] for MRuby::CrossBuild), which leaves
+  # mruby-io/mruby-dir HAL symbols (mrb_hal_io_*, mrb_hal_dir_*) undefined
+  # at link time. The device is ARM Linux, so the posix port is correct.
+  conf.ports :posix
+
   conf.build_mrbtest_lib_only
   conf.disable_cxx_exception
 end
