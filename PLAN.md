@@ -362,18 +362,45 @@ Portrait, full screen 1404×1872:
    assert the printed 5 appears in the right cell region. Semi-automated:
    run from the Mac, eyeball + a couple of pixel-region asserts.
 
-**Device install (`device/install.sh`)**:
+**Device install (`device/install.sh`)** — as built, after on-device
+discovery of 3.27.3.0 (2026-08-21):
 
-1. `backup.sh` first: tar `/home/root/.local/share/remarkable/xochitl` metadata
-   (not the full content if huge — metadata + config), original
-   `xochitl.service`, `/etc/version` → pulled back to the Mac.
-2. Copy binaries to `/home/root/redoku/`, units to `/etc/systemd/system/`
-   (`rm2fb.service` + `.socket`, later `redoku-watcher.service`).
-3. Write `/etc/systemd/system/xochitl.service.d/10-rm2fb.conf` with
-   `Environment=LD_PRELOAD=/home/root/redoku/lib/librm2fb_client_swtcon.so`.
-4. `daemon-reload`, enable + start rm2fb socket, restart xochitl.
+1. Binaries are staged to `/home/root/redoku/{bin,lib}` (survives OTA
+   updates); the two systemd files go to `/etc/systemd/system/` (wiped by
+   OTA updates — built-in cleanup). Nothing existing is modified, only
+   added: no backups needed for this phase (a backup step returns in M4,
+   which touches xochitl's document store).
+2. `rm2fb.service`: `Type=notify` (the server sd_notifies READY after its
+   sockets bind), `Before=xochitl.service`, `KillSignal=SIGINT` (its clean
+   shutdown handler ignores SIGTERM), `ExecStart` of
+   `rm2fb_server_swtcon`. **No `.socket` unit** — upstream's is stale
+   (DGRAM at the STREAM's path); the server binds its own sockets:
+   STREAM `/var/run/rm2fb.sock` (clients), DGRAM
+   `/var/run/rm2fb.control.sock` (`rm2fbctl`).
+3. Self-disarming preload: the xochitl drop-in
+   (`xochitl.service.d/10-redoku.conf`) uses
+   `EnvironmentFile=-/home/root/redoku/preload.env`, which
+   `rm2fb.service` writes on successful start (`ExecStartPost`) and
+   deletes on any stop or crash (`ExecStopPost`). The shim `exit(1)`s
+   xochitl when no server answers, and 4 fast xochitl failures make
+   `remarkable-fail.sh` **reboot the device** — with the arming file, a
+   broken server instead yields a stock xochitl boot. Reboot loops are
+   structurally impossible.
+4. The drop-in also sets `WatchdogSec=0`: 3.27.3.0 runs xochitl with
+   `WatchdogSec=60`, and rm2fb SIGSTOPs xochitl's process group while
+   another client is front — a stopped xochitl can't pet the watchdog and
+   would be killed mid-game.
+5. Preflight before touching anything: root + on-device check, firmware
+   version (`IMG_VERSION`, hard stop on drift unless `--force`), 32-bit
+   ARM ELF magic on the artifacts, swtcon's runtime deps (`/dev/fb0`,
+   `.wbf` waveform, sy7636a hwmon), and refusal if foreign xochitl
+   drop-ins or a non-reDoku `rm2fb.service` exist. Any failure after
+   preflight auto-rolls-back to stock.
 
-`uninstall.sh` reverses every step. Both scripts print what they do.
+`uninstall.sh` reverses every step (disarm first, then stop, remove,
+restart xochitl), is idempotent and safe on partial installs;
+`--purge` also removes `/home/root/redoku`. Both scripts print what
+they do.
 
 ## 10. Milestones
 
