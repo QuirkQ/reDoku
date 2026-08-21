@@ -18,6 +18,7 @@
 - **Wire protocol is fixed by the server** (PLAN.md §3): `int32` variant tag then a raw little-endian struct. `UpdateParams` corners are **y-first and inclusive**. Tags: `Init=0`, `IdleUpdate=1`, `UpdateParams=2`, `UpdateBatchHeader=3`, `OpenInputDevice=4`. Control-socket request types: `GetClients=0`, `GetFB=1`, `SwitchTo=2`, `SetLauncher=3`.
 - **One display connection per PID** — the server identifies clients by `SO_PEERCRED`. Input fds must be requested over the existing display connection, never over a second socket.
 - **Ruby is mruby, not CRuby.** Available: `mruby-io` (`File`, `IO`, `$stderr`), `mruby-dir` (`Dir.entries`), `mruby-errno`, `mruby-pack`, `mruby-sprintf`, `mruby-struct`, `mruby-time`, `mruby-math`, `mruby-random`. No stdlib beyond the default gembox, no new dependencies.
+- **mrbtest loads a gem's test files in alphabetical order and runs each `assert` block as its file loads**, not after all of them load. A helper class shared between test files must therefore live in a file that sorts *first* — hence `test/_support.rb`, whose leading underscore is load-bearing, not decoration.
 - **A gem's mrbtest state contains only that gem's *declared* dependencies** — not the whole gembox the shipped binary links. So a gem's `mrblib/` and `test/` may use core methods plus the methods of gems it declares in `mrbgem.rake`, and nothing else. Measured on this checkout: `String#chomp`, `String#upcase`, `String#empty?`, `Array#index`, `Enumerable#each_with_index`, `Hash#key?` and the `<<~` heredoc are core; `String#each_char` and `String#start_with?` come from `mruby-string-ext` and need declaring. A method that works in `bin/mruby` can still raise `NoMethodError` under `make test`.
 - **Panel geometry:** 1404×1872, RGB565 plane, gray 0=black … 255=white.
 - **Tests are mrbtest**: `assert('description') do … end` in `<gem>/test/*.rb`, run by `make test`. Every task ends with `make test` green.
@@ -70,7 +71,7 @@ mrbgems/mruby-redoku/                  # NEW: game logic, pure Ruby
 ├── mrblib/redoku/pen.rb               # raw evdev -> screen mapping
 ├── mrblib/redoku/app.rb               # event loop, ink echo, buttons
 ├── mrblib/redoku/main.rb              # Redoku.main(argv) entry point
-└── test/{support,layout,font,renderer,pen,app}.rb
+└── test/{_support,layout,font,renderer,pen,app}.rb   # _support sorts first: see Global Constraints
 
 mrbgems/mruby-bin-redoku/              # NEW: the executable
 ├── mrbgem.rake
@@ -1504,7 +1505,7 @@ git commit -m "feat(rm2): add control socket client and signal flags"
 First pure-Ruby task: the new `mruby-redoku` gem with the two leaf modules everything else draws through. Geometry follows PLAN.md §8. The font is built in rather than generated from BDF: M1 needs short UI labels, not the crisp 96 px digits that justify the `tools/fontpack.rb` pipeline, and a 5×7 table keeps the walking skeleton free of a build step it does not need yet.
 
 **Files:**
-- Create: `mrbgems/mruby-redoku/mrbgem.rake`, `mrblib/redoku/layout.rb`, `mrblib/redoku/font.rb`, `test/support.rb`, `test/layout.rb`, `test/font.rb`
+- Create: `mrbgems/mruby-redoku/mrbgem.rake`, `mrblib/redoku/layout.rb`, `mrblib/redoku/font.rb`, `test/_support.rb`, `test/layout.rb`, `test/font.rb`
 - Modify: `build_config.rb`
 
 **Interfaces:**
@@ -1516,7 +1517,7 @@ First pure-Ruby task: the new `mruby-redoku` gem with the two leaf modules every
 
 - [ ] **Step 1: Write the test support double**
 
-Create `mrbgems/mruby-redoku/test/support.rb` — a mock display that records calls instead of touching a framebuffer. `gray_at` replays the recorded rectangles (last write wins) rather than keeping 2.6M pixels:
+Create `mrbgems/mruby-redoku/test/_support.rb` — a mock display that records calls instead of touching a framebuffer. `gray_at` replays the recorded rectangles (last write wins) rather than keeping 2.6M pixels. The leading underscore in the filename is required: mrbtest runs each `assert` block as its file loads, in alphabetical order, so a helper defined in a later-sorting file is not yet defined when an earlier file's assertions run.
 
 ```ruby
 # Stand-in for RM2::Display: records draw calls so tests can assert on
