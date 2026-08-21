@@ -7,11 +7,6 @@ class FakeInput
     @hung_up = false
   end
 
-  def push(batch)
-    @batches << batch
-    self
-  end
-
   def pending_events
     @batches.shift || []
   end
@@ -25,17 +20,19 @@ class FakeInput
   end
 end
 
-# Stands in for RM2::Input.wait: says "ready" while batches remain.
+# Stands in for RM2::Input.wait: says "ready" while batches remain, and
+# records what it was asked to wait on, so tests can pin the arguments App
+# passes rather than trusting them.
 class FakeWaiter
-  attr_reader :waits
+  attr_reader :calls # one [sources, timeout_ms] per wait
 
   def initialize(sources)
     @sources = sources
-    @waits = 0
+    @calls = []
   end
 
-  def wait(_sources, _timeout_ms)
-    @waits += 1
+  def wait(sources, timeout_ms)
+    @calls << [sources, timeout_ms]
     @sources.any? { |s| !s.empty? }
   end
 end
@@ -183,6 +180,22 @@ assert('App resumes inking where the pen returns to the board') do
                 Redoku::App::INK_GRAY], d.lines[0]
 end
 
+assert('App inks the closing segment when the pen lifts in mid-motion') do
+  app, d, = new_app
+  s1 = pen_sample(300, 400, true)
+  # A real pen reports the new position and BTN_TOUCH 0 in the same packet
+  # when it is lifted while still moving, so this segment is the stroke's
+  # tail: drop it and every such stroke ends short of where the pen was.
+  s2 = pen_sample(340, 440, false)
+  p1 = screen_of(s1)
+  p2 = screen_of(s2)
+  app.handle_sample(s1)
+  app.handle_sample(s2)
+  assert_equal 1, d.lines.size
+  assert_equal [p1[0], p1[1], p2[0], p2[1], Redoku::App::INK_WIDTH,
+                Redoku::App::INK_GRAY], d.lines[0]
+end
+
 assert('a tap on Quit stops the loop') do
   app, = new_app
   assert_true app.running?
@@ -198,6 +211,16 @@ assert('a long drag across Quit is not a tap') do
   app.handle_sample(pen_sample(qx + 10, qy + 10, true))
   app.handle_sample(pen_sample(qx + qw - 10, qy + qh - 10, true))
   app.handle_sample(pen_sample(qx + qw - 10, qy + qh - 10, false))
+  assert_true app.running?
+end
+
+assert('sliding off Quit before releasing does not fire it') do
+  app, = new_app
+  qx, qy, = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(pen_sample(qx + 2, qy + 2, true))  # down on Quit
+  app.handle_sample(pen_sample(qx - 3, qy + 2, false)) # released just outside
+  # Travel is a handful of pixels, well under TAP_MAX_PATH, so only the
+  # release landing off the button can save the game here.
   assert_true app.running?
 end
 
@@ -226,8 +249,11 @@ assert('a tap on New clears the ink and repaints the board') do
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
   bx, by, bw, bh = Redoku::Layout.board_rect
+  # This GL16 board update is the evidence that the ink was cleared. The
+  # gray_at below only confirms draw_board's white fill covers that cell
+  # pixel: gray_at replays fill_rect calls, and ink is a draw_line.
   assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[0]
-  assert_equal 255, d.gray_at(300, 400) # ink gone, board white again
+  assert_equal 255, d.gray_at(300, 400)
 end
 
 assert('App#step drains every source and flushes once') do
@@ -254,7 +280,9 @@ assert('App#run paints once, then loops until Quit') do
   app, d, = new_app(batches)
   app.run
   assert_false app.running?
-  assert_equal 1, d.lines.size # the stroke still inked on its way through
+  # The stroke still inked on its way through: the drag, then the release's
+  # zero-length closing stamp.
+  assert_equal 2, d.lines.size
   # First update of the run is the full GC16 paint.
   assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
                 RM2::GC16, RM2::SYNC], d.updates[0]
@@ -280,10 +308,35 @@ assert('App#step keeps running while one live source remains') do
   dead = FakeInput.new
   live = FakeInput.new
   dead.hung_up = true
-  app = Redoku::App.new(d, [dead, live], Redoku::Renderer.new(d),
-                        FakeWaiter.new([dead, live]), FakeSignals.new)
+  waiter = FakeWaiter.new([dead, live])
+  app = Redoku::App.new(d, [dead, live], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new)
   app.step
   assert_true app.running?
+  app.step
+  assert_equal [live], waiter.calls[1][0] # and stops waiting on the dead one
+end
+
+assert('App#step waits on its current sources with the poll timeout') do
+  d = TestDisplay.new
+  input = FakeInput.new
+  waiter = FakeWaiter.new([input])
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new)
+  app.step
+  assert_equal 1, waiter.calls.size
+  assert_equal [[input], Redoku::App::POLL_MS], waiter.calls[0]
+end
+
+assert('App#step stops a loop that has no sources at all') do
+  # Nothing to wait on means nothing will ever arrive, and wait answers
+  # false immediately for an empty list, so a loop left running here would
+  # spin at 100% CPU on a battery device with only SIGTERM to stop it.
+  d = TestDisplay.new
+  app = Redoku::App.new(d, [], Redoku::Renderer.new(d), FakeWaiter.new([]),
+                        FakeSignals.new)
+  app.step
+  assert_false app.running?
 end
 
 assert('App#run stops when the process is asked to terminate') do

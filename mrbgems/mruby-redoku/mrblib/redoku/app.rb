@@ -13,6 +13,10 @@ module Redoku
     TAP_MAX_PATH = 20 # px of travel still counted as a tap, not a drag
     POLL_MS = 100     # idle wake-up; returns immediately when ink is pending
 
+    # ink_dirty is the pending ink damage as INCLUSIVE corners
+    # [x1, y1, x2, y2] — the one rect in this codebase that is not
+    # [x, y, w, h] with exclusive edges, because it grows corner by corner as
+    # segments arrive and is converted only on its way out, in flush_ink.
     attr_reader :difficulty, :ink_dirty
 
     def initialize(display, sources, renderer, waiter = RM2::Input,
@@ -24,11 +28,11 @@ module Redoku
       @signals = signals
       @difficulty = Renderer::DIFFICULTIES[0]
       @running = true
-      @mode = nil       # :ink, :button or nil — fixed at pen-down
+      @mode = nil       # :ink, :button, :none, or nil for no stroke open
       @last = nil       # previous point of this stroke
-      @start = nil      # where this stroke began
-      @path = 0         # travel so far, for tap detection
-      @ink_dirty = nil  # [x1, y1, x2, y2] pending ink damage
+      @button = nil     # the button this stroke went down on, if any
+      @travel = 0       # distance travelled so far, for tap detection
+      @ink_dirty = nil  # pending ink damage, inclusive corners
     end
 
     def running?
@@ -50,7 +54,8 @@ module Redoku
     # a single update rather than one per segment. A hung-up source (the
     # server tearing down a uinput clone, a device unbound) never becomes
     # readable again, so it is dropped; losing every source means the pen is
-    # gone and there is nothing left to play with.
+    # gone and there is nothing left to play with, so the loop ends (see
+    # drop_hung_up_sources).
     def step
       ready = @waiter.wait(@sources, POLL_MS)
       if ready
@@ -100,27 +105,52 @@ module Redoku
 
     private
 
+    # The empty check runs on every turn, not only when the list just shrank:
+    # an App handed no sources at all would otherwise spin hot forever, since
+    # wait answers false immediately for an empty list and never blocks, and
+    # nothing else in the loop would ever stop it.
     def drop_hung_up_sources
-      live = @sources.reject { |source| source.hung_up? }
-      return if live.size == @sources.size
-      @sources = live
+      @sources = @sources.reject { |source| source.hung_up? }
       @running = false if @sources.empty?
     end
 
-    # @last is kept for every stroke, not only an inking one: the travel that
-    # tells a tap from a drag has to accumulate on a button stroke too, or
-    # TAP_MAX_PATH would never bite and any drag ending on Quit would quit.
+    # @last and @travel are kept for every stroke, not only an inking one:
+    # the travel that tells a tap from a drag has to accumulate on a button
+    # stroke too, or TAP_MAX_PATH would never bite and any drag ending on
+    # Quit would quit. @button remembers what was pressed, so the release
+    # can be checked against it without asking Layout twice.
     def begin_stroke(x, y)
-      @start = [x, y]
       @last = [x, y]
-      @path = 0
-      @mode = if Layout.cell_at(x, y)
-                :ink
-              elsif Layout.button_at(x, y)
-                :button
-              else
-                :none
-              end
+      @travel = 0
+      if Layout.cell_at(x, y)
+        @button = nil
+        @mode = :ink
+      else
+        @button = Layout.button_at(x, y)
+        @mode = @button ? :button : :none
+      end
+    end
+
+    def continue_stroke(x, y)
+      @travel += (x - @last[0]).abs + (y - @last[1]).abs
+      ink_to(x, y)
+      @last = [x, y]
+    end
+
+    # The closing segment inks like any other: when the pen lifts in
+    # mid-motion the new position and BTN_TOUCH 0 arrive in the same packet,
+    # so skipping it would drop the tail of every such stroke. Usually it is
+    # zero length — a release packet repeats the last position, and the
+    # decoder drops unchanged EV_ABS values — which stamps the brush once
+    # more over pixels it already painted.
+    def end_stroke(x, y)
+      @travel += (x - @last[0]).abs + (y - @last[1]).abs
+      ink_to(x, y)
+      press(@button) if tap?(x, y)
+      @mode = nil
+      @last = nil
+      @button = nil
+      @travel = 0
     end
 
     # The board is the writing surface and the chrome is not, so a segment is
@@ -128,30 +158,23 @@ module Redoku
     # that wanders off leaves a gap and picks up again where it returns.
     # Clamping the stray endpoint to the border instead would drag it along
     # the edge and smear a line down the side of the board for as long as the
-    # pen stayed outside, which is worse than the gap. @last and @path still
-    # advance unconditionally, so travel and the stroke stay coherent across
-    # the boundary. cell_at is the board test — it answers nil off the board.
-    def continue_stroke(x, y)
-      @path += (x - @last[0]).abs + (y - @last[1]).abs
-      if @mode == :ink && Layout.cell_at(@last[0], @last[1]) &&
-         Layout.cell_at(x, y)
-        @d.draw_line(@last[0], @last[1], x, y, INK_WIDTH, INK_GRAY)
-        mark_dirty(@last[0], @last[1], x, y)
-      end
-      @last = [x, y]
+    # pen stayed outside, which is worse than the gap. cell_at is the board
+    # test — it answers nil off the board. @mode is checked first, so a
+    # button or dead stroke costs no geometry at all.
+    def ink_to(x, y)
+      return unless @mode == :ink
+      return unless Layout.cell_at(@last[0], @last[1]) && Layout.cell_at(x, y)
+      @d.draw_line(@last[0], @last[1], x, y, INK_WIDTH, INK_GRAY)
+      mark_dirty(@last[0], @last[1], x, y)
     end
 
-    def end_stroke(x, y)
-      @path += (x - @last[0]).abs + (y - @last[1]).abs
-      press(Layout.button_at(@start[0], @start[1])) if tap?
-      @mode = nil
-      @last = nil
-      @start = nil
-      @path = 0
-    end
-
-    def tap?
-      @mode == :button && @path <= TAP_MAX_PATH
+    # A tap starts and ends on the same button, having travelled little in
+    # between. Sliding off the button before releasing cancels it — the
+    # standard affordance, and one more thing that has to go right before
+    # Quit fires.
+    def tap?(x, y)
+      @mode == :button && @travel <= TAP_MAX_PATH &&
+        Layout.button_at(x, y) == @button
     end
 
     def press(button)
@@ -170,11 +193,15 @@ module Redoku
     end
 
     # New wipes the ink. Repainting and flushing board_rect alone is enough
-    # because ink cannot exist anywhere else: continue_stroke refuses any
-    # segment with an endpoint off the board, so every stamped pixel is
-    # within INK_WIDTH / 2 of a line inside board_rect — that is, inside it
-    # or on the 2 px frame overhang, which draw_board repaints black over
-    # black (see Renderer#flush_board). Widen where ink may go and this
+    # because ink cannot exist anywhere else: ink_to refuses any segment with
+    # an endpoint off the board, so every stamped pixel is within
+    # INK_WIDTH / 2 of a line inside board_rect — that is, inside it or on
+    # the Layout::BLOCK_LINE / 2 frame overhang, which draw_board repaints
+    # black over black (see Renderer#flush_board). That holds only while
+    # INK_WIDTH <= Layout::BLOCK_LINE, which is 4 and 4 today: a fatter
+    # brush reaches past the frame band onto white background, where stray
+    # ink would survive New and no host test could see it, because the mock
+    # records the update rather than rendering it. Raise INK_WIDTH and this
     # flush has to widen with it.
     def clear_ink
       @ink_dirty = nil
