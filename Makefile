@@ -1,7 +1,11 @@
 # Makefile — every target is a thin Docker wrapper; nothing runs on the Mac.
 IMAGE        := redoku-build
-MRUBY_DIR    ?= ../mruby
-RM2STUFF_DIR ?= ../rM2-stuff
+# Sibling checkouts are used when they exist; otherwise the pinned
+# versions below are cloned into tmp/ (gitignored) on first use.
+MRUBY_DIR    ?= $(firstword $(wildcard ../mruby) tmp/mruby)
+RM2STUFF_DIR ?= $(firstword $(wildcard ../rM2-stuff) tmp/rM2-stuff)
+MRUBY_REF    := 4.0.0
+RM2STUFF_REF := 451577081b9eaa3d582e50bbca8c4adfd4911b53
 PLATFORM     := linux/amd64
 
 DOCKER_RUN := docker run --rm --platform $(PLATFORM) \
@@ -16,11 +20,18 @@ RAKE := rake MRUBY_CONFIG=/work/build_config.rb MRUBY_BUILD_DIR=/work/build
 image:
 	docker build --platform $(PLATFORM) -t $(IMAGE) docker
 
-build: image
+build: image | $(MRUBY_DIR)
 	$(DOCKER_RUN) $(RAKE)
 
-test: image
+test: image | $(MRUBY_DIR)
 	$(DOCKER_RUN) $(RAKE) test
+
+tmp/mruby:
+	git clone --depth 1 --branch $(MRUBY_REF) https://github.com/mruby/mruby.git $@
+
+tmp/rM2-stuff:
+	git clone https://github.com/QuirkQ/rM2-stuff.git $@
+	git -C $@ checkout $(RM2STUFF_REF)
 
 # Cross-builds the rm2fb display server (swtcon mode) from the rM2-stuff
 # checkout, mirroring its CI: toltec toolchain via switch-arm.sh + the
@@ -31,7 +42,7 @@ test: image
 # zig + fetching ghostty — only the yaft app (which we don't build) links it.
 # The dirs must exist because cmake validates interface include paths at
 # generate time even for targets that are never built.
-rm2fb: image
+rm2fb: image | $(RM2STUFF_DIR)
 	docker run --rm --platform $(PLATFORM) \
 		-v $(CURDIR):/work \
 		-v $(abspath $(RM2STUFF_DIR)):/rm2-stuff \
@@ -52,7 +63,7 @@ rm2fb: image
 			/work/build/rm2fb/libs/rm2fb/librm2fb_client_swtcon.so \
 			/work/build/rm2fb/dist/'
 
-shell: image
+shell: image | $(MRUBY_DIR)
 	docker run --rm -it --platform $(PLATFORM) \
 		-v $(CURDIR):/work \
 		-v $(abspath $(MRUBY_DIR)):/mruby \

@@ -1,0 +1,349 @@
+#!/bin/sh
+# bin/redoku — get the rm2fb display server on and off a reMarkable 2
+# over SSH, without needing to understand the ssh/scp choreography.
+#
+# Works on Linux and macOS with the stock OpenSSH client. Run it from a
+# reDoku checkout (it needs device/install.sh and device/uninstall.sh).
+#
+# Safe by design:
+#   * Your ~/.ssh/config is IGNORED by default (ssh -F /dev/null), so a
+#     stray "Host *" rule can't break the connection — plain password
+#     auth over the USB cable just works. Have keys or aliases set up?
+#     Pass --ssh-config ~/.ssh/config.
+#   * Host keys are pinned in ~/.ssh/redoku_known_hosts: the first
+#     connection is trusted, a later mismatch fails loudly — and your
+#     real known_hosts is never touched.
+#   * Binaries are verified to be 32-bit ARM ELF before anything is
+#     copied, every copy is size-checked, and the on-device installer
+#     rolls the device back to stock if anything fails.
+#   * Nothing runs until you confirm (or pass --yes), and --dry-run
+#     shows the plan without touching anything.
+
+set -eu
+
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+REMOTE_DIR=/home/root/redoku
+KNOWN_HOSTS=$HOME/.ssh/redoku_known_hosts
+CTL_PATH=$HOME/.ssh/redoku-ctl-%C
+
+HOST=10.11.99.1
+RUSER=root
+SSH_CFG=            # empty = the safe default (-F /dev/null)
+IDENTITY=
+ARTIFACTS=
+FORCE=0
+PURGE=0
+YES=0
+DRY=0
+CMD=
+
+say()  { printf '==> %s\n' "$*"; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+bin/redoku — install/uninstall the rm2fb display server on a reMarkable 2
+
+usage:
+  bin/redoku install      copy the built binaries to the device and install
+  bin/redoku uninstall    return the device to stock (safe, idempotent)
+  bin/redoku status       show what's running on the device
+  bin/redoku shell        open an SSH shell on the device
+
+how it connects (the default just works):
+  Plug the reMarkable in over USB and run a command. You'll be asked for
+  the device's SSH password, shown on the device under
+  Settings -> Help -> Copyrights and licenses. Your ~/.ssh/config is
+  deliberately ignored so nothing in it can interfere. The connection is
+  kept open for 2 minutes, so back-to-back commands ask only once.
+
+options:
+  -H, --host HOST         device address or ssh alias   (default: 10.11.99.1)
+  -u, --user USER         ssh user                      (default: root)
+  -F, --ssh-config FILE   use YOUR ssh config (aliases, keys, etc.) instead
+                          of the safe default, e.g.:  -F ~/.ssh/config
+  -i, --identity FILE     ssh private key to use
+  -a, --artifacts DIR     where the built armv7 binaries are (install only;
+                          default: build/rm2fb/dist/ — if empty, install
+                          offers to build them with 'make rm2fb')
+      --force             install: proceed on an untested firmware version
+      --purge             uninstall: also delete /home/root/redoku
+  -y, --yes               don't ask for confirmation
+  -n, --dry-run           show what would happen without touching anything
+  -h, --help              this help
+
+safety:
+  The install only ADDs files (no kernel, boot, or partition changes),
+  binaries are checked to really be 32-bit ARM before they leave your
+  machine, and the on-device installer rolls back to stock on any
+  failure. If the device ever seems stuck, hold the power button ~10 s:
+  it reboots and a broken display server disarms itself.
+EOF
+}
+
+# ---- argument parsing -------------------------------------------------
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    install|uninstall|status|shell)
+      [ -z "$CMD" ] || die "two commands given: '$CMD' and '$1'"
+      CMD=$1 ;;
+    -H|--host)       [ $# -ge 2 ] || die "$1 needs a value"; HOST=$2; shift ;;
+    -u|--user)       [ $# -ge 2 ] || die "$1 needs a value"; RUSER=$2; shift ;;
+    -F|--ssh-config) [ $# -ge 2 ] || die "$1 needs a value"; SSH_CFG=$2; shift ;;
+    -i|--identity)   [ $# -ge 2 ] || die "$1 needs a value"; IDENTITY=$2; shift ;;
+    -a|--artifacts)  [ $# -ge 2 ] || die "$1 needs a value"; ARTIFACTS=$2; shift ;;
+    --force)         FORCE=1 ;;
+    --purge)         PURGE=1 ;;
+    -y|--yes)        YES=1 ;;
+    -n|--dry-run)    DRY=1 ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               die "unknown argument '$1' — see bin/redoku --help" ;;
+  esac
+  shift
+done
+
+[ -n "$CMD" ] || { usage; exit 1; }
+command -v ssh >/dev/null 2>&1 || die "no 'ssh' on this machine"
+[ -z "$SSH_CFG" ]  || [ -f "$SSH_CFG" ]  || die "ssh config not found: $SSH_CFG"
+[ -z "$IDENTITY" ] || [ -f "$IDENTITY" ] || die "identity file not found: $IDENTITY"
+[ -z "$ARTIFACTS" ] || [ -d "$ARTIFACTS" ] || die "artifacts directory not found: $ARTIFACTS"
+[ "$FORCE" -eq 0 ] || [ "$CMD" = install ]   || die "--force only applies to install"
+[ "$PURGE" -eq 0 ] || [ "$CMD" = uninstall ] || die "--purge only applies to uninstall"
+[ -z "$ARTIFACTS" ] || [ "$CMD" = install ]  || die "--artifacts only applies to install"
+
+TARGET=$RUSER@$HOST
+
+# ---- ssh plumbing -----------------------------------------------------
+
+# One ssh invocation with the common options prepended. ControlMaster
+# keeps the (password-authenticated) connection open and reuses it, so
+# the password is asked at most once per 2 minutes.
+ssh_run() {
+  if [ -n "$IDENTITY" ]; then set -- -i "$IDENTITY" "$@"; fi
+  if [ -n "$SSH_CFG" ]; then
+    set -- -F "$SSH_CFG" "$@"
+  else
+    set -- -F /dev/null \
+           -o UserKnownHostsFile="$KNOWN_HOSTS" \
+           -o StrictHostKeyChecking=accept-new "$@"
+  fi
+  set -- -o ConnectTimeout=15 \
+         -o ControlMaster=auto \
+         -o ControlPath="$CTL_PATH" \
+         -o ControlPersist=120 "$@"
+  ssh "$@"
+}
+
+# Run one command on the device. Stdin/stdout pass through.
+remote() {
+  if [ "$DRY" -eq 1 ]; then
+    printf '==> [dry-run] ssh %s -- %s\n' "$TARGET" "$1" >&2
+    return 0
+  fi
+  ssh_run "$TARGET" "$1"
+}
+
+connect() {
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  if [ -n "$SSH_CFG" ]; then
+    say "connecting to $TARGET (using your ssh config: $SSH_CFG)"
+  else
+    say "connecting to $TARGET — your ~/.ssh/config is intentionally ignored (see --help)"
+    say "if asked for a password: it's shown on the device under"
+    say "  Settings -> Help -> Copyrights and licenses"
+  fi
+  [ "$DRY" -eq 1 ] && return 0
+  if remote true; then return 0; fi
+  if [ -n "$SSH_CFG" ]; then
+    die "could not connect to $TARGET
+  - ssh config 'Host' blocks match the name you dial: if your config has
+    the device under an alias, pass that alias too, e.g.:
+      bin/redoku $CMD --ssh-config $SSH_CFG --host <alias>
+  - Or drop --ssh-config to use plain password auth over USB."
+  fi
+  die "could not connect to $TARGET
+  - Is the device plugged in via USB and awake? (tap the screen)
+  - Did ssh report a host-key mismatch above? That happens after a device
+    reset/reflash: delete $KNOWN_HOSTS and try again.
+  - Password auth disabled on the device? Use your own setup with:
+      --ssh-config ~/.ssh/config --host <alias>"
+}
+
+confirm() {
+  [ "$YES" -eq 1 ] && return 0
+  [ "$DRY" -eq 1 ] && return 0
+  [ -t 0 ] || die "not running in a terminal — add --yes to skip confirmation"
+  printf '%s [y/N] ' "$1"
+  read -r _ans || die "aborted — nothing was touched"
+  case $_ans in
+    y|Y|yes|Yes|YES) ;;
+    *) die "aborted — nothing was touched" ;;
+  esac
+}
+
+# Stream a file to the device over the ssh connection (no scp: modern
+# scp speaks SFTP, which the device's Dropbear may not) and verify the
+# byte count on the other side.
+push_file() { # push_file <local> <remote-path>
+  say "  sending $(basename "$1")"
+  if [ "$DRY" -eq 1 ]; then
+    printf '==> [dry-run] copy %s -> %s:%s\n' "$1" "$TARGET" "$2" >&2
+    return 0
+  fi
+  remote "cat > '$2'" < "$1"
+  _lsize=$(wc -c < "$1" | tr -d '[:space:]')
+  _rsize=$(remote "wc -c < '$2'" | tr -d '[:space:]')
+  [ "$_lsize" = "$_rsize" ] || \
+    die "copy of $1 arrived truncated ($_rsize of $_lsize bytes) — bad cable? try again"
+}
+
+# ---- finding + checking the built binaries ----------------------------
+
+_hex_at() { dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | od -An -tx1 | tr -d ' \n'; }
+
+# 32-bit ARM ELF: magic 7f 'E' 'L' 'F' + ELFCLASS32, e_machine EM_ARM.
+# Same check device/install.sh repeats on the device.
+is_arm_elf() {
+  [ "$(_hex_at "$1" 0 5)" = "7f454c4601" ] && [ "$(_hex_at "$1" 18 2)" = "2800" ]
+}
+
+# Print the unique 32-bit-ARM build of $2 under directory $1.
+# Returns 1 when there is none, 2 when there are several.
+pick_in() {
+  [ -d "$1" ] || return 1
+  _match=
+  _count=0
+  while IFS= read -r _f; do
+    [ -n "$_f" ] || continue
+    is_arm_elf "$_f" || continue
+    _count=$((_count + 1))
+    if [ "$_count" -eq 1 ]; then
+      _match=$_f
+    else
+      [ "$_count" -eq 2 ] && \
+        printf 'ERROR: several ARM builds of %s under %s:\n  %s\n' "$2" "$1" "$_match" >&2
+      printf '  %s\n' "$_f" >&2
+    fi
+  done <<EOF
+$(find "$1" -type f -name "$2" 2>/dev/null)
+EOF
+  if [ "$_count" -eq 0 ]; then return 1; fi
+  if [ "$_count" -gt 1 ]; then
+    printf 'pass the right one with:  --artifacts DIR\n' >&2
+    return 2
+  fi
+  printf '%s\n' "$_match"
+}
+
+pick_artifact() { # $1 = filename; prints the path
+  pick_in "${ARTIFACTS:-$REPO/build/rm2fb/dist}" "$1"
+}
+
+# ---- commands ----------------------------------------------------------
+
+cmd_install() {
+  [ -f "$REPO/device/install.sh" ] && [ -f "$REPO/device/uninstall.sh" ] || \
+    die "device/install.sh not found next to me — run bin/redoku from a reDoku checkout"
+
+  say "looking for the built armv7 binaries in ${ARTIFACTS:-build/rm2fb/dist}"
+  SERVER=$(pick_artifact rm2fb_server_swtcon) || SERVER=
+  CLIENT=$(pick_artifact librm2fb_client_swtcon.so) || CLIENT=
+  if [ -z "$SERVER" ] || [ -z "$CLIENT" ]; then
+    [ -z "$ARTIFACTS" ] || \
+      die "no ARM builds of rm2fb_server_swtcon / librm2fb_client_swtcon.so under $ARTIFACTS"
+    say "not built yet — 'make rm2fb' cross-compiles them in Docker"
+    say "  (first run clones the pinned rM2-stuff into tmp/ and can take a while)"
+    confirm "Run 'make rm2fb' now?"
+    [ "$DRY" -eq 0 ] || die "dry-run: would run 'make rm2fb' — run that first, then retry"
+    command -v docker >/dev/null 2>&1 || \
+      die "docker not found — 'make rm2fb' needs it (see README prerequisites)"
+    make -C "$REPO" rm2fb || die "'make rm2fb' failed (its output above says why)"
+    SERVER=$(pick_artifact rm2fb_server_swtcon) || \
+      die "build finished but rm2fb_server_swtcon is not in build/rm2fb/dist"
+    CLIENT=$(pick_artifact librm2fb_client_swtcon.so) || \
+      die "build finished but librm2fb_client_swtcon.so is not in build/rm2fb/dist"
+  fi
+  CTLBIN=$(pick_artifact rm2fbctl) || CTLBIN=
+
+  say "this will:"
+  say "  device : $TARGET"
+  say "  server : $SERVER"
+  say "  client : $CLIENT"
+  if [ -n "$CTLBIN" ]; then
+    say "  ctl    : $CTLBIN"
+  else
+    say "  ctl    : rm2fbctl not found — optional, continuing without it"
+  fi
+  say "  action : copy to $REMOTE_DIR/ and run the on-device installer"
+  say "           (adds files only; any failure rolls back to stock)"
+  confirm "Install on the device?"
+
+  connect
+  say "copying files to $REMOTE_DIR"
+  remote "mkdir -p $REMOTE_DIR/bin $REMOTE_DIR/lib"
+  push_file "$SERVER" "$REMOTE_DIR/bin/rm2fb_server_swtcon"
+  push_file "$CLIENT" "$REMOTE_DIR/lib/librm2fb_client_swtcon.so"
+  [ -z "$CTLBIN" ] || push_file "$CTLBIN" "$REMOTE_DIR/bin/rm2fbctl"
+  push_file "$REPO/device/install.sh" "$REMOTE_DIR/install.sh"
+  push_file "$REPO/device/uninstall.sh" "$REMOTE_DIR/uninstall.sh"
+  remote "chmod +x $REMOTE_DIR/bin/"'*'
+
+  _force_arg=
+  [ "$FORCE" -eq 0 ] || _force_arg=' --force'
+  say "running the on-device installer (~30 s, includes a 15 s verification wait)"
+  if remote "sh $REMOTE_DIR/install.sh$_force_arg"; then
+    say "all done — xochitl is now running through the display server"
+    say "  check it   : bin/redoku status"
+    say "  banished it: bin/redoku uninstall"
+  else
+    die "the on-device installer failed and rolled the device back to stock
+  (its output above says why; the device is safe and unchanged)"
+  fi
+}
+
+cmd_uninstall() {
+  [ -f "$REPO/device/uninstall.sh" ] || \
+    die "device/uninstall.sh not found next to me — run bin/redoku from a reDoku checkout"
+
+  say "this returns the device to stock (idempotent, safe on partial installs)"
+  if [ "$PURGE" -eq 1 ]; then
+    say "  --purge: ALSO deletes $REMOTE_DIR entirely (binaries, scripts, everything)"
+  fi
+  confirm "Return the device to stock?"
+
+  connect
+  say "copying the uninstaller"
+  remote "mkdir -p $REMOTE_DIR"
+  push_file "$REPO/device/uninstall.sh" "$REMOTE_DIR/uninstall.sh"
+
+  _purge_arg=
+  [ "$PURGE" -eq 0 ] || _purge_arg=' --purge'
+  say "running the on-device uninstaller"
+  remote "sh $REMOTE_DIR/uninstall.sh$_purge_arg"
+  say "done — the device is back to stock"
+}
+
+cmd_status() {
+  connect
+  remote 'printf "firmware : %s\n" "$(sed -n "s/^IMG_VERSION=//p" /etc/os-release | tr -d \")"
+if [ -f /etc/systemd/system/rm2fb.service ]; then printf "installed: yes\n"; else printf "installed: no\n"; fi
+printf "rm2fb    : %s\n" "$(systemctl is-active rm2fb.service 2>/dev/null || true)"
+printf "xochitl  : %s\n" "$(systemctl is-active xochitl.service 2>/dev/null || true)"
+if [ -S /var/run/rm2fb.sock ]; then printf "socket   : present\n"; else printf "socket   : absent\n"; fi
+if [ -f /home/root/redoku/preload.env ]; then printf "preload  : armed (xochitl draws through rm2fb)\n"; else printf "preload  : disarmed (xochitl is stock)\n"; fi'
+}
+
+cmd_shell() {
+  connect
+  [ "$DRY" -eq 1 ] && return 0
+  ssh_run "$TARGET"
+}
+
+case $CMD in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  status)    cmd_status ;;
+  shell)     cmd_shell ;;
+esac

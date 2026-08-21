@@ -11,35 +11,52 @@ for the full design and roadmap.
 ## Prerequisites
 
 - Docker (all builds run in a container; nothing is installed on your machine)
-- An [mruby](https://github.com/mruby/mruby) checkout next to this repo —
-  the build expects `../mruby` by default (override with
-  `make MRUBY_DIR=/path/to/mruby …`):
+- A reMarkable 2 connected via USB; its SSH password is shown on the
+  device under Settings → Help → Copyrights and licenses
 
-  ```bash
-  git clone --branch 4.0.0 https://github.com/mruby/mruby.git ../mruby
-  ```
-
-- Only for running on the device later (Milestone 0, not needed for
-  `make build`/`make test`): the
-  [rM2-stuff](https://github.com/timower/rM2-stuff) display server as
-  `../rM2-stuff`
-- A reMarkable 2 reachable over SSH: connect it via USB and use
-  `root@10.11.99.1`; the password is shown on the device under
-  Settings → Help → Copyrights and licenses
+The source dependencies take care of themselves: `make` uses an
+[mruby](https://github.com/mruby/mruby) or
+[rM2-stuff](https://github.com/QuirkQ/rM2-stuff) checkout sitting next
+to this repo when one exists (override with `MRUBY_DIR=` /
+`RM2STUFF_DIR=`), and otherwise clones the pinned versions into `tmp/`
+(gitignored) on first use.
 
 ## Build & test
 
 ```bash
 make test    # host build + full mrbtest suite (in Docker)
 make build   # also cross-compiles armv7 binaries into build/rm2/bin/
+make rm2fb   # cross-compiles the display server into build/rm2fb/dist/
 ```
 
 ## Installing the display server on the device
 
 Drawing goes through the
 [rm2fb display server](https://github.com/timower/rM2-stuff) (swtcon
-mode), which must run on the device. `device/install.sh` sets it up;
-`device/uninstall.sh` returns the device to stock.
+mode), which must run on the device. `bin/redoku` does the whole dance —
+plug the device in over USB and run:
+
+```bash
+bin/redoku install
+```
+
+It takes the cross-built binaries from `build/rm2fb/dist/` (offering to
+run `make rm2fb` first when they aren't built yet), double-checks they
+really are 32-bit ARM, copies everything over, and runs
+`device/install.sh` on the device. You'll be asked once for the device's
+SSH password. Your `~/.ssh/config` is deliberately ignored so nothing in
+it can interfere; if you have keys or aliases set up, add
+`--ssh-config ~/.ssh/config`. See `bin/redoku --help` for all options
+(`--dry-run` shows the plan without touching anything).
+
+Back to stock (add `--purge` to also delete `/home/root/redoku`):
+
+```bash
+bin/redoku uninstall
+```
+
+`bin/redoku status` shows what's running on the device, and
+`bin/redoku shell` drops you into an SSH session there.
 
 The install only *adds* files — binaries under `/home/root/redoku/`, two
 systemd files under `/etc/systemd/system/`. No kernel, boot, or
@@ -49,26 +66,6 @@ env file that exists only while the server is running, so a broken
 server means xochitl starts stock instead of crash-looping; install
 failures roll back automatically, and a firmware update wipes the
 systemd files, reverting to stock by itself.
-
-`make rm2fb` cross-builds the binaries in Docker (needs the
-[rM2-stuff](https://github.com/timower/rM2-stuff) checkout as
-`../rM2-stuff`, override with `make RM2STUFF_DIR=… rm2fb`) into
-`build/rm2fb/dist/`. Then deploy and install:
-
-```bash
-make rm2fb
-ssh root@10.11.99.1 'mkdir -p /home/root/redoku/bin /home/root/redoku/lib'
-scp build/rm2fb/dist/rm2fb_server_swtcon build/rm2fb/dist/rm2fbctl root@10.11.99.1:/home/root/redoku/bin/
-scp build/rm2fb/dist/librm2fb_client_swtcon.so root@10.11.99.1:/home/root/redoku/lib/
-scp device/install.sh device/uninstall.sh root@10.11.99.1:/home/root/redoku/
-ssh root@10.11.99.1 'sh /home/root/redoku/install.sh'
-```
-
-Back to stock (add `--purge` to also delete `/home/root/redoku`):
-
-```bash
-ssh root@10.11.99.1 'sh /home/root/redoku/uninstall.sh'
-```
 
 If the device seems unresponsive, hold the power button ~10 s to force a
 reboot — a broken display server disarms itself and xochitl boots stock.
@@ -96,6 +93,7 @@ ssh -t root@10.11.99.1 /home/root/mirb    # try: RM2::GC16  =>  61442
 ## Repository layout
 
 - `mrbgems/mruby-rm2/` — the display-client gem ([its README](mrbgems/mruby-rm2/README.md) documents the API)
+- `bin/redoku` — installs/uninstalls the display server on the device over SSH
 - `device/` — install/uninstall scripts for the rm2fb display server (run on the device)
 - `examples/` — demo scripts run with the cross-built `bin/mruby`
 - `build_config.rb`, `docker/`, `Makefile` — the build pipeline
