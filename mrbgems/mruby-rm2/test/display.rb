@@ -123,3 +123,91 @@ assert('update on an empty rect is a no-op') do
     RM2::TestServer.stop
   end
 end
+
+assert('draw_line draws a horizontal run of pixels') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    d.draw_line(10, 50, 14, 50, 1, 255)
+    assert_equal 0xFFFF, d.pixel(10, 50)
+    assert_equal 0xFFFF, d.pixel(12, 50)
+    assert_equal 0xFFFF, d.pixel(14, 50)
+    assert_equal 0x0000, d.pixel(15, 50) # endpoint is inclusive, no further
+    assert_equal 0x0000, d.pixel(10, 51) # width 1 stays on one row
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line draws a diagonal and a single point') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    d.draw_line(100, 100, 103, 103, 1, 255)
+    assert_equal 0xFFFF, d.pixel(100, 100)
+    assert_equal 0xFFFF, d.pixel(101, 101)
+    assert_equal 0xFFFF, d.pixel(102, 102)
+    assert_equal 0xFFFF, d.pixel(103, 103)
+    d.draw_line(200, 200, 200, 200, 1, 255) # degenerate: one stamp
+    assert_equal 0xFFFF, d.pixel(200, 200)
+    assert_equal 0x0000, d.pixel(201, 200)
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line width stamps a square brush centred on the line') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    d.draw_line(300, 300, 305, 300, 3, 255)
+    assert_equal 0xFFFF, d.pixel(300, 299) # one row above
+    assert_equal 0xFFFF, d.pixel(300, 300)
+    assert_equal 0xFFFF, d.pixel(300, 301) # one row below
+    assert_equal 0x0000, d.pixel(300, 302) # brush is 3 tall, not 4
+    assert_equal 0xFFFF, d.pixel(299, 300) # brush extends left of the start
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line clips to the panel instead of writing out of bounds') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    d.draw_line(-20, 5, 20, 5, 1, 255) # starts off the left edge
+    assert_equal 0xFFFF, d.pixel(0, 5)
+    assert_equal 0xFFFF, d.pixel(20, 5)
+    d.draw_line(1400, 1870, 1420, 1890, 5, 255) # runs off the far corner
+    assert_equal 0xFFFF, d.pixel(1403, 1871)
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line validates its arguments') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 0, 255) }   # width < 1
+    assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 1, 256) }   # gray > 255
+    assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 1, -1) }    # gray < 0
+    assert_raise(ArgumentError) { d.draw_line(0, 0, 200000, 0, 1, 0) } # span too large
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('fill_rect and update reject negative extents') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    assert_raise(ArgumentError) { d.fill_rect(10, 10, -5, 5, 0) }
+    assert_raise(ArgumentError) { d.fill_rect(10, 10, 5, -5, 0) }
+    assert_raise(ArgumentError) { d.update(10, 10, -5, 5) }
+    assert_raise(ArgumentError) { d.update(10, 10, 5, -5) }
+    assert_true d.update(10, 10, 0, 5) # zero extent stays a silent no-op
+  ensure
+    RM2::TestServer.stop
+  end
+end

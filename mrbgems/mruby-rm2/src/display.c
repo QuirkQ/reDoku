@@ -40,6 +40,10 @@ typedef struct {
   int32_t extra_mode;
 } update_params; /* 32 bytes on both target ABIs */
 
+/* Wire structs must be byte-identical on host x86-64 and armv7hf. */
+typedef char rm2_init_msg_size_check[(sizeof(init_msg) == 16) ? 1 : -1];
+typedef char rm2_update_params_size_check[(sizeof(update_params) == 32) ? 1 : -1];
+
 typedef struct {
   int sock;
   uint16_t* fb;    /* RGB565 plane; NULL once closed */
@@ -123,7 +127,8 @@ recv_fd(int sock) {
   if (n <= 0) return -1;
 
   c = CMSG_FIRSTHDR(&msg);
-  if (c == NULL || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+  if (c == NULL || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS ||
+      c->cmsg_len != CMSG_LEN(sizeof(int)) || (msg.msg_flags & MSG_CTRUNC) != 0)
     return -1;
   memcpy(&fd, CMSG_DATA(c), sizeof(fd));
   return fd;
@@ -254,6 +259,30 @@ rm2_display_closed_p(mrb_state* mrb, mrb_value self) {
   return mrb_bool_value(d == NULL || d->fb == NULL);
 }
 
+/* Gray 0..255 -> RGB565 (PLAN.md §3). */
+static uint16_t
+gray565(mrb_int gray) {
+  return (uint16_t)((gray >> 3) | ((gray >> 2) << 5) | ((gray >> 3) << 11));
+}
+
+/* One brush stamp: a `width`-sided square centred on (x, y), clipped. */
+static void
+stamp(rm2_display* d, mrb_int x, mrb_int y, mrb_int width, uint16_t px) {
+  mrb_int half = width / 2;
+  mrb_int x1 = x - half, y1 = y - half;
+  mrb_int x2 = x1 + width, y2 = y1 + width;
+  mrb_int row, col;
+
+  if (x1 < 0) x1 = 0;
+  if (y1 < 0) y1 = 0;
+  if (x2 > d->width) x2 = d->width;
+  if (y2 > d->height) y2 = d->height;
+  for (row = y1; row < y2; row++) {
+    uint16_t* p = d->fb + (size_t)row * d->width + x1;
+    for (col = x1; col < x2; col++) *p++ = px;
+  }
+}
+
 static mrb_value
 rm2_display_fill_rect(mrb_state* mrb, mrb_value self) {
   mrb_int x, y, w, h, gray;
@@ -266,6 +295,8 @@ rm2_display_fill_rect(mrb_state* mrb, mrb_value self) {
 
   if (gray < 0 || gray > 255)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "gray must be 0..255");
+  if (w < 0 || h < 0)
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "width and height must be >= 0");
 
   x2 = x + w; /* exclusive */
   y2 = y + h;
@@ -275,7 +306,7 @@ rm2_display_fill_rect(mrb_state* mrb, mrb_value self) {
   if (y2 > d->height) y2 = d->height;
   if (x >= x2 || y >= y2) return self;
 
-  px = (uint16_t)((gray >> 3) | ((gray >> 2) << 5) | ((gray >> 3) << 11));
+  px = gray565(gray);
   for (row = y; row < y2; row++) {
     uint16_t* p = d->fb + (size_t)row * d->width + x;
     for (col = x; col < x2; col++) *p++ = px;
@@ -295,6 +326,48 @@ rm2_display_pixel(mrb_state* mrb, mrb_value self) {
   return mrb_int_value(mrb, d->fb[(size_t)y * d->width + x]);
 }
 
+#define RM2_MAX_SPAN 65535
+
+static mrb_value
+rm2_display_draw_line(mrb_state* mrb, mrb_value self) {
+  mrb_int x1, y1, x2, y2, width, gray;
+  rm2_display* d;
+  mrb_int dx, dy, sx, sy, err, e2;
+  uint16_t px;
+
+  mrb_get_args(mrb, "iiiiii", &x1, &y1, &x2, &y2, &width, &gray);
+  d = get_open_display(mrb, self);
+
+  if (gray < 0 || gray > 255)
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "gray must be 0..255");
+  if (width < 1)
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "width must be >= 1");
+
+  dx = x2 > x1 ? x2 - x1 : x1 - x2;
+  dy = y2 > y1 ? y2 - y1 : y1 - y2;
+  if (dx > RM2_MAX_SPAN || dy > RM2_MAX_SPAN)
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "line span too large");
+
+  px = gray565(gray);
+  sx = x1 < x2 ? 1 : -1;
+  sy = y1 < y2 ? 1 : -1;
+  err = dx - dy;
+  for (;;) {
+    stamp(d, x1, y1, width, px);
+    if (x1 == x2 && y1 == y2) break;
+    e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      x1 += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      y1 += sy;
+    }
+  }
+  return self;
+}
+
 static mrb_value
 rm2_display_update_raw(mrb_state* mrb, mrb_value self) {
   mrb_int x, y, w, h, waveform, flags;
@@ -306,6 +379,9 @@ rm2_display_update_raw(mrb_state* mrb, mrb_value self) {
 
   mrb_get_args(mrb, "iiiiii", &x, &y, &w, &h, &waveform, &flags);
   d = get_open_display(mrb, self);
+
+  if (w < 0 || h < 0)
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "width and height must be >= 0");
 
   x2 = x + w; /* exclusive */
   y2 = y + h;
@@ -344,5 +420,6 @@ rm2_display_init(mrb_state* mrb, struct RClass* rm2) {
   mrb_define_method(mrb, cls, "closed?", rm2_display_closed_p, MRB_ARGS_NONE());
   mrb_define_method(mrb, cls, "fill_rect", rm2_display_fill_rect, MRB_ARGS_REQ(5));
   mrb_define_method(mrb, cls, "pixel", rm2_display_pixel, MRB_ARGS_REQ(2));
+  mrb_define_method(mrb, cls, "draw_line", rm2_display_draw_line, MRB_ARGS_REQ(6));
   mrb_define_method(mrb, cls, "update_raw", rm2_display_update_raw, MRB_ARGS_REQ(6));
 }
