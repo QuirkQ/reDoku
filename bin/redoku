@@ -185,14 +185,24 @@ confirm() {
 
 # Stream a file to the device over the ssh connection (no scp: modern
 # scp speaks SFTP, which the device's Dropbear may not) and verify the
-# byte count on the other side.
+# byte count on the other side. Unlink before writing: overwriting a
+# RUNNING binary fails with ETXTBSY, and truncating a mapped .so can
+# crash its user — a fresh inode has neither problem, so reinstalling
+# over a live install just works.
 push_file() { # push_file <local> <remote-path>
+  # Belt and braces: every remote path is a hardcoded literal under
+  # $REMOTE_DIR — refuse anything else so the rm -f below can never
+  # reach outside the redoku directory.
+  case $2 in
+    "$REMOTE_DIR"/?*) ;;
+    *) die "internal error: refusing to write outside $REMOTE_DIR: '$2'" ;;
+  esac
   say "  sending $(basename "$1")"
   if [ "$DRY" -eq 1 ]; then
     printf '==> [dry-run] copy %s -> %s:%s\n' "$1" "$TARGET" "$2" >&2
     return 0
   fi
-  remote "cat > '$2'" < "$1"
+  remote "rm -f '$2' && cat > '$2'" < "$1"
   _lsize=$(wc -c < "$1" | tr -d '[:space:]')
   _rsize=$(remote "wc -c < '$2'" | tr -d '[:space:]')
   [ "$_lsize" = "$_rsize" ] || \
