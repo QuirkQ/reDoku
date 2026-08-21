@@ -7,7 +7,10 @@ PDF, a game launches. It generates puzzles, you play by literally writing
 digits into cells with the pen, and your scribbles snap to printed digits.
 Quit, and you're back in the stock UI exactly where you left it.
 
-**Status:** design approved 2026-08-20. Milestone 0 not yet started.
+**Status:** design approved 2026-08-20. Build pipeline + `mruby-rm2` display
+gem complete 2026-08-21 (host tests green against a fake rm2fb server;
+cross-built mruby verified running on the device). Next: Milestone 0 —
+install the display server on-device.
 
 ---
 
