@@ -11,4 +11,12 @@ module RM2
   # UpdateParams.flags bits.
   SYNC      = 1
   FAST_DRAW = 2
+
+  class Display
+    # Flush a damage rectangle to the panel. Returns the server's ack
+    # (false means we are not the front client and the update was dropped).
+    def update(x, y, w, h, waveform: GL16, flags: 0)
+      update_raw(x, y, w, h, waveform, flags)
+    end
+  end
 end

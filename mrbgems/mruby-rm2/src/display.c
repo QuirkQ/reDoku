@@ -33,6 +33,14 @@ typedef struct {
 } init_msg; /* 16 bytes on both target ABIs */
 
 typedef struct {
+  int32_t y1, x1, y2, x2; /* inclusive corners, y first */
+  int32_t flags;
+  int32_t waveform;
+  float temperature;
+  int32_t extra_mode;
+} update_params; /* 32 bytes on both target ABIs */
+
+typedef struct {
   int sock;
   uint16_t* fb;    /* RGB565 plane; NULL once closed */
   size_t map_size; /* full mapping incl. the trailing gray plane */
@@ -287,6 +295,43 @@ rm2_display_pixel(mrb_state* mrb, mrb_value self) {
   return mrb_int_value(mrb, d->fb[(size_t)y * d->width + x]);
 }
 
+static mrb_value
+rm2_display_update_raw(mrb_state* mrb, mrb_value self) {
+  mrb_int x, y, w, h, waveform, flags;
+  rm2_display* d;
+  mrb_int x2, y2;
+  int32_t tag = TAG_UPDATE;
+  update_params up;
+  uint8_t ack;
+
+  mrb_get_args(mrb, "iiiiii", &x, &y, &w, &h, &waveform, &flags);
+  d = get_open_display(mrb, self);
+
+  x2 = x + w; /* exclusive */
+  y2 = y + h;
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  if (x2 > d->width) x2 = d->width;
+  if (y2 > d->height) y2 = d->height;
+  if (x >= x2 || y >= y2) return mrb_true_value(); /* nothing to flush */
+
+  up.y1 = (int32_t)y;
+  up.x1 = (int32_t)x;
+  up.y2 = (int32_t)(y2 - 1); /* inclusive corners */
+  up.x2 = (int32_t)(x2 - 1);
+  up.flags = (int32_t)flags;
+  up.waveform = (int32_t)waveform;
+  up.temperature = 0.0f;
+  up.extra_mode = 0;
+
+  if (write_exact(d->sock, &tag, sizeof(tag)) < 0 ||
+      write_exact(d->sock, &up, sizeof(up)) < 0)
+    mrb_sys_fail(mrb, "send update");
+  if (read_exact(d->sock, &ack, sizeof(ack)) < 0)
+    mrb_sys_fail(mrb, "read update ack");
+  return mrb_bool_value(ack != 0);
+}
+
 void
 rm2_display_init(mrb_state* mrb, struct RClass* rm2) {
   struct RClass* cls =
@@ -299,4 +344,5 @@ rm2_display_init(mrb_state* mrb, struct RClass* rm2) {
   mrb_define_method(mrb, cls, "closed?", rm2_display_closed_p, MRB_ARGS_NONE());
   mrb_define_method(mrb, cls, "fill_rect", rm2_display_fill_rect, MRB_ARGS_REQ(5));
   mrb_define_method(mrb, cls, "pixel", rm2_display_pixel, MRB_ARGS_REQ(2));
+  mrb_define_method(mrb, cls, "update_raw", rm2_display_update_raw, MRB_ARGS_REQ(6));
 }
