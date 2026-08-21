@@ -2396,7 +2396,12 @@ end
 
 assert('App#run paints once, then loops until Quit') do
   qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
-  batches = [[pen_sample(300, 400, true), pen_sample(340, 440, true)],
+  # The ink stroke MUST be released before the Quit tap. Without the pen-up,
+  # the Quit samples are read as the still-open ink stroke dragging on,
+  # nothing ever sets @running = false, and the waiter then returns false
+  # forever — `make test` hangs rather than fails.
+  batches = [[pen_sample(300, 400, true), pen_sample(340, 440, true),
+              pen_sample(340, 440, false)],
              [pen_sample(qx + qw / 2, qy + qh / 2, true)],
              [pen_sample(qx + qw / 2, qy + qh / 2, false)]]
   app, d, = new_app(batches)
@@ -2601,26 +2606,35 @@ module Redoku
     def begin_stroke(x, y)
       @start = [x, y]
       @path = 0
-      if Layout.cell_at(x, y)
-        @mode = :ink
-        @last = [x, y]
-      elsif Layout.button_at(x, y)
-        @mode = :button
-      else
-        @mode = :none
-      end
+      @last = [x, y] # every mode tracks travel, not just :ink
+      @mode = if Layout.cell_at(x, y)
+                :ink
+              elsif Layout.button_at(x, y)
+                :button
+              else
+                :none
+              end
     end
 
+    # Travel accumulates for every stroke, whatever its mode — tap detection
+    # depends on it, and gating this on :ink left TAP_MAX_PATH dead so that
+    # any drag ending on a button counted as a tap. Ink itself is drawn only
+    # while both ends of the segment are on the board: the board is the
+    # writing surface, and ink on the chrome would survive a New tap, which
+    # repaints board_rect alone.
     def continue_stroke(x, y)
-      @path += (x - @last[0]).abs + (y - @last[1]).abs if @last
-      return unless @mode == :ink
-      @d.draw_line(@last[0], @last[1], x, y, INK_WIDTH, INK_GRAY)
-      mark_dirty(@last[0], @last[1], x, y)
+      prev = @last
       @last = [x, y]
+      @path += (x - prev[0]).abs + (y - prev[1]).abs if prev
+      return unless @mode == :ink
+      return unless prev && Layout.cell_at(prev[0], prev[1]) && Layout.cell_at(x, y)
+      @d.draw_line(prev[0], prev[1], x, y, INK_WIDTH, INK_GRAY)
+      mark_dirty(prev[0], prev[1], x, y)
     end
 
     def end_stroke(x, y)
       @path += (x - @last[0]).abs + (y - @last[1]).abs if @last
+      # tap? reads @mode and @path, so both must be current before it runs.
       press(Layout.button_at(@start[0], @start[1])) if tap?(x, y)
       @mode = nil
       @last = nil
