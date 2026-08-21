@@ -14,7 +14,9 @@ for the full design and roadmap.
 - Sibling checkouts next to this repo:
   - [`../mruby`](https://github.com/mruby/mruby) at 4.0.0
   - [`../rM2-stuff`](https://github.com/QuirkQ/rM2-stuff) (display server, needed on-device — see below)
-- A reMarkable 2 reachable over SSH (e.g. `ssh remarkable` via USB at `10.11.99.1`)
+- A reMarkable 2 reachable over SSH: connect it via USB and use
+  `root@10.11.99.1`; the password is shown on the device under
+  Settings → Help → Copyrights and licenses
 
 ## Build & test
 
@@ -35,8 +37,8 @@ Once you have SSH access:
 
 ```bash
 make build
-scp build/rm2/bin/mruby examples/checkerboard.rb remarkable:/home/root/
-ssh -t remarkable '/home/root/mruby /home/root/checkerboard.rb'
+scp build/rm2/bin/mruby examples/checkerboard.rb root@10.11.99.1:/home/root/
+ssh -t root@10.11.99.1 '/home/root/mruby /home/root/checkerboard.rb'
 ```
 
 With the display server running you'll see a full-screen checkerboard
@@ -44,8 +46,8 @@ flash onto the e-ink panel. Without any display server you can still
 sanity-check the toolchain with the REPL:
 
 ```bash
-scp build/rm2/bin/mirb remarkable:/home/root/
-ssh -t remarkable /home/root/mirb    # try: RM2::GC16  =>  61442
+scp build/rm2/bin/mirb root@10.11.99.1:/home/root/
+ssh -t root@10.11.99.1 /home/root/mirb    # try: RM2::GC16  =>  61442
 ```
 
 ## Repository layout
