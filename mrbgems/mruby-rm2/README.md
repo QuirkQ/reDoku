@@ -38,7 +38,17 @@ node, TCP-injected ones to the clone), so a client that wants both opens
 every match. Input fds are requested over the display connection — the
 server allows one socket per PID. A sample is `[x, y, pressure, tools]` in
 raw device coordinates, one per `SYN_REPORT`; `tools` is a bitmask of
-`RM2::Input::PEN`, `RUBBER`, `TOUCH`.
+`RM2::Input::PEN`, `RUBBER` and `TOUCH`, where `TOUCH` is evdev's
+`BTN_TOUCH` — the pen tip pressed against the glass, not a finger. Only
+`ABS_X`, `ABS_Y` and `ABS_PRESSURE` are decoded, so the `pt_mt` touchscreen
+(which reports `ABS_MT_POSITION_X`/`_Y` instead) would yield samples with
+all-zero coordinates until multitouch axes are added.
+
+An input can hang up while still open — rm2fb restarting tears down the
+uinput clones, and the kernel then reports `POLLHUP` and EOF. `wait` and
+`pending_events` both set `#hung_up?` when they see it, and a hung-up input
+never reports readable again, so close it and drop it from the list you pass
+to `wait`. `#closed?` stays false: the fd is still yours to close.
 
 Tests run against a fake protocol server (`test/fake_server.c`, forked by
 mrbtest via the `mrb_mruby_rm2_gem_test` hook) — see `test/display.rb`.

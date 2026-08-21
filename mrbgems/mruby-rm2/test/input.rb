@@ -75,6 +75,126 @@ assert('RM2::Input tracks tool and touch release in the tools bitmask') do
   end
 end
 
+assert('RM2::Input holds a packet split across two writes until its SYN') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    w = File.open(fifo, 'w')
+    # Half a packet: readable, but no SYN_REPORT has closed it yet.
+    w.write RM2::TestServer.pack_events([[1, 0x140, 1], [3, 0, 700], [3, 1, 800]])
+    w.flush
+    assert_true RM2::Input.wait([i], 500)
+    assert_equal [], i.pending_events
+    # The rest arrives on a later read: the sticky state lives in the input,
+    # not on pending_events' stack, so nothing was lost in between.
+    w.write RM2::TestServer.pack_events([[3, 24, 55], [0, 0, 0]])
+    w.flush
+    assert_true RM2::Input.wait([i], 500)
+    samples = i.pending_events
+    assert_equal 1, samples.size
+    assert_equal [700, 800, 55, RM2::Input::PEN], samples[0]
+    w.close
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('RM2::Input reads a batch larger than one read() buffer') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    w = File.open(fifo, 'w')
+    # 202 events > the 64-event read buffer, so this needs several reads.
+    events = [[1, 0x140, 1], [1, 0x14a, 1]]
+    100.times { |n| events << [3, 0, 1000 + n] << [0, 0, 0] }
+    w.write RM2::TestServer.pack_events(events)
+    w.flush
+    assert_true RM2::Input.wait([i], 500)
+    samples = i.pending_events
+    assert_equal 100, samples.size
+    assert_equal [1000, 0, 0, RM2::Input::PEN | RM2::Input::TOUCH], samples[0]
+    assert_equal [1099, 0, 0, RM2::Input::PEN | RM2::Input::TOUCH], samples[99]
+    assert_equal [], i.pending_events
+    w.close
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('RM2::Input drops the packet torn by SYN_DROPPED, then resyncs') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    w = File.open(fifo, 'w')
+    w.write RM2::TestServer.pack_events([
+      [1, 0x140, 1], [3, 0, 10], [3, 1, 20], [3, 24, 5], [0, 0, 0], # clean
+      [3, 0, 99], [0, 3, 0],   # SYN_DROPPED: this packet mixes two states
+      [3, 1, 77], [0, 0, 0],   # its SYN closes the torn packet, reports nothing
+      [3, 0, 111], [0, 0, 0]   # back in sync
+    ])
+    w.flush
+    assert_true RM2::Input.wait([i], 500)
+    samples = i.pending_events
+    assert_equal 2, samples.size
+    assert_equal [10, 20, 5, RM2::Input::PEN], samples[0]
+    assert_equal [111, 77, 5, RM2::Input::PEN], samples[1]
+    w.close
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('RM2::Input reports a hangup instead of reading as always ready') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    assert_false i.hung_up?
+    w = File.open(fifo, 'w')
+    w.write RM2::TestServer.pack_events([[3, 0, 42], [3, 1, 43], [0, 0, 0]])
+    w.flush
+    w.close # the only writer is gone: the read end hangs up
+
+    # Events buffered before the hangup still drain.
+    samples = i.pending_events
+    assert_equal 1, samples.size
+    assert_equal [42, 43], [samples[0][0], samples[0][1]]
+
+    # Now empty: read() reports EOF, which is what marks the input hung up.
+    assert_equal [], i.pending_events
+    assert_true i.hung_up?
+
+    # POLLHUP is set whether or not it was asked for and makes poll return a
+    # positive count, so a bare `n > 0` would report this dead fd as ready
+    # for ever while pending_events kept returning [].
+    assert_false RM2::Input.wait([i], 20)
+    assert_false i.closed? # a hangup is not closure: the fd is still ours
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('RM2::Input.wait marks a hangup it sees in revents') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    File.open(fifo, 'w').close # a writer opens and closes, writing nothing
+    assert_false RM2::Input.wait([i], 20)
+    assert_true i.hung_up?
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
 assert('RM2::Input.wait times out when no events are pending') do
   path = RM2::TestServer.start
   begin
@@ -94,6 +214,9 @@ assert('RM2::Input.wait validates its arguments') do
     i = d.open_input(RM2::TestServer.make_fifo)
     assert_false RM2::Input.wait([], 0)
     assert_raise(ArgumentError) { RM2::Input.wait([i] * 9, 0) }
+    # A negative timeout is poll's "block forever"; refuse it rather than
+    # hang the caller's loop with no diagnostic.
+    assert_raise(ArgumentError) { RM2::Input.wait([i], -1) }
     assert_raise(TypeError) { RM2::Input.wait([Object.new], 0) }
     i.close
     assert_raise(RuntimeError) { RM2::Input.wait([i], 0) }

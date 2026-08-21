@@ -6,6 +6,8 @@
  */
 #include "rm2.h"
 
+#include <mruby.h>
+#include <mruby/class.h>
 #include <mruby/data.h>
 #include <mruby/error.h>
 
