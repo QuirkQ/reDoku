@@ -28,4 +28,4 @@ shell: image
 		-w /mruby $(IMAGE) bash
 
 clean:
-	rm -rf build
+	rm -rf build build_config.rb.lock
