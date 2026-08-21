@@ -56,7 +56,10 @@ assert('Renderer#draw_header shows the title and the difficulty') do
   right = Redoku::Layout::BOARD_X + Redoku::Layout::BOARD_W
   label_w = Redoku::Font.width('MEDIUM', Redoku::Layout::LABEL_SCALE)
   assert_equal 0, d.gray_at(right - label_w, Redoku::Layout::HEADER_Y)
-  assert_nil d.gray_at(right + 1, Redoku::Layout::HEADER_Y) # nothing past it
+  # Nothing is painted at or past the board's right edge: the label's last ink
+  # is at x 1331 and the header band ends there too, so `right` itself is the
+  # tightest untouched column.
+  assert_nil d.gray_at(right, Redoku::Layout::HEADER_Y)
 end
 
 assert('Renderer#draw_all clears the whole panel first') do
@@ -78,6 +81,12 @@ assert('Renderer flush methods pick the documented waveforms') do
   x, y, w, h = Redoku::Layout.board_rect
   assert_equal [x, y, w, h, RM2::GL16, 0], d.updates[0]
   d.clear_calls
+  r.flush_header
+  assert_equal [Redoku::Layout::HEADER_X, Redoku::Layout::HEADER_Y,
+                Redoku::Layout::BOARD_W,
+                Redoku::Font::HEIGHT * Redoku::Layout::TITLE_SCALE,
+                RM2::GL16, 0], d.updates[0]
+  d.clear_calls
   r.flush_rect(10, 20, 30, 40, waveform: RM2::DU, flags: RM2::FAST_DRAW)
   assert_equal [10, 20, 30, 40, RM2::DU, RM2::FAST_DRAW], d.updates[0]
 end
@@ -85,6 +94,9 @@ end
 assert('Renderer draws nothing outside the panel') do
   d = TestDisplay.new
   Redoku::Renderer.new(d).draw_all(:hard)
+  # Guard against a vacuous pass: the loop below proves nothing over an empty
+  # list, and the :hard repaint really records 390 rects.
+  assert_true d.rects.size > 100, "only #{d.rects.size} rects recorded"
   d.rects.each do |x, y, w, h, _gray|
     assert_true x >= 0 && y >= 0, "rect starts off-panel: #{[x, y, w, h]}"
     assert_true x + w <= Redoku::Layout::SCREEN_W, "rect too wide: #{[x, y, w, h]}"

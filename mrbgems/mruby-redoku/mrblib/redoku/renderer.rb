@@ -7,6 +7,7 @@ module Redoku
     WHITE = 255
     BLACK = 0
     DIFFICULTIES = [:easy, :medium, :hard].freeze
+    BUTTON_BORDER = 3
 
     def initialize(display)
       @d = display
@@ -21,8 +22,8 @@ module Redoku
     end
 
     def draw_header(difficulty)
-      x, y, w, _h = header_rect
-      @d.fill_rect(x, y, w, Font::HEIGHT * Layout::TITLE_SCALE, WHITE)
+      x, y, w, h = header_rect
+      @d.fill_rect(x, y, w, h, WHITE)
       Font.draw(@d, 'REDOKU', Layout::HEADER_X, Layout::HEADER_Y,
                 Layout::TITLE_SCALE, BLACK)
       label = difficulty.to_s.upcase
@@ -62,6 +63,10 @@ module Redoku
                 waveform: RM2::GC16, flags: RM2::SYNC)
     end
 
+    # board_rect is enough even though the frame straddles it: draw_board's
+    # white fill is exactly board_rect, so the 2 px overhang only ever receives
+    # black over black and a repaint cannot leave a stale pixel out there.
+    # Widening that white fill would break this and need a wider flush.
     def flush_board
       x, y, w, h = Layout.board_rect
       @d.update(x, y, w, h, waveform: RM2::GL16, flags: 0)
@@ -77,8 +82,6 @@ module Redoku
     end
 
     private
-
-    BUTTON_BORDER = 3
 
     def header_rect
       [Layout::HEADER_X, Layout::HEADER_Y,
