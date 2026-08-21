@@ -2601,8 +2601,7 @@ module Redoku
     # and `wait` returns false immediately for an empty array — so the loop
     # would spin at 100% CPU with no exit but SIGTERM.
     def drop_hung_up_sources
-      live = @sources.reject { |source| source.hung_up? }
-      @sources = live if live.size != @sources.size
+      @sources = @sources.reject { |source| source.hung_up? }
       @running = false if @sources.empty?
     end
 
@@ -2746,8 +2745,9 @@ assert('redoku --help explains itself and exits 0') do
 end
 
 assert('redoku fails clearly when no display server is listening') do
-  _out, err, status = Open3.capture3({ 'RM2FB_SOCKET' => '/tmp/redoku-no-server.sock' },
-                                     REDOKU)
+  # No rm2fb server exists in the build container, so the default socket
+  # path is absent and this exercises the real failure path.
+  _out, err, status = Open3.capture3(REDOKU)
   assert_false status.success?
   assert_include err, 'redoku:'
 end
@@ -2783,8 +2783,7 @@ module Redoku
   TEXT
 
   # Entry point called from tools/redoku/redoku.c. Returns the process exit
-  # status; the socket path can be overridden with RM2FB_SOCKET, which is
-  # what the bintests use to reach a server that is not there.
+  # status.
   def self.main(argv)
     unknown = argv.find { |a| !['--help', '--clients'].include?(a) }
     if unknown
@@ -2813,8 +2812,10 @@ module Redoku
 
   def self.play
     RM2.setup_signals
-    socket = ENV['RM2FB_SOCKET']
-    display = socket ? RM2::Display.open(socket) : RM2::Display.open
+    # No socket override: the default path is absent in the build container,
+    # which is exactly what the bintest's failure case needs, and ENV would
+    # mean declaring mruby-env for a test hook.
+    display = RM2::Display.open
 
     paths = RM2::Input.resolve_all(PEN_DEVICE)
     if paths.empty?
@@ -2824,7 +2825,7 @@ module Redoku
 
     App.new(display, inputs, Renderer.new(display)).run
 
-    inputs.each(&:close)
+    inputs.each { |input| input.close }
     display.close # closing the connection hands the panel back to xochitl
     0
   rescue StandardError => e
