@@ -4,9 +4,10 @@ A handwritten sudoku game for the reMarkable 2, written in [mruby](https://mruby
 You'll tap an innocent-looking document in the stock library, a sudoku
 appears, and you play by writing digits with the pen.
 
-**Status:** early days. The display-client gem (`mruby-rm2`) and build
-pipeline work; the game itself is not written yet. See [PLAN.md](PLAN.md)
-for the full design and roadmap.
+**Status:** early days. The walking skeleton is in: `redoku` draws the
+board, echoes pen ink into it, and hands the screen back on Quit — no
+puzzles yet, and the pen path is still awaiting its first run on real
+hardware. See [PLAN.md](PLAN.md) for the full design and roadmap.
 
 ## Prerequisites
 
@@ -29,7 +30,7 @@ make build   # also cross-compiles armv7 binaries into build/rm2/bin/
 make rm2fb   # cross-compiles the display server into build/rm2fb/dist/
 ```
 
-## Installing the display server on the device
+## Installing on the device
 
 Drawing goes through the
 [rm2fb display server](https://github.com/timower/rM2-stuff) (swtcon
@@ -37,15 +38,19 @@ mode), which must run on the device. `bin/redoku` does the whole dance —
 plug the device in over USB and run:
 
 ```bash
+make build           # the game binary; install offers to build the server
 bin/redoku install
 ```
 
-It takes the cross-built binaries from `build/rm2fb/dist/` (offering to
-run `make rm2fb` first when they aren't built yet), double-checks they
-really are 32-bit ARM, copies everything over, and runs
-`device/install.sh` on the device. You'll be asked once for the device's
-SSH password. Your `~/.ssh/config` is deliberately ignored so nothing in
-it can interfere; if you have keys or aliases set up, add
+It takes the cross-built display server from `build/rm2fb/dist/`
+(offering to run `make rm2fb` first when it isn't built yet) and the game
+from `build/rm2/bin/redoku`, double-checks they really are 32-bit ARM,
+copies everything over, and runs `device/install.sh` on the device.
+Re-running it is safe from any state: the same files land in the same
+places and the device ends up in the same working state, so there is no
+"repair" path to learn. You'll be asked once for the device's SSH
+password. Your `~/.ssh/config` is deliberately ignored so nothing in it
+can interfere; if you have keys or aliases set up, add
 `--ssh-config ~/.ssh/config`. See `bin/redoku --help` for all options
 (`--dry-run` shows the plan without touching anything).
 
@@ -71,9 +76,28 @@ If the device seems unresponsive, hold the power button ~10 s to force a
 reboot — a broken display server disarms itself and xochitl boots stock.
 Last resort: a firmware update reinstalls the root filesystem clean.
 
-## Running the checkerboard demo on the device
+## Running on the device
 
-With the display server installed:
+```bash
+bin/redoku play      # refresh the game binary from build/rm2/bin/, then run it
+```
+
+The board appears on the e-ink panel and pen strokes leave ink inside it:
+`New` clears the ink, `Level` cycles the difficulty label, and `Quit`
+closes the display connection, which hands the screen back to xochitl.
+`play` only ever copies that one binary, so a rebuild reaches the device
+without disturbing the display server; `bin/redoku play --seconds 10`
+runs the game unattended for ten seconds instead of waiting for you,
+which is the quickest way to smoke-test a build.
+
+The binary has a second mode that never touches the screen —
+`redoku --clients` lists the display server's clients:
+
+```bash
+ssh root@10.11.99.1 /home/root/redoku/bin/redoku --clients
+```
+
+### The checkerboard demo
 
 ```bash
 make build
@@ -93,7 +117,9 @@ ssh -t root@10.11.99.1 /home/root/mirb    # try: RM2::GC16  =>  61442
 ## Repository layout
 
 - `mrbgems/mruby-rm2/` — the display-client gem ([its README](mrbgems/mruby-rm2/README.md) documents the API)
-- `bin/redoku` — installs/uninstalls the display server on the device over SSH
+- `mrbgems/mruby-redoku/` — the game: layout, rendering, pen handling, event loop
+- `mrbgems/mruby-bin-redoku/` — the `redoku` executable (a `main` that calls `Redoku.main`)
+- `bin/redoku` — installs, runs, and uninstalls reDoku on the device over SSH
 - `device/` — install/uninstall scripts for the rm2fb display server (run on the device)
 - `examples/` — demo scripts run with the cross-built `bin/mruby`
 - `build_config.rb`, `docker/`, `Makefile` — the build pipeline

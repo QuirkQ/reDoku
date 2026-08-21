@@ -8,8 +8,10 @@ MRuby::Build.new do |conf|
   conf.gembox 'default'
   conf.gem File.expand_path('mrbgems/mruby-rm2', File.dirname(__FILE__))
   conf.gem File.expand_path('mrbgems/mruby-redoku', File.dirname(__FILE__))
+  conf.gem File.expand_path('mrbgems/mruby-bin-redoku', File.dirname(__FILE__))
   conf.enable_debug
   conf.enable_test
+  conf.enable_bintest
 end
 
 # Device build: armv7hf cross-compile for the reMarkable 2 (firmware >= 3.18,
@@ -39,6 +41,7 @@ MRuby::CrossBuild.new('rm2') do |conf|
 
   conf.gem File.expand_path('mrbgems/mruby-rm2', File.dirname(__FILE__))
   conf.gem File.expand_path('mrbgems/mruby-redoku', File.dirname(__FILE__))
+  conf.gem File.expand_path('mrbgems/mruby-bin-redoku', File.dirname(__FILE__))
 
   conf.build_mrbtest_lib_only
   conf.disable_cxx_exception

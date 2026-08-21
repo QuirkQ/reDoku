@@ -14,7 +14,17 @@ cross-built mruby verified running on the device). **Milestone 0 passed
 3.27.3.0 — xochitl feels stock under the client shim, the mruby
 checkerboard demo flashed onto the e-ink and xochitl's UI came back, and
 `rm2fbctl list` works (live-client `switch` deferred to M1, which builds
-the first long-running client). Next: Milestone 1 — the walking skeleton.
+the first long-running client).
+
+**M1's walking skeleton is implemented and host-tested 2026-08-21**:
+`mruby-rm2` grew input, the control socket and signal flags; `mruby-redoku`
+holds the layout, bitmap font, renderer, pen mapping and event loop; and
+`mruby-bin-redoku` links it all into the `redoku` executable, cross-built
+for armv7 and put on the device by `bin/redoku install` / `play`. Green on
+2231 host assertions plus a bintest that runs the real binary. **The
+remaining M1 gate is on-device verification of the pen path** — ink under a
+real digitizer, `New` / `Level` / `Quit` as pen taps, and Quit handing the
+screen back to xochitl. Next: Milestone 2 — the sudoku engine.
 
 ---
 
@@ -192,8 +202,9 @@ knowledge:
   `#blit(x, y, w, h, packed_gray_string)` — pixel pushing in C for speed
 - `Display#update(x, y, w, h, waveform:, flags:)` — clamps, converts to
   inclusive y-first corners, sends, reads ack
-- `RM2::Input.resolve(name)` → device path by scanning `/dev/input/event*`
-  for the matching evdev name; `Display#open_input(path)` requests that
+- `RM2::Input.resolve_all(name)` → every device path whose evdev name
+  matches (the server publishes uinput clones of the real nodes, and both
+  carry the same name); `Display#open_input(path)` requests that
   path's fd over the display connection (`OpenInputDevice` — the server
   allows one socket per PID, so input fds ride the Display's connection) and
   returns an `RM2::Input`; `#pending_events` decodes `input_event` structs
@@ -344,8 +355,9 @@ Portrait, full screen 1404×1872:
   currently `4515770` — the exact commit this plan's protocol reference was
   verified against), mounted into the build container. Any 3.27.3.0 fixes we
   need land as commits on the fork, upstreamable later.
-- `make deploy` — scp binaries + `device/` scripts to the device, run
-  `install.sh` (idempotent)
+- `bin/redoku install` — copy binaries + `device/` scripts to the device and
+  run `install.sh` (idempotent, safe to re-run); `bin/redoku play` refreshes
+  just the game binary and runs it
 - `make test` — Docker: mruby's rake builds the host target and runs
   `mrbtest` (every gem's `test/` suite, incl. the fake-server protocol tests)
 - `make screenshot` / `make inject STROKES=…` — `tools/rmctl.rb` against

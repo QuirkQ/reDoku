@@ -1,6 +1,7 @@
 #!/bin/sh
-# bin/redoku — get the rm2fb display server on and off a reMarkable 2
-# over SSH, without needing to understand the ssh/scp choreography.
+# bin/redoku — get the rm2fb display server and the reDoku game on and off
+# a reMarkable 2 over SSH, without needing to understand the ssh/scp
+# choreography.
 #
 # Works on Linux and macOS with the stock OpenSSH client. Run it from a
 # reDoku checkout (it needs device/install.sh and device/uninstall.sh).
@@ -24,6 +25,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 REMOTE_DIR=/home/root/redoku
+REMOTE_GAME=$REMOTE_DIR/bin/redoku    # the game binary on the device
 KNOWN_HOSTS=$HOME/.ssh/redoku_known_hosts
 CTL_PATH=$HOME/.ssh/redoku-ctl-%C
 
@@ -34,6 +36,7 @@ IDENTITY=
 ARTIFACTS=
 FORCE=0
 PURGE=0
+PLAY_SECS=          # empty = play interactively, until you stop it
 YES=0
 DRY=0
 CMD=
@@ -43,10 +46,12 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-bin/redoku — install/uninstall the rm2fb display server on a reMarkable 2
+bin/redoku — put the rm2fb display server and the reDoku game on a reMarkable 2
 
 usage:
   bin/redoku install      copy the built binaries to the device and install
+                          (safe to re-run: idempotent from any state)
+  bin/redoku play         run the game on the device
   bin/redoku uninstall    return the device to stock (safe, idempotent)
   bin/redoku status       show what's running on the device
   bin/redoku shell        open an SSH shell on the device
@@ -57,6 +62,13 @@ how it connects (the default just works):
   Settings -> Help -> Copyrights and licenses. Your ~/.ssh/config is
   deliberately ignored so nothing in it can interfere. The connection is
   kept open for 2 minutes, so back-to-back commands ask only once.
+
+playing the game:
+  'install' stages the whole tree, the game binary included, and can be
+  re-run at any time. 'play' then only refreshes that one binary
+  (/home/root/redoku/bin/redoku, from the cross build in build/rm2/bin/ —
+  run 'make build' first) and starts it, so working on the game never means
+  restarting the display server. 'uninstall --purge' removes everything.
 
 options:
   -H, --host HOST         device address or ssh alias   (default: 10.11.99.1)
@@ -69,6 +81,8 @@ options:
                           offers to build them with 'make rm2fb')
       --force             install: proceed on an untested firmware version
       --purge             uninstall: also delete /home/root/redoku
+      --seconds N         play: stop the game after N seconds instead of
+                          running it interactively (unattended smoke test)
   -y, --yes               don't ask for confirmation
   -n, --dry-run           show what would happen without touching anything
   -h, --help              this help
@@ -86,7 +100,7 @@ EOF
 
 while [ $# -gt 0 ]; do
   case $1 in
-    install|uninstall|status|shell)
+    install|uninstall|play|status|shell)
       [ -z "$CMD" ] || die "two commands given: '$CMD' and '$1'"
       CMD=$1 ;;
     -H|--host)       [ $# -ge 2 ] || die "$1 needs a value"; HOST=$2; shift ;;
@@ -96,6 +110,7 @@ while [ $# -gt 0 ]; do
     -a|--artifacts)  [ $# -ge 2 ] || die "$1 needs a value"; ARTIFACTS=$2; shift ;;
     --force)         FORCE=1 ;;
     --purge)         PURGE=1 ;;
+    --seconds)       [ $# -ge 2 ] || die "$1 needs a value"; PLAY_SECS=$2; shift ;;
     -y|--yes)        YES=1 ;;
     -n|--dry-run)    DRY=1 ;;
     -h|--help)       usage; exit 0 ;;
@@ -112,6 +127,12 @@ command -v ssh >/dev/null 2>&1 || die "no 'ssh' on this machine"
 [ "$FORCE" -eq 0 ] || [ "$CMD" = install ]   || die "--force only applies to install"
 [ "$PURGE" -eq 0 ] || [ "$CMD" = uninstall ] || die "--purge only applies to uninstall"
 [ -z "$ARTIFACTS" ] || [ "$CMD" = install ]  || die "--artifacts only applies to install"
+[ -z "$PLAY_SECS" ] || [ "$CMD" = play ]     || die "--seconds only applies to play"
+# It ends up as 'sleep N' on the device, which wants a plain whole number.
+if [ -n "$PLAY_SECS" ]; then
+  case $PLAY_SECS in *[!0-9]*) die "--seconds wants whole seconds, not '$PLAY_SECS'" ;; esac
+  [ "$PLAY_SECS" -ge 1 ] || die "--seconds wants at least 1 second"
+fi
 
 TARGET=$RUSER@$HOST
 
@@ -251,11 +272,28 @@ pick_artifact() { # $1 = filename; prints the path
   pick_in "${ARTIFACTS:-$REPO/build/rm2fb/dist}" "$1"
 }
 
+# The cross-built game, into $GAME. Its path is fixed (mruby's rake decides
+# it), so there is nothing to search for and no --artifacts override; it is
+# checked to really be 32-bit ARM like everything else that leaves this
+# machine. 'install' stages it, 'play' refreshes it.
+find_game() {
+  GAME=$REPO/build/rm2/bin/redoku
+  [ -f "$GAME" ] || \
+    die "no game binary at $GAME — cross-build it with:  make build"
+  is_arm_elf "$GAME" || \
+    die "$GAME is not 32-bit ARM — that is a host build, not a device one;
+  rebuild with:  make clean && make build"
+}
+
 # ---- commands ----------------------------------------------------------
 
 cmd_install() {
   [ -f "$REPO/device/install.sh" ] && [ -f "$REPO/device/uninstall.sh" ] || \
     die "device/install.sh not found next to me — run bin/redoku from a reDoku checkout"
+
+  # Before the server hunt below, which may offer a long 'make rm2fb': a
+  # missing game binary should not surface after minutes of building.
+  find_game
 
   say "looking for the built armv7 binaries in ${ARTIFACTS:-build/rm2fb/dist}"
   SERVER=$(pick_artifact rm2fb_server_swtcon) || SERVER=
@@ -286,8 +324,10 @@ cmd_install() {
   else
     say "  ctl    : rm2fbctl not found — optional, continuing without it"
   fi
+  say "  game   : $GAME"
   say "  action : copy to $REMOTE_DIR/ and run the on-device installer"
   say "           (adds files only; any failure rolls back to stock)"
+  say "  re-run : safe any time — the same files, the same end state"
   confirm "Install on the device?"
 
   connect
@@ -296,6 +336,7 @@ cmd_install() {
   push_file "$SERVER" "$REMOTE_DIR/bin/rm2fb_server_swtcon"
   push_file "$CLIENT" "$REMOTE_DIR/lib/librm2fb_client_swtcon.so"
   [ -z "$CTLBIN" ] || push_file "$CTLBIN" "$REMOTE_DIR/bin/rm2fbctl"
+  push_file "$GAME" "$REMOTE_GAME"
   push_file "$REPO/device/install.sh" "$REMOTE_DIR/install.sh"
   push_file "$REPO/device/uninstall.sh" "$REMOTE_DIR/uninstall.sh"
   remote "chmod +x $REMOTE_DIR/bin/"'*'
@@ -305,12 +346,66 @@ cmd_install() {
   say "running the on-device installer (~30 s, includes a 15 s verification wait)"
   if remote "sh $REMOTE_DIR/install.sh$_force_arg"; then
     say "all done — xochitl is now running through the display server"
+    say "  play it    : bin/redoku play"
     say "  check it   : bin/redoku status"
     say "  banished it: bin/redoku uninstall"
   else
     die "the on-device installer failed and rolled the device back to stock
   (its output above says why; the device is safe and unchanged)"
   fi
+}
+
+cmd_play() {
+  find_game
+  connect
+
+  # Just the game binary. 'install' stages the whole tree; re-running it here
+  # would restart the display server and xochitl for a file neither of them
+  # reads. One binary is all that changes while you work on the game, and
+  # push_file unlinks before writing, so refreshing it while an older
+  # instance is still running is safe.
+  say "refreshing $REMOTE_GAME"
+  remote "mkdir -p $REMOTE_DIR/bin"
+  push_file "$GAME" "$REMOTE_GAME"
+  remote "chmod +x $REMOTE_GAME"
+
+  # The game cannot paint a single pixel without the server, so say so here
+  # rather than let it fail with a socket error on the device.
+  if [ "$DRY" -eq 0 ] && [ "$(remote \
+       'systemctl is-active rm2fb.service 2>/dev/null || true' \
+       | tr -d '[:space:]')" != active ]; then
+    say "WARNING: rm2fb.service is not active — the game cannot draw."
+    say "         Install the display server first:  bin/redoku install"
+  fi
+
+  if [ -z "$PLAY_SECS" ]; then
+    say "starting the game — the Quit button (or Ctrl-C) gives the screen back"
+    if [ "$DRY" -eq 1 ]; then
+      printf '==> [dry-run] ssh -t %s -- %s\n' "$TARGET" "$REMOTE_GAME" >&2
+      return 0
+    fi
+    # -t asks for a real tty so Ctrl-C arrives as SIGINT at the game, which
+    # quits cleanly, instead of just dropping the ssh session behind its back.
+    _rc=0
+    ssh_run -t "$TARGET" "$REMOTE_GAME" || _rc=$?
+    [ "$_rc" -eq 0 ] || die "the game exited $_rc — its output above says why"
+    say "done — the screen is back to xochitl"
+    return 0
+  fi
+
+  # No tty this time: nothing is watching. No 'timeout' either — the device's
+  # BusyBox has no such applet — so a background sleep TERMs the game and
+  # 'wait' reports how it went. 143 is 128+SIGTERM, meaning the signal killed
+  # it outright; redoku handles SIGTERM and exits 0 instead, so a timed run
+  # ending either way is a run that ended when we asked it to.
+  say "running the game for ${PLAY_SECS}s, unattended"
+  _timed="$REMOTE_GAME & rp=\$!; (sleep $PLAY_SECS; kill -TERM \$rp 2>/dev/null) & sp=\$!; wait \$rp; rc=\$?; kill \$sp 2>/dev/null; exit \$rc"
+  _rc=0
+  remote "$_timed" || _rc=$?
+  case $_rc in
+    0|143) say "the timed run ended cleanly (exit $_rc)" ;;
+    *)     die "the game exited $_rc — its output above says why" ;;
+  esac
 }
 
 cmd_uninstall() {
@@ -353,6 +448,7 @@ cmd_shell() {
 
 case $CMD in
   install)   cmd_install ;;
+  play)      cmd_play ;;
   uninstall) cmd_uninstall ;;
   status)    cmd_status ;;
   shell)     cmd_shell ;;
