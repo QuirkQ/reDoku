@@ -11,9 +11,18 @@ for the full design and roadmap.
 ## Prerequisites
 
 - Docker (all builds run in a container; nothing is installed on your machine)
-- Sibling checkouts next to this repo:
-  - [`../mruby`](https://github.com/mruby/mruby) at 4.0.0
-  - [`../rM2-stuff`](https://github.com/QuirkQ/rM2-stuff) (display server, needed on-device — see below)
+- An [mruby](https://github.com/mruby/mruby) checkout next to this repo —
+  the build expects `../mruby` by default (override with
+  `make MRUBY_DIR=/path/to/mruby …`):
+
+  ```bash
+  git clone --branch 4.0.0 https://github.com/mruby/mruby.git ../mruby
+  ```
+
+- Only for running on the device later (Milestone 0, not needed for
+  `make build`/`make test`): the
+  [rM2-stuff](https://github.com/timower/rM2-stuff) display server as
+  `../rM2-stuff`
 - A reMarkable 2 reachable over SSH: connect it via USB and use
   `root@10.11.99.1`; the password is shown on the device under
   Settings → Help → Copyrights and licenses
