@@ -3,25 +3,30 @@
  * In-process fake rm2fb server for mrbtest. Speaks the real wire protocol
  * (PLAN.md §3) on a /tmp unix socket: grants a memfd-backed framebuffer on
  * Init and logs every UpdateParams it receives — raw 32-byte structs
- * appended to a log file — so Ruby tests can assert exact bytes.
+ * appended to a log file — so Ruby tests can assert exact bytes. It also
+ * answers OpenInputDevice by open()ing the requested path and passing the
+ * fd back over SCM_RIGHTS, logging the 68-byte request verbatim.
  *
  * The listening socket is bound in the parent BEFORE forking, so the
  * socket is connectable the moment RM2::TestServer.start returns.
  */
 #define _GNU_SOURCE
 #include <mruby.h>
+#include <mruby/array.h>
 #include <mruby/class.h>
 #include <mruby/error.h>
 #include <mruby/string.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/input.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -33,6 +38,8 @@
 static pid_t server_pid = -1;
 static char sock_path[108];
 static char log_path[128];
+static char fifo_path[128];
+static char open_input_log_path[128];
 
 static int
 fs_write_exact(int fd, const void* buf, size_t len) {
@@ -122,6 +129,27 @@ fs_serve(int listen_fd, int log_fd) {
       if (fs_write_exact(log_fd, params, sizeof(params)) < 0) _exit(1);
       if (fs_write_exact(client, &ack, sizeof(ack)) < 0) _exit(1);
     }
+    else if (tag == 4) { /* OpenInputDevice: 68-byte payload */
+      char req[68];
+      int32_t flags;
+      uint8_t ok;
+      int fd, log;
+      if (fs_read_exact(client, req, sizeof(req)) != 0) _exit(1);
+      log = open(open_input_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (log >= 0) {
+        if (fs_write_exact(log, req, sizeof(req)) < 0) _exit(1);
+        close(log);
+      }
+      memcpy(&flags, &req[64], sizeof(flags));
+      req[63] = '\0';
+      fd = open(req, (flags & (O_ACCMODE | O_NONBLOCK)) | O_CLOEXEC);
+      ok = fd >= 0 ? 1 : 0;
+      if (fs_write_exact(client, &ok, sizeof(ok)) < 0) _exit(1);
+      if (fd >= 0) {
+        if (fs_send_fd(client, fd) < 0) _exit(1);
+        close(fd);
+      }
+    }
     else {
       _exit(1); /* unknown tag: fail loudly, the test will see a dead server */
     }
@@ -139,7 +167,10 @@ fs_start(mrb_state* mrb, mrb_value self) {
 
   snprintf(sock_path, sizeof(sock_path), "/tmp/rm2fb-test-%d.sock", (int)getpid());
   snprintf(log_path, sizeof(log_path), "/tmp/rm2fb-test-%d.log", (int)getpid());
+  snprintf(open_input_log_path, sizeof(open_input_log_path),
+           "/tmp/rm2fb-test-%d.openinput", (int)getpid());
   unlink(sock_path);
+  unlink(open_input_log_path); /* a stale log must not read as this run's */
 
   log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (log_fd < 0) mrb_sys_fail(mrb, "open update log");
@@ -182,6 +213,10 @@ fs_stop(mrb_state* mrb, mrb_value self) {
     waitpid(server_pid, NULL, 0);
     server_pid = -1;
     unlink(sock_path);
+    if (fifo_path[0] != '\0') {
+      unlink(fifo_path);
+      fifo_path[0] = '\0';
+    }
   }
   return mrb_nil_value();
 }
@@ -191,6 +226,54 @@ fs_log_path(mrb_state* mrb, mrb_value self) {
   return mrb_str_new_cstr(mrb, log_path);
 }
 
+/* A FIFO stands in for an evdev node: nothing to read until a test writes,
+ * which is what makes the wait-timeout and decode paths testable. */
+static mrb_value
+fs_make_fifo(mrb_state* mrb, mrb_value self) {
+  snprintf(fifo_path, sizeof(fifo_path), "/tmp/rm2fb-test-%d.fifo",
+           (int)getpid());
+  unlink(fifo_path);
+  if (mkfifo(fifo_path, 0644) < 0) mrb_sys_fail(mrb, "mkfifo");
+  return mrb_str_new_cstr(mrb, fifo_path);
+}
+
+/* Packs [[type, code, value], …] using the real struct input_event, whose
+ * size differs per ABI (16 bytes on armv7, 24 on x86-64). */
+static mrb_value
+fs_pack_events(mrb_state* mrb, mrb_value self) {
+  mrb_value ary, out;
+  mrb_int i, len;
+
+  mrb_get_args(mrb, "A", &ary);
+  len = RARRAY_LEN(ary);
+  out = mrb_str_new(mrb, NULL, 0);
+  for (i = 0; i < len; i++) {
+    mrb_value triple = mrb_ary_ref(mrb, ary, i);
+    struct input_event ev;
+    if (RARRAY_LEN(triple) != 3)
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "expected [type, code, value]");
+    memset(&ev, 0, sizeof(ev));
+    ev.type = (unsigned short)mrb_integer(mrb_ary_ref(mrb, triple, 0));
+    ev.code = (unsigned short)mrb_integer(mrb_ary_ref(mrb, triple, 1));
+    ev.value = (int)mrb_integer(mrb_ary_ref(mrb, triple, 2));
+    mrb_str_cat(mrb, out, (const char*)&ev, sizeof(ev));
+  }
+  return out;
+}
+
+static mrb_value
+fs_last_open_input(mrb_state* mrb, mrb_value self) {
+  char buf[68];
+  int fd = open(open_input_log_path, O_RDONLY);
+  if (fd < 0) return mrb_nil_value();
+  if (fs_read_exact(fd, buf, sizeof(buf)) != 0) {
+    close(fd);
+    return mrb_nil_value();
+  }
+  close(fd);
+  return mrb_str_new(mrb, buf, sizeof(buf));
+}
+
 void
 mrb_mruby_rm2_gem_test(mrb_state* mrb) {
   struct RClass* rm2 = mrb_module_get(mrb, "RM2");
@@ -198,4 +281,9 @@ mrb_mruby_rm2_gem_test(mrb_state* mrb) {
   mrb_define_class_method(mrb, ts, "start", fs_start, MRB_ARGS_NONE());
   mrb_define_class_method(mrb, ts, "stop", fs_stop, MRB_ARGS_NONE());
   mrb_define_class_method(mrb, ts, "log_path", fs_log_path, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, ts, "make_fifo", fs_make_fifo, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, ts, "pack_events", fs_pack_events,
+                          MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, ts, "last_open_input", fs_last_open_input,
+                          MRB_ARGS_NONE());
 }

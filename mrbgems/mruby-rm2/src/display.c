@@ -4,12 +4,13 @@
  * against rM2-stuff libs/rm2fb/include/rm2fb/Message.h). Wire format:
  * int32 variant tag + raw little-endian struct, strict request/reply.
  */
-#include <mruby.h>
-#include <mruby/class.h>
+#include "rm2.h"
+
 #include <mruby/data.h>
 #include <mruby/error.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -18,7 +19,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-enum { TAG_INIT = 0, TAG_UPDATE = 2 };
+enum { TAG_INIT = 0, TAG_UPDATE = 2, TAG_OPEN_INPUT = 4 };
 
 typedef struct {
   int32_t width;
@@ -40,9 +41,15 @@ typedef struct {
   int32_t extra_mode;
 } update_params; /* 32 bytes on both target ABIs */
 
+typedef struct {
+  char path[64];
+  int32_t flags;
+} open_input_msg; /* 68 bytes on both target ABIs */
+
 /* Wire structs must be byte-identical on host x86-64 and armv7hf. */
 typedef char rm2_init_msg_size_check[(sizeof(init_msg) == 16) ? 1 : -1];
 typedef char rm2_update_params_size_check[(sizeof(update_params) == 32) ? 1 : -1];
+typedef char rm2_open_input_msg_size_check[(sizeof(open_input_msg) == 68) ? 1 : -1];
 
 typedef struct {
   int sock;
@@ -418,6 +425,43 @@ rm2_display_update_raw(mrb_state* mrb, mrb_value self) {
   return mrb_bool_value(ack != 0);
 }
 
+/* Asks the server to open an evdev node for us and pass back the fd. Going
+ * through the server (rather than open()ing it ourselves) is what lets it
+ * discard our stale event backlog while we are SIGSTOPped. */
+static mrb_value
+rm2_display_open_input(mrb_state* mrb, mrb_value self) {
+  const char* path;
+  mrb_int flags = O_RDONLY | O_NONBLOCK;
+  rm2_display* d;
+  int32_t tag = TAG_OPEN_INPUT;
+  open_input_msg req;
+  uint8_t ok;
+  int fd;
+
+  mrb_get_args(mrb, "z|i", &path, &flags);
+  d = get_open_display(mrb, self);
+
+  memset(&req, 0, sizeof(req));
+  if (strlen(path) >= sizeof(req.path))
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "input device path too long");
+  strcpy(req.path, path);
+  req.flags = (int32_t)flags;
+
+  if (write_exact(d->sock, &tag, sizeof(tag)) < 0 ||
+      write_exact(d->sock, &req, sizeof(req)) < 0)
+    mrb_sys_fail(mrb, "send OpenInputDevice");
+  if (read_exact(d->sock, &ok, sizeof(ok)) < 0)
+    mrb_sys_fail(mrb, "read OpenInputDevice reply");
+  if (ok == 0)
+    mrb_raisef(mrb, E_RUNTIME_ERROR, "server could not open input device %s",
+               path);
+
+  fd = recv_fd(d->sock);
+  if (fd < 0)
+    mrb_raise(mrb, E_RUNTIME_ERROR, "server sent no input device fd");
+  return rm2_input_new(mrb, fd);
+}
+
 void
 rm2_display_init(mrb_state* mrb, struct RClass* rm2) {
   struct RClass* cls =
@@ -432,4 +476,6 @@ rm2_display_init(mrb_state* mrb, struct RClass* rm2) {
   mrb_define_method(mrb, cls, "pixel", rm2_display_pixel, MRB_ARGS_REQ(2));
   mrb_define_method(mrb, cls, "draw_line", rm2_display_draw_line, MRB_ARGS_REQ(6));
   mrb_define_method(mrb, cls, "update_raw", rm2_display_update_raw, MRB_ARGS_REQ(6));
+  mrb_define_method(mrb, cls, "open_input", rm2_display_open_input,
+                    MRB_ARGS_ARG(1, 1));
 }

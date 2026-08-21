@@ -22,6 +22,24 @@ and clip to the panel; negative extents raise `ArgumentError`. `draw_line`
 stamps a square brush of `width` px on each point of the line, centred but
 biased up-left for even widths.
 
+```ruby
+paths  = RM2::Input.resolve_all('Wacom I2C Digitizer')  # real node + uinput clone
+inputs = paths.map { |p| d.open_input(p) }
+while RM2::Input.wait(inputs, 100)
+  inputs.each do |i|
+    i.pending_events.each { |x, y, pressure, tools| ... }
+  end
+end
+```
+
+`resolve_all` is plural because the display server publishes uinput clones of
+each device under the same evdev name (real pen events go to the hardware
+node, TCP-injected ones to the clone), so a client that wants both opens
+every match. Input fds are requested over the display connection — the
+server allows one socket per PID. A sample is `[x, y, pressure, tools]` in
+raw device coordinates, one per `SYN_REPORT`; `tools` is a bitmask of
+`RM2::Input::PEN`, `RUBBER`, `TOUCH`.
+
 Tests run against a fake protocol server (`test/fake_server.c`, forked by
 mrbtest via the `mrb_mruby_rm2_gem_test` hook) — see `test/display.rb`.
 Protocol reference: `PLAN.md` §3 in the repo root.

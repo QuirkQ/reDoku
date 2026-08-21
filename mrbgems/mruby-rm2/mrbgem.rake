@@ -7,7 +7,10 @@ MRuby::Gem::Specification.new('mruby-rm2') do |spec|
   # without it the documented error contract silently degrades to RuntimeError.
   spec.add_dependency('mruby-errno', core: 'mruby-errno')
 
-  # Tests read the fake server's update log and assert raw wire bytes.
-  spec.add_test_dependency('mruby-io',    core: 'mruby-io')
-  spec.add_test_dependency('mruby-pack',  core: 'mruby-pack')
+  # Input.resolve_all reads device names out of sysfs.
+  spec.add_dependency('mruby-io',  core: 'mruby-io')
+  spec.add_dependency('mruby-dir', core: 'mruby-dir')
+
+  # Tests read the fake server's logs and assert raw wire bytes.
+  spec.add_test_dependency('mruby-pack', core: 'mruby-pack')
 end

@@ -1,11 +1,11 @@
-#include <mruby.h>
-#include <mruby/class.h>
-
-void rm2_display_init(mrb_state* mrb, struct RClass* rm2);
+#include "rm2.h"
 
 void
 mrb_mruby_rm2_gem_init(mrb_state* mrb) {
   struct RClass* rm2 = mrb_define_module(mrb, "RM2");
+  /* Input first: rm2_input_new resolves RM2::Input by class lookup, and
+   * Display#open_input calls it. */
+  rm2_input_init(mrb, rm2);
   rm2_display_init(mrb, rm2);
 }
 
