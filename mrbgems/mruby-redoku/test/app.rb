@@ -147,6 +147,42 @@ assert('App does not draw ink from a stroke that began off the board') do
   assert_equal [], d.lines
 end
 
+assert('App stops inking where the pen leaves the board') do
+  app, d, = new_app
+  s1 = pen_sample(300, 400, true)  # down inside a cell
+  s2 = pen_sample(340, 440, true)  # still inside
+  s3 = pen_sample(340, 1600, true) # dragged off the board, over the buttons
+  p1 = screen_of(s1)
+  p2 = screen_of(s2)
+  app.handle_sample(s1)
+  app.handle_sample(s2)
+  app.handle_sample(s3)
+  assert_equal 1, d.lines.size # only the segment with both ends on the board
+  assert_equal [p1[0], p1[1], p2[0], p2[1], Redoku::App::INK_WIDTH,
+                Redoku::App::INK_GRAY], d.lines[0]
+  # ...and nothing outside the board was marked for a DU flush either.
+  board_bottom = Redoku::Layout::BOARD_Y + Redoku::Layout::BOARD_W
+  assert_true app.ink_dirty[3] < board_bottom
+end
+
+assert('App resumes inking where the pen returns to the board') do
+  app, d, = new_app
+  s1 = pen_sample(300, 400, true)  # down inside a cell
+  s2 = pen_sample(300, 1600, true) # off the board
+  s3 = pen_sample(340, 440, true)  # back on the board
+  s4 = pen_sample(380, 480, true)  # and moving inside it
+  p3 = screen_of(s3)
+  p4 = screen_of(s4)
+  app.handle_sample(s1)
+  app.handle_sample(s2)
+  app.handle_sample(s3)
+  app.handle_sample(s4)
+  # Both crossings are gaps; only the pair with two in-board ends is drawn.
+  assert_equal 1, d.lines.size
+  assert_equal [p3[0], p3[1], p4[0], p4[1], Redoku::App::INK_WIDTH,
+                Redoku::App::INK_GRAY], d.lines[0]
+end
+
 assert('a tap on Quit stops the loop') do
   app, = new_app
   assert_true app.running?

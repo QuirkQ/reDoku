@@ -123,9 +123,18 @@ module Redoku
               end
     end
 
+    # The board is the writing surface and the chrome is not, so a segment is
+    # drawn only when both of its endpoints are on the board: an :ink stroke
+    # that wanders off leaves a gap and picks up again where it returns.
+    # Clamping the stray endpoint to the border instead would drag it along
+    # the edge and smear a line down the side of the board for as long as the
+    # pen stayed outside, which is worse than the gap. @last and @path still
+    # advance unconditionally, so travel and the stroke stay coherent across
+    # the boundary. cell_at is the board test — it answers nil off the board.
     def continue_stroke(x, y)
       @path += (x - @last[0]).abs + (y - @last[1]).abs
-      if @mode == :ink
+      if @mode == :ink && Layout.cell_at(@last[0], @last[1]) &&
+         Layout.cell_at(x, y)
         @d.draw_line(@last[0], @last[1], x, y, INK_WIDTH, INK_GRAY)
         mark_dirty(@last[0], @last[1], x, y)
       end
@@ -160,6 +169,13 @@ module Redoku
       @renderer.flush_header
     end
 
+    # New wipes the ink. Repainting and flushing board_rect alone is enough
+    # because ink cannot exist anywhere else: continue_stroke refuses any
+    # segment with an endpoint off the board, so every stamped pixel is
+    # within INK_WIDTH / 2 of a line inside board_rect — that is, inside it
+    # or on the 2 px frame overhang, which draw_board repaints black over
+    # black (see Renderer#flush_board). Widen where ink may go and this
+    # flush has to widen with it.
     def clear_ink
       @ink_dirty = nil
       @renderer.draw_board
