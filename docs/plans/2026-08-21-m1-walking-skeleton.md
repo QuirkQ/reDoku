@@ -1513,7 +1513,7 @@ First pure-Ruby task: the new `mruby-redoku` gem with the two leaf modules every
 - Produces:
   - `Redoku::Layout`: constants `SCREEN_W=1404`, `SCREEN_H=1872`, `CELL=140`, `BOARD_X=72`, `BOARD_Y=200`, `BOARD_W=1260`, `CELL_LINE=1`, `BLOCK_LINE=4`, `BTN_W=400`, `BTN_H=140`; `board_rect -> [x,y,w,h]`; `cell_rect(col, row) -> [x,y,w,h]`; `cell_at(px, py) -> [col,row] | nil`; `buttons -> [[name,x,y,w,h], …]` for `:new, :level, :quit`; `button_rect(name)`; `button_at(px, py) -> name | nil`.
   - `Redoku::Font`: `WIDTH=5`, `HEIGHT=7`, `GAP=1`; `draw(display, text, x, y, scale, gray)`; `width(text, scale) -> px`.
-- `Redoku::TestDisplay` (test support) is consumed by Tasks 5 and 6.
+- `TestDisplay` (test support, defined at top level — not under `Redoku`) is consumed by Tasks 5 and 6.
 
 - [ ] **Step 1: Write the test support double**
 
