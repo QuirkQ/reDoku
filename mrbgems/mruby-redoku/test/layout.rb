@@ -2,7 +2,7 @@ assert('Layout board geometry matches the design') do
   assert_equal [72, 200, 1260, 1260], Redoku::Layout.board_rect
   # The board is horizontally centred on the 1404 px panel.
   assert_equal 1404 - (72 + 1260), Redoku::Layout::BOARD_X
-  assert_equal 9 * Redoku::Layout::CELL, Redoku::Layout::BOARD_W
+  assert_equal 1260, Redoku::Layout::BOARD_W
 end
 
 assert('Layout.cell_rect places each of the 81 cells') do

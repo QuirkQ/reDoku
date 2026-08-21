@@ -24,7 +24,9 @@ assert('Font.draw scales each pixel into a square block') do
   assert_equal 0, d.gray_at(0, 0)
   assert_equal 0, d.gray_at(3, 3)
   assert_nil d.gray_at(0, 4)   # row 1 of 'I' is blank outside the stem
-  assert_equal 28, Redoku::Font::HEIGHT * 4
+  # The glyph is 7 rows of 4 px: its last row is y 24..27, and nothing below.
+  assert_equal 0, d.gray_at(0, 24)
+  assert_nil d.gray_at(0, 28)
 end
 
 assert('Font.draw advances along the string and honours gray') do

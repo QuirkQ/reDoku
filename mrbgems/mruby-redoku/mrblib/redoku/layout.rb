@@ -7,8 +7,11 @@ module Redoku
     SCREEN_W = 1404
     SCREEN_H = 1872
 
+    # The board is square, so BOARD_W doubles as its vertical extent —
+    # board_rect and cell_at both lean on that.
+    SIZE     = 9                  # cells per side
     CELL     = 140
-    BOARD_W  = 9 * CELL           # 1260
+    BOARD_W  = SIZE * CELL        # 1260
     BOARD_X  = (SCREEN_W - BOARD_W) / 2 # 72
     BOARD_Y  = 200                # leaves a header band above the board
 
@@ -25,10 +28,12 @@ module Redoku
 
     # Quit sits alone on the second row so a mis-aimed tap cannot end the
     # game while reaching for New or Level.
+    # Each row is frozen too, not just the outer array: `buttons` hands the
+    # shared array out, so a mutable row would be editable process-wide.
     BUTTONS = [
-      [:new,   BOARD_X,                          BTN_ROW1_Y, BTN_W, BTN_H],
-      [:level, BOARD_X + BTN_W + BTN_GAP,        BTN_ROW1_Y, BTN_W, BTN_H],
-      [:quit,  BOARD_X + 2 * (BTN_W + BTN_GAP),  BTN_ROW2_Y, BTN_W, BTN_H]
+      [:new,   BOARD_X,                          BTN_ROW1_Y, BTN_W, BTN_H].freeze,
+      [:level, BOARD_X + BTN_W + BTN_GAP,        BTN_ROW1_Y, BTN_W, BTN_H].freeze,
+      [:quit,  BOARD_X + 2 * (BTN_W + BTN_GAP),  BTN_ROW2_Y, BTN_W, BTN_H].freeze
     ].freeze
 
     HEADER_X = BOARD_X
@@ -42,7 +47,7 @@ module Redoku
     end
 
     def self.cell_rect(col, row)
-      unless col >= 0 && col < 9 && row >= 0 && row < 9
+      unless col >= 0 && col < SIZE && row >= 0 && row < SIZE
         raise ArgumentError, "cell out of range: #{col},#{row}"
       end
       [BOARD_X + col * CELL, BOARD_Y + row * CELL, CELL, CELL]
