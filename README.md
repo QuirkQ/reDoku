@@ -50,14 +50,16 @@ server means xochitl starts stock instead of crash-looping; install
 failures roll back automatically, and a firmware update wipes the
 systemd files, reverting to stock by itself.
 
-Build the armv7 binaries (`rm2fb_server_swtcon`,
-`librm2fb_client_swtcon.so`, `rm2fbctl` — the Docker build isn't in the
-Makefile yet), then deploy and install:
+`make rm2fb` cross-builds the binaries in Docker (needs the
+[rM2-stuff](https://github.com/timower/rM2-stuff) checkout as
+`../rM2-stuff`, override with `make RM2STUFF_DIR=… rm2fb`) into
+`build/rm2fb/dist/`. Then deploy and install:
 
 ```bash
+make rm2fb
 ssh root@10.11.99.1 'mkdir -p /home/root/redoku/bin /home/root/redoku/lib'
-scp rm2fb_server_swtcon rm2fbctl root@10.11.99.1:/home/root/redoku/bin/
-scp librm2fb_client_swtcon.so root@10.11.99.1:/home/root/redoku/lib/
+scp build/rm2fb/dist/rm2fb_server_swtcon build/rm2fb/dist/rm2fbctl root@10.11.99.1:/home/root/redoku/bin/
+scp build/rm2fb/dist/librm2fb_client_swtcon.so root@10.11.99.1:/home/root/redoku/lib/
 scp device/install.sh device/uninstall.sh root@10.11.99.1:/home/root/redoku/
 ssh root@10.11.99.1 'sh /home/root/redoku/install.sh'
 ```
