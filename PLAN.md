@@ -140,10 +140,10 @@ Pen→screen transform: `sx = ABS_Y * 1404/15725`, `sy = 1872 − ABS_X * 1872/2
 Touch→screen: `sx = X`, `sy = 1872 − Y`.
 
 **Process-lifecycle contract** — one connection per PID (identified via
-`SO_PEERCRED`); expect SIGSTOP/SIGCONT of our process group (so the game
-`setsid()`s); ignore SIGPIPE (server restart = reconnect); on SIGCONT the
-server has already re-flashed our buffer, but we do a defensive full redraw.
-Closing the socket cleanly deregisters us.
+`SO_PEERCRED`); expect SIGSTOP/SIGCONT of our process group; ignore SIGPIPE
+(server restart = reconnect); on SIGCONT the server has already re-flashed
+our buffer, but we do a defensive full redraw. Closing the socket cleanly
+deregisters us.
 
 **TCP :8888 debug protocol** — server pushes every front-client update
 (`UpdateParams` + rect RGB565 pixels) and accepts
@@ -209,19 +209,23 @@ knowledge:
   allows one socket per PID, so input fds ride the Display's connection) and
   returns an `RM2::Input`; `#pending_events` decodes `input_event` structs
   and assembles per-SYN_REPORT samples into `[raw_x, raw_y, pressure, tools]`
-  arrays (`tools` = TOOL_PEN|TOOL_RUBBER|TOUCH bitmask); `#wait(timeout_ms)`
-  polls the fd, so the event loop needs no IO objects
+  arrays (`tools` = TOOL_PEN|TOOL_RUBBER|TOUCH bitmask);
+  `RM2::Input.wait(inputs, timeout_ms)` — a class method over an array of
+  them, one poll() for every source at once, so the event loop needs no IO
+  objects
 - `RM2::Control.clients` / `.switch_to(pid)` — control-socket datagrams
 - `RM2::Inotify.watch(path, mask)` / `#read_events` — for the watcher
-- `RM2.setup_signals` — setsid, ignore SIGPIPE, SIGCONT/SIGTERM → flags
-  polled from Ruby (`RM2.resumed?`, `RM2.terminated?`)
+- `RM2.setup_signals` — ignore SIGPIPE, SIGCONT and SIGTERM/SIGINT → flags
+  polled from Ruby (`RM2.resumed?`, `RM2.terminated?`). No `setsid`: the game
+  keeps its controlling terminal, which is what lets Ctrl-C over an SSH
+  session reach it as SIGINT and quit it cleanly
 
 Everything above this line is Ruby.
 
 ### Ruby event loop
 
-Single-threaded poll loop (`Input#wait`) over the pen fd (touch fd optional
-later) with a timeout that doubles as the recognition-idle timer:
+Single-threaded poll loop (`RM2::Input.wait`) over the pen fds (touch fd
+optional later) with a timeout that doubles as the recognition-idle timer:
 
 1. Pen events → `InputRouter` maps raw→screen coordinates, classifies the
    target region (cell / button), and forwards to the active screen.

@@ -64,11 +64,13 @@ how it connects (the default just works):
   kept open for 2 minutes, so back-to-back commands ask only once.
 
 playing the game:
-  'install' stages the whole tree, the game binary included, and can be
-  re-run at any time. 'play' then only refreshes that one binary
-  (/home/root/redoku/bin/redoku, from the cross build in build/rm2/bin/ —
-  run 'make build' first) and starts it, so working on the game never means
-  restarting the display server. 'uninstall --purge' removes everything.
+  'install' stages the whole tree, the game binary included when it has been
+  cross-built (it warns and installs the display server alone when it
+  hasn't), and can be re-run at any time. 'play' then only refreshes that one
+  binary (/home/root/redoku/bin/redoku, from the cross build in
+  build/rm2/bin/ — run 'make build' first) and starts it, so working on the
+  game never means restarting the display server. 'uninstall --purge'
+  removes everything.
 
 options:
   -H, --host HOST         device address or ssh alias   (default: 10.11.99.1)
@@ -275,14 +277,25 @@ pick_artifact() { # $1 = filename; prints the path
 # The cross-built game, into $GAME. Its path is fixed (mruby's rake decides
 # it), so there is nothing to search for and no --artifacts override; it is
 # checked to really be 32-bit ARM like everything else that leaves this
-# machine. 'install' stages it, 'play' refreshes it.
+# machine.
+#
+# Returns 1 with $GAME empty and $GAME_WHY explaining it, because the two
+# callers want opposite things: 'install' installs the display server —
+# which does not need the game and must stay installable on a fresh clone or
+# while the game build is broken — so it warns and carries on, while 'play'
+# has nothing to run and dies.
 find_game() {
   GAME=$REPO/build/rm2/bin/redoku
-  [ -f "$GAME" ] || \
-    die "no game binary at $GAME — cross-build it with:  make build"
-  is_arm_elf "$GAME" || \
-    die "$GAME is not 32-bit ARM — that is a host build, not a device one;
-  rebuild with:  make clean && make build"
+  GAME_WHY=
+  if [ ! -f "$GAME" ]; then
+    GAME_WHY="no game binary at $GAME — cross-build it with:  make build"
+  elif ! is_arm_elf "$GAME"; then
+    # One line, like the message above it: both callers print it as a single
+    # indented continuation line, where an embedded newline would lose its
+    # prefix and its indentation.
+    GAME_WHY="$GAME is not 32-bit ARM (a host build?) — rebuild with:  make clean && make build"
+  fi
+  [ -z "$GAME_WHY" ] || { GAME=; return 1; }
 }
 
 # ---- commands ----------------------------------------------------------
@@ -291,9 +304,9 @@ cmd_install() {
   [ -f "$REPO/device/install.sh" ] && [ -f "$REPO/device/uninstall.sh" ] || \
     die "device/install.sh not found next to me — run bin/redoku from a reDoku checkout"
 
-  # Before the server hunt below, which may offer a long 'make rm2fb': a
-  # missing game binary should not surface after minutes of building.
-  find_game
+  # Before the server hunt below, which may offer a long 'make rm2fb', so
+  # that the plan can report the game's state without a wait in between.
+  find_game || true
 
   say "looking for the built armv7 binaries in ${ARTIFACTS:-build/rm2fb/dist}"
   SERVER=$(pick_artifact rm2fb_server_swtcon) || SERVER=
@@ -324,7 +337,13 @@ cmd_install() {
   else
     say "  ctl    : rm2fbctl not found — optional, continuing without it"
   fi
-  say "  game   : $GAME"
+  if [ -n "$GAME" ]; then
+    say "  game   : $GAME"
+  else
+    say "  game   : WARNING — skipped, the display server goes on alone:"
+    say "           $GAME_WHY"
+    say "           then re-run 'bin/redoku install' to stage the game"
+  fi
   say "  action : copy to $REMOTE_DIR/ and run the on-device installer"
   say "           (adds files only; any failure rolls back to stock)"
   say "  re-run : safe any time — the same files, the same end state"
@@ -336,7 +355,7 @@ cmd_install() {
   push_file "$SERVER" "$REMOTE_DIR/bin/rm2fb_server_swtcon"
   push_file "$CLIENT" "$REMOTE_DIR/lib/librm2fb_client_swtcon.so"
   [ -z "$CTLBIN" ] || push_file "$CTLBIN" "$REMOTE_DIR/bin/rm2fbctl"
-  push_file "$GAME" "$REMOTE_GAME"
+  [ -z "$GAME" ] || push_file "$GAME" "$REMOTE_GAME"
   push_file "$REPO/device/install.sh" "$REMOTE_DIR/install.sh"
   push_file "$REPO/device/uninstall.sh" "$REMOTE_DIR/uninstall.sh"
   remote "chmod +x $REMOTE_DIR/bin/"'*'
@@ -346,7 +365,11 @@ cmd_install() {
   say "running the on-device installer (~30 s, includes a 15 s verification wait)"
   if remote "sh $REMOTE_DIR/install.sh$_force_arg"; then
     say "all done — xochitl is now running through the display server"
-    say "  play it    : bin/redoku play"
+    if [ -n "$GAME" ]; then
+      say "  play it    : bin/redoku play"
+    else
+      say "  play it    : make build, then bin/redoku play"
+    fi
     say "  check it   : bin/redoku status"
     say "  banished it: bin/redoku uninstall"
   else
@@ -356,7 +379,7 @@ cmd_install() {
 }
 
 cmd_play() {
-  find_game
+  find_game || die "$GAME_WHY"
   connect
 
   # Just the game binary. 'install' stages the whole tree; re-running it here
@@ -398,8 +421,21 @@ cmd_play() {
   # 'wait' reports how it went. 143 is 128+SIGTERM, meaning the signal killed
   # it outright; redoku handles SIGTERM and exits 0 instead, so a timed run
   # ending either way is a run that ended when we asked it to.
+  #
+  # The watchdog's >/dev/null 2>&1 is what makes an early death report early.
+  # 'kill $sp' kills the subshell, not the sleep it forked, and an orphaned
+  # sleep holding the remote stdout keeps the ssh channel from reaching EOF —
+  # so a game that dies in 0.2 s would not be reported for the full N
+  # seconds. With its own stdio detached, the orphan holds nothing. (BusyBox
+  # 1.36 runs 'sleep' in-process and so dies with the subshell, hiding this;
+  # dash and friends leave the orphan, and the device's applet set is a
+  # build-time choice we should not lean on.)
+  #
+  # Ctrl-C here kills ssh, not the game: the watchdog is deliberately left
+  # alive so it still TERMs the game at second N, but the panel stays taken
+  # until then.
   say "running the game for ${PLAY_SECS}s, unattended"
-  _timed="$REMOTE_GAME & rp=\$!; (sleep $PLAY_SECS; kill -TERM \$rp 2>/dev/null) & sp=\$!; wait \$rp; rc=\$?; kill \$sp 2>/dev/null; exit \$rc"
+  _timed="$REMOTE_GAME & rp=\$!; (sleep $PLAY_SECS; kill -TERM \$rp 2>/dev/null) >/dev/null 2>&1 & sp=\$!; wait \$rp; rc=\$?; kill \$sp 2>/dev/null; exit \$rc"
   _rc=0
   remote "$_timed" || _rc=$?
   case $_rc in

@@ -45,12 +45,14 @@ bin/redoku install
 It takes the cross-built display server from `build/rm2fb/dist/`
 (offering to run `make rm2fb` first when it isn't built yet) and the game
 from `build/rm2/bin/redoku`, double-checks they really are 32-bit ARM,
-copies everything over, and runs `device/install.sh` on the device.
-Re-running it is safe from any state: the same files land in the same
-places and the device ends up in the same working state, so there is no
-"repair" path to learn. You'll be asked once for the device's SSH
-password. Your `~/.ssh/config` is deliberately ignored so nothing in it
-can interfere; if you have keys or aliases set up, add
+copies everything over, and runs `device/install.sh` on the device. The
+game is optional here: when it hasn't been cross-built, `install` says so
+and puts the display server on by itself. Re-running it is safe from any
+state: the same files land in the same places and the device ends up in
+the same working state, so there is no "repair" path to learn. You'll be
+asked once for the device's SSH password. Your `~/.ssh/config` is
+deliberately ignored so nothing in it can interfere; if you have keys or
+aliases set up, add
 `--ssh-config ~/.ssh/config`. See `bin/redoku --help` for all options
 (`--dry-run` shows the plan without touching anything).
 
