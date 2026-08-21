@@ -9,8 +9,12 @@ Quit, and you're back in the stock UI exactly where you left it.
 
 **Status:** design approved 2026-08-20. Build pipeline + `mruby-rm2` display
 gem complete 2026-08-21 (host tests green against a fake rm2fb server;
-cross-built mruby verified running on the device). Next: Milestone 0 —
-install the display server on-device.
+cross-built mruby verified running on the device). **Milestone 0 passed
+2026-08-21**: rm2fb (swtcon) installed via `bin/redoku install` on firmware
+3.27.3.0 — xochitl feels stock under the client shim, the mruby
+checkerboard demo flashed onto the e-ink and xochitl's UI came back, and
+`rm2fbctl list` works (live-client `switch` deferred to M1, which builds
+the first long-running client). Next: Milestone 1 — the walking skeleton.
 
 ---
 
@@ -32,7 +36,8 @@ driver and is therefore **firmware-version-independent** (no per-version
 address hooks). Its master branch explicitly handles the RGB32 framebuffer
 format that firmware 3.24+/3.27 introduced (see the repo's
 `doc/swtcon_3.27_diff.md`), tested by the author against a real 3.27 image.
-Our exact build 3.27.3.0 is unverified → hence the Milestone 0 gate (§10).
+Our exact build 3.27.3.0 was unverified → hence the Milestone 0 gate (§10),
+**passed on the real device 2026-08-21**.
 
 Decisions already made with rationale:
 
@@ -412,6 +417,11 @@ coordinates; (c) `rm2fbctl switch` flips between xochitl and the hello client
 cleanly. **Hard gate: if (a) fails we stop and decide** — options are the
 rM2-stuff issue tracker, the 3.28 beta channel, or a codexctl downgrade to a
 supported 3.23 build. Nothing beyond M0 starts until the gate passes.
+**Passed 2026-08-21**: (a) confirmed by feel on-device; (b) via
+`examples/checkerboard.rb` (acked GC16 sync update, visually confirmed,
+xochitl restored on disconnect) — the planned C hello-client became the
+mruby demo, exercising the real client stack instead; (c) `rm2fbctl list`
+verified, live-client `switch` deferred to M1's long-running skeleton.
 
 **M1 — walking skeleton.** mruby cross-build + `mruby-rm2` shim; `redoku`
 draws the empty board and echoes pen ink into cells; Quit button returns to
