@@ -506,7 +506,7 @@ assert('Display#open_input rejects a path that does not fit the wire struct') do
 end
 
 assert('RM2::Input.resolve_all returns every node with a matching name') do
-  root = "/tmp/redoku-sysfs-#{Process.pid rescue 0}"
+  root = '/tmp/redoku-sysfs-test'
   begin
     Dir.mkdir(root) unless Dir.exist?(root)
     # event10 proves numeric (not lexicographic) ordering.
@@ -737,9 +737,10 @@ rm2_input_s_wait(mrb_state* mrb, mrb_value klass) {
 
   mrb_get_args(mrb, "Ai", &ary, &timeout);
   len = RARRAY_LEN(ary);
+  /* Both %d and %i consume an mrb_int, so the literal must be cast. */
   if (len > RM2_MAX_WAIT)
-    mrb_raisef(mrb, E_ARGUMENT_ERROR, "at most %d inputs, got %i",
-               RM2_MAX_WAIT, len);
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "at most %i inputs, got %i",
+               (mrb_int)RM2_MAX_WAIT, len);
   if (len == 0) return mrb_false_value();
 
   for (i = 0; i < len; i++) {

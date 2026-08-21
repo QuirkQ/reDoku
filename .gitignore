@@ -1,3 +1,4 @@
 build/
 build_config.rb.lock
 tmp/
+.superpowers/
