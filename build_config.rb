@@ -7,6 +7,7 @@ MRuby::Build.new do |conf|
   conf.toolchain :gcc
   conf.gembox 'default'
   conf.gem File.expand_path('mrbgems/mruby-rm2', File.dirname(__FILE__))
+  conf.gem File.expand_path('mrbgems/mruby-redoku', File.dirname(__FILE__))
   conf.enable_debug
   conf.enable_test
 end
@@ -37,6 +38,7 @@ MRuby::CrossBuild.new('rm2') do |conf|
   conf.ports :posix
 
   conf.gem File.expand_path('mrbgems/mruby-rm2', File.dirname(__FILE__))
+  conf.gem File.expand_path('mrbgems/mruby-redoku', File.dirname(__FILE__))
 
   conf.build_mrbtest_lib_only
   conf.disable_cxx_exception
