@@ -88,7 +88,7 @@ PLAN.md                                # status line for M1
 | Produced by | Interface |
 |---|---|
 | Task 1 | `Display#draw_line(x1, y1, x2, y2, width, gray) -> self` |
-| Task 2 | `Display#open_input(path, flags = O_RDONLY\|O_NONBLOCK) -> RM2::Input`; `RM2::Input#pending_events -> [[x, y, pressure, tools], …]`; `RM2::Input.wait(inputs, timeout_ms) -> bool`; `RM2::Input.resolve_all(name, root = SYSFS_ROOT) -> [path, …]`; `RM2::Input::PEN\|RUBBER\|TOUCH` |
+| Task 2 | `Display#open_input(path, flags = O_RDONLY\|O_NONBLOCK) -> RM2::Input`; `RM2::Input#pending_events -> [[x, y, pressure, tools], …]`; `RM2::Input.wait(inputs, timeout_ms) -> bool` (true only when some fd is genuinely readable); `RM2::Input#hung_up?`; `RM2::Input.resolve_all(name, root = SYSFS_ROOT) -> [path, …]`; `RM2::Input::PEN\|RUBBER\|TOUCH` |
 | Task 3 | `RM2::Control.clients -> [{pid:, active:, name:}, …]`; `RM2::Control.switch_to(pid) -> bool`; `RM2.setup_signals`; `RM2.terminated?`; `RM2.resumed?` |
 | Task 4 | `Redoku::Layout` constants + `cell_rect`/`cell_at`/`buttons`/`button_at`; `Redoku::Font.draw(display, text, x, y, scale, gray)`/`.width(text, scale)`/`HEIGHT` |
 | Task 5 | `Redoku::Renderer.new(display)` with `#draw_all(difficulty)`, `#draw_board`, `#draw_header(difficulty)`, `#draw_buttons`, `#flush_all`, `#flush_board`, `#flush_header` |
@@ -353,6 +353,8 @@ The server allows one connection per PID, so input fds are requested over the *e
 - Create: `mrbgems/mruby-rm2/mrblib/input.rb`
 - Create: `mrbgems/mruby-rm2/test/input.rb`
 - Modify: `mrbgems/mruby-rm2/src/display.c`, `src/gem.c`, `mrbgem.rake`, `test/fake_server.c`, `README.md`
+
+**Amendment after review (the code blocks below predate it).** `RM2::Input.wait` as first written returned `poll`'s raw count, but `POLLHUP`/`POLLERR`/`POLLNVAL` land in `revents` whether or not they were requested and each makes `poll` return a positive count — so a hung-up fd (rm2fb tearing down a uinput clone, a device unbound) reported "readable" forever while `pending_events` returned `[]`, spinning the event loop at 100% CPU. The shipped contract is therefore: `wait` counts an fd ready only when its `revents` has `POLLIN`; an fd reporting `POLLHUP`/`POLLERR`/`POLLNVAL`, or a `read()` of 0, marks that input **hung up**, observable as `Input#hung_up?` (distinct from `closed?` — the fd is still open) and never readable again. `wait` also rejects a negative timeout instead of blocking forever, `rm2_input_new` forces `O_NONBLOCK` so the decode path's assumption holds whatever flags the caller passed, and `SYN_DROPPED` triggers a resync that suppresses samples until the next `SYN_REPORT` (a full-screen GC16 refresh takes about a second, so the kernel *will* drop pen events).
 
 **Interfaces:**
 - Consumes: `Display` internals from Task 1 (`rm2_display`, `write_exact`, `read_exact`, `recv_fd`, `get_open_display`).
@@ -2147,7 +2149,7 @@ The skeleton's behaviour: ink follows the pen inside the board, taps hit buttons
 - Create: `mrbgems/mruby-redoku/mrblib/redoku/pen.rb`, `mrblib/redoku/app.rb`, `test/pen.rb`, `test/app.rb`
 
 **Interfaces:**
-- Consumes: `Redoku::Layout`, `Redoku::Renderer` (Tasks 4-5); `Display#draw_line`/`#update` (Task 1); `RM2::Input.wait`, `#pending_events`, `RM2::Input::TOUCH` (Task 2); `RM2.terminated?`, `RM2.resumed?` (Task 3).
+- Consumes: `Redoku::Layout`, `Redoku::Renderer` (Tasks 4-5); `Display#draw_line`/`#update` (Task 1); `RM2::Input.wait`, `#pending_events`, `#hung_up?`, `RM2::Input::TOUCH` (Task 2); `RM2.terminated?`, `RM2.resumed?` (Task 3).
 - Produces: `Redoku::Pen.to_screen(raw_x, raw_y) -> [x, y]`, `Redoku::Pen::MAX_X`, `MAX_Y`; `Redoku::App.new(display, sources, renderer, waiter = RM2::Input, signals = RM2)` with `#run`, `#step`, `#handle_sample(sample)`, `#flush_ink`, `#handle_resume`, `#running?`, `#difficulty`, `#ink_dirty`; `Redoku::App::INK_GRAY`, `INK_WIDTH`, `TAP_MAX_PATH`, `POLL_MS`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2186,8 +2188,11 @@ Create `mrbgems/mruby-redoku/test/app.rb`:
 ```ruby
 # Feeds canned samples to App as if they came from an RM2::Input.
 class FakeInput
+  attr_accessor :hung_up
+
   def initialize(batches = [])
     @batches = batches
+    @hung_up = false
   end
 
   def push(batch)
@@ -2197,6 +2202,10 @@ class FakeInput
 
   def pending_events
     @batches.shift || []
+  end
+
+  def hung_up?
+    @hung_up
   end
 
   def empty?
@@ -2405,6 +2414,24 @@ assert('App repaints everything after a resume') do
                 RM2::GC16, RM2::SYNC], d.updates[0]
 end
 
+assert('App#step drops a hung-up source and stops when the last one dies') do
+  app, _d, input = new_app
+  input.hung_up = true
+  app.step
+  assert_false app.running?
+end
+
+assert('App#step keeps running while one live source remains') do
+  d = TestDisplay.new
+  dead = FakeInput.new
+  live = FakeInput.new
+  dead.hung_up = true
+  app = Redoku::App.new(d, [dead, live], Redoku::Renderer.new(d),
+                        FakeWaiter.new([dead, live]), FakeSignals.new)
+  app.step
+  assert_true app.running?
+end
+
 assert('App#run stops when the process is asked to terminate') do
   app, d, _input, signals = new_app
   signals.terminated = true
@@ -2510,7 +2537,10 @@ module Redoku
     end
 
     # One turn of the loop: wait, drain every source, then flush the ink in
-    # a single update rather than one per segment.
+    # a single update rather than one per segment. A hung-up source (the
+    # server tearing down a uinput clone, a device unbound) never becomes
+    # readable again, so it is dropped; losing every source means the pen is
+    # gone and there is nothing left to play with.
     def step
       ready = @waiter.wait(@sources, POLL_MS)
       if ready
@@ -2518,6 +2548,7 @@ module Redoku
           source.pending_events.each { |sample| handle_sample(sample) }
         end
       end
+      drop_hung_up_sources
       flush_ink
       self
     end
@@ -2558,6 +2589,13 @@ module Redoku
     end
 
     private
+
+    def drop_hung_up_sources
+      live = @sources.reject { |source| source.hung_up? }
+      return if live.size == @sources.size
+      @sources = live
+      @running = false if @sources.empty?
+    end
 
     def begin_stroke(x, y)
       @start = [x, y]
