@@ -9,6 +9,11 @@
  *
  * The listening socket is bound in the parent BEFORE forking, so the
  * socket is connectable the moment RM2::TestServer.start returns.
+ *
+ * A second, independent fake lives further down: the SOCK_DGRAM control
+ * socket (start_control/stop_control), with its own paths, its own child
+ * and its own request log. The two share only the read/write helpers, so a
+ * test can run either alone.
  */
 #define _GNU_SOURCE
 #include <mruby.h>
@@ -40,6 +45,10 @@ static char sock_path[108];
 static char log_path[128];
 static char fifo_path[128];
 static char open_input_log_path[128];
+
+static pid_t control_pid = -1;
+static char control_sock_path[108];
+static char control_log_path[128];
 
 static int
 fs_write_exact(int fd, const void* buf, size_t len) {
@@ -274,6 +283,144 @@ fs_last_open_input(mrb_state* mrb, mrb_value self) {
   return mrb_str_new(mrb, buf, sizeof(buf));
 }
 
+/* One 52-byte ControlInterface::Client record: pid at 0, active at 4, the
+ * FbFormat triple at 8..19, name at 20..51. */
+static void
+fs_put_client(char* rec, int32_t pid, uint8_t active, const char* name) {
+  int32_t fmt[3] = { FAKE_FB_WIDTH, FAKE_FB_HEIGHT, 0 };
+  memcpy(rec, &pid, sizeof(pid));
+  rec[4] = (char)active;
+  memcpy(&rec[8], fmt, sizeof(fmt));
+  strncpy(&rec[20], name, 32); /* deliberately may fill all 32, unterminated */
+}
+
+/* Canned reply: int32 count, then two 52-byte Client records. */
+static void
+fs_serve_control(int sock, int log_fd) {
+  for (;;) {
+    char req[8];
+    struct sockaddr_un from;
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(sock, req, sizeof(req), 0, (struct sockaddr*)&from,
+                         &from_len);
+    int32_t type, pid;
+
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      _exit(1);
+    }
+    if (n < (ssize_t)sizeof(req)) continue;
+    if (fs_write_exact(log_fd, req, sizeof(req)) < 0) _exit(1);
+    memcpy(&type, req, sizeof(type));
+    memcpy(&pid, &req[4], sizeof(pid));
+
+    if (type == 0) { /* GetClients */
+      char buf[4 + 2 * 52];
+      int32_t count = 2;
+      memset(buf, 0, sizeof(buf));
+      memcpy(buf, &count, sizeof(count));
+      fs_put_client(&buf[4], 1232, 1, "xochitl");
+      fs_put_client(&buf[4 + 52], 4711, 0, "redoku");
+      if (sendto(sock, buf, sizeof(buf), 0, (struct sockaddr*)&from,
+                 from_len) < 0)
+        _exit(1);
+    } else { /* SwitchTo / anything else: one bool */
+      uint8_t ok = (type == 2 && pid == 1232) ? 1 : 0;
+      if (sendto(sock, &ok, sizeof(ok), 0, (struct sockaddr*)&from,
+                 from_len) < 0)
+        _exit(1);
+    }
+  }
+}
+
+static mrb_value
+fs_start_control(mrb_state* mrb, mrb_value self) {
+  struct sockaddr_un addr;
+  int sock, log_fd;
+  pid_t pid;
+
+  if (control_pid > 0)
+    mrb_raise(mrb, E_RUNTIME_ERROR, "fake control server already running");
+
+  snprintf(control_sock_path, sizeof(control_sock_path),
+           "/tmp/rm2fb-ctl-%d.sock", (int)getpid());
+  snprintf(control_log_path, sizeof(control_log_path), "/tmp/rm2fb-ctl-%d.log",
+           (int)getpid());
+  unlink(control_sock_path);
+  unlink(control_log_path); /* a stale log must not read as this run's */
+
+  log_fd = open(control_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (log_fd < 0) mrb_sys_fail(mrb, "open control log");
+
+  sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (sock < 0) {
+    close(log_fd);
+    mrb_sys_fail(mrb, "control socket");
+  }
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, control_sock_path, sizeof(addr.sun_path) - 1);
+  /* Bound in the parent before the fork, so the socket is addressable the
+   * moment start_control returns. */
+  if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    close(sock);
+    close(log_fd);
+    mrb_sys_fail(mrb, "bind fake control socket");
+  }
+
+  pid = fork();
+  if (pid < 0) {
+    close(sock);
+    close(log_fd);
+    mrb_sys_fail(mrb, "fork fake control server");
+  }
+  if (pid == 0) {
+    fs_serve_control(sock, log_fd);
+    _exit(0);
+  }
+  close(sock);
+  close(log_fd);
+  control_pid = pid;
+  return mrb_str_new_cstr(mrb, control_sock_path);
+}
+
+static mrb_value
+fs_stop_control(mrb_state* mrb, mrb_value self) {
+  if (control_pid > 0) {
+    kill(control_pid, SIGKILL);
+    waitpid(control_pid, NULL, 0);
+    control_pid = -1;
+    unlink(control_sock_path);
+  }
+  return mrb_nil_value();
+}
+
+/* The last 8-byte Request the fake control server logged, or nil when it
+ * has not seen a whole one yet. */
+static mrb_value
+fs_last_control_request(mrb_state* mrb, mrb_value self) {
+  char buf[8];
+  int fd = open(control_log_path, O_RDONLY);
+  if (fd < 0) return mrb_nil_value();
+  if (lseek(fd, -(off_t)sizeof(buf), SEEK_END) < 0 ||
+      fs_read_exact(fd, buf, sizeof(buf)) != 0) {
+    close(fd);
+    return mrb_nil_value();
+  }
+  close(fd);
+  return mrb_str_new(mrb, buf, sizeof(buf));
+}
+
+/* Delivers a signal to the test process itself, which is what makes the
+ * SIGTERM/SIGCONT flags testable without a second process. */
+static mrb_value
+fs_raise_signal(mrb_state* mrb, mrb_value self) {
+  mrb_int sig;
+  mrb_get_args(mrb, "i", &sig);
+  if (raise((int)sig) != 0) mrb_sys_fail(mrb, "raise");
+  return mrb_nil_value();
+}
+
 void
 mrb_mruby_rm2_gem_test(mrb_state* mrb) {
   struct RClass* rm2 = mrb_module_get(mrb, "RM2");
@@ -286,4 +433,12 @@ mrb_mruby_rm2_gem_test(mrb_state* mrb) {
                           MRB_ARGS_REQ(1));
   mrb_define_class_method(mrb, ts, "last_open_input", fs_last_open_input,
                           MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, ts, "start_control", fs_start_control,
+                          MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, ts, "stop_control", fs_stop_control,
+                          MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, ts, "last_control_request",
+                          fs_last_control_request, MRB_ARGS_NONE());
+  mrb_define_class_method(mrb, ts, "raise_signal", fs_raise_signal,
+                          MRB_ARGS_REQ(1));
 }

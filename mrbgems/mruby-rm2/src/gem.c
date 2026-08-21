@@ -7,6 +7,8 @@ mrb_mruby_rm2_gem_init(mrb_state* mrb) {
    * Display#open_input calls it. */
   rm2_input_init(mrb, rm2);
   rm2_display_init(mrb, rm2);
+  rm2_control_init(mrb, rm2);
+  rm2_signals_init(mrb, rm2);
 }
 
 void

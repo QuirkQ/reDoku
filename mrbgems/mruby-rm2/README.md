@@ -50,6 +50,32 @@ uinput clones, and the kernel then reports `POLLHUP` and EOF. `wait` and
 never reports readable again, so close it and drop it from the list you pass
 to `wait`. `#closed?` stays false: the fd is still yours to close.
 
+```ruby
+RM2::Control.clients        # => [{pid: 1232, active: true, name: "xochitl"}, ...]
+RM2::Control.switch_to(pid) # hand the panel to another client
+
+RM2.setup_signals           # SIGTERM/SIGINT -> RM2.terminated?, SIGCONT -> RM2.resumed?
+```
+
+The control socket is a separate `SOCK_DGRAM` RPC endpoint at
+`RM2::Control::SOCKET_PATH` (`/var/run/rm2fb.control.sock`), not the display
+connection, so `clients` can inspect the server without taking the screen.
+Both methods take an optional path so tests can point at a fake.
+
+Never `switch_to` away from a live display client of your own process: the
+server SIGSTOPs the demoted client's whole process group, so the call would
+freeze the caller. Give the screen back by closing the display and exiting.
+
+`terminated?` is sticky — once the process has been asked to quit it stays
+true. `resumed?` is consumed on read: each SIGCONT is reported exactly once,
+which is the cue to repaint everything rather than trust what is on the
+panel. Handlers are installed without `SA_RESTART`, so a signal cuts a
+blocking `RM2::Input.wait` short and the event loop gets a turn to look at
+the flags. `setup_signals` also ignores SIGPIPE, so a dead server surfaces as
+a `SystemCallError` from the next `#update` instead of killing the process.
+
 Tests run against a fake protocol server (`test/fake_server.c`, forked by
-mrbtest via the `mrb_mruby_rm2_gem_test` hook) — see `test/display.rb`.
+mrbtest via the `mrb_mruby_rm2_gem_test` hook) — see `test/display.rb`. The
+control socket has its own independent fake in the same file
+(`start_control`/`stop_control`) — see `test/control.rb`.
 Protocol reference: `PLAN.md` §3 in the repo root.
