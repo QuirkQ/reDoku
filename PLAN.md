@@ -192,12 +192,14 @@ knowledge:
   `#blit(x, y, w, h, packed_gray_string)` — pixel pushing in C for speed
 - `Display#update(x, y, w, h, waveform:, flags:)` — clamps, converts to
   inclusive y-first corners, sends, reads ack
-- `RM2::Input.open(name)` → resolves the device path by scanning
-  `/dev/input/event*` for the matching evdev name, then requests that path's
-  fd from the server (`OpenInputDevice`); `#pending_events` decodes
-  `input_event` structs and assembles per-SYN_REPORT samples into
-  `[:pen, raw_x, raw_y, pressure, tool_state]` / `[:touch, ...]` arrays; `#fd`
-  exposed for the Ruby select loop
+- `RM2::Input.resolve(name)` → device path by scanning `/dev/input/event*`
+  for the matching evdev name; `Display#open_input(path)` requests that
+  path's fd over the display connection (`OpenInputDevice` — the server
+  allows one socket per PID, so input fds ride the Display's connection) and
+  returns an `RM2::Input`; `#pending_events` decodes `input_event` structs
+  and assembles per-SYN_REPORT samples into `[raw_x, raw_y, pressure, tools]`
+  arrays (`tools` = TOOL_PEN|TOOL_RUBBER|TOUCH bitmask); `#wait(timeout_ms)`
+  polls the fd, so the event loop needs no IO objects
 - `RM2::Control.clients` / `.switch_to(pid)` — control-socket datagrams
 - `RM2::Inotify.watch(path, mask)` / `#read_events` — for the watcher
 - `RM2.setup_signals` — setsid, ignore SIGPIPE, SIGCONT/SIGTERM → flags
@@ -207,8 +209,8 @@ Everything above this line is Ruby.
 
 ### Ruby event loop
 
-Single-threaded `IO.select` loop over the pen fd (touch fd optional later)
-with a timeout that doubles as the recognition-idle timer:
+Single-threaded poll loop (`Input#wait`) over the pen fd (touch fd optional
+later) with a timeout that doubles as the recognition-idle timer:
 
 1. Pen events → `InputRouter` maps raw→screen coordinates, classifies the
    target region (cell / button), and forwards to the active screen.
