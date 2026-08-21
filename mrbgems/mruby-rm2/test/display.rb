@@ -193,6 +193,52 @@ assert('draw_line validates its arguments') do
     assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 1, 256) }   # gray > 255
     assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 1, -1) }    # gray < 0
     assert_raise(ArgumentError) { d.draw_line(0, 0, 200000, 0, 1, 0) } # span too large
+    assert_raise(ArgumentError) { d.draw_line(0, 0, 65535, 0, 1000000, 0) } # width too large
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line handles reversed endpoints, vertical and steep lines') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    d.draw_line(400, 400, 396, 396, 1, 255) # reversed diagonal: x2 < x1, y2 < y1
+    assert_equal 0xFFFF, d.pixel(400, 400)
+    assert_equal 0xFFFF, d.pixel(398, 398)
+    assert_equal 0xFFFF, d.pixel(396, 396)
+
+    d.draw_line(500, 500, 500, 504, 1, 255) # vertical line
+    assert_equal 0xFFFF, d.pixel(500, 500)
+    assert_equal 0xFFFF, d.pixel(500, 504)
+    assert_equal 0x0000, d.pixel(501, 500) # width 1 stays on one column
+
+    d.draw_line(600, 600, 602, 610, 1, 255) # steep line: dy > dx
+    assert_equal 0xFFFF, d.pixel(600, 600)
+    assert_equal 0xFFFF, d.pixel(602, 610)
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line brush at the right edge does not wrap onto the next row') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    d.draw_line(1403, 100, 1403, 100, 5, 255) # brush hangs off the right edge
+    assert_equal 0xFFFF, d.pixel(1403, 100)
+    assert_equal 0x0000, d.pixel(0, 101) # must not wrap onto the next row
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line entirely off-panel does not crash or paint') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    d.draw_line(5000, 100, 5001, 100, 1, 255) # fully off the right edge
+    assert_equal 0x0000, d.pixel(1403, 100) # nothing bled onto the visible panel
   ensure
     RM2::TestServer.stop
   end

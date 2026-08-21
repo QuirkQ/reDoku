@@ -127,9 +127,18 @@ recv_fd(int sock) {
   if (n <= 0) return -1;
 
   c = CMSG_FIRSTHDR(&msg);
-  if (c == NULL || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS ||
-      c->cmsg_len != CMSG_LEN(sizeof(int)) || (msg.msg_flags & MSG_CTRUNC) != 0)
+  if (c == NULL || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
     return -1;
+  if (c->cmsg_len != CMSG_LEN(sizeof(int)) || (msg.msg_flags & MSG_CTRUNC) != 0) {
+    /* The kernel may still have installed an fd (e.g. a second, truncated
+     * one after the first) even though the message as a whole is rejected;
+     * close it rather than leaking it into the process. */
+    if (c->cmsg_len >= CMSG_LEN(sizeof(int))) {
+      memcpy(&fd, CMSG_DATA(c), sizeof(fd));
+      close(fd);
+    }
+    return -1;
+  }
   memcpy(&fd, CMSG_DATA(c), sizeof(fd));
   return fd;
 }
@@ -261,13 +270,13 @@ rm2_display_closed_p(mrb_state* mrb, mrb_value self) {
 
 /* Gray 0..255 -> RGB565 (PLAN.md §3). */
 static uint16_t
-gray565(mrb_int gray) {
+rm2_gray565(mrb_int gray) {
   return (uint16_t)((gray >> 3) | ((gray >> 2) << 5) | ((gray >> 3) << 11));
 }
 
 /* One brush stamp: a `width`-sided square centred on (x, y), clipped. */
 static void
-stamp(rm2_display* d, mrb_int x, mrb_int y, mrb_int width, uint16_t px) {
+rm2_stamp(rm2_display* d, mrb_int x, mrb_int y, mrb_int width, uint16_t px) {
   mrb_int half = width / 2;
   mrb_int x1 = x - half, y1 = y - half;
   mrb_int x2 = x1 + width, y2 = y1 + width;
@@ -277,6 +286,7 @@ stamp(rm2_display* d, mrb_int x, mrb_int y, mrb_int width, uint16_t px) {
   if (y1 < 0) y1 = 0;
   if (x2 > d->width) x2 = d->width;
   if (y2 > d->height) y2 = d->height;
+  if (x1 >= x2 || y1 >= y2) return;
   for (row = y1; row < y2; row++) {
     uint16_t* p = d->fb + (size_t)row * d->width + x1;
     for (col = x1; col < x2; col++) *p++ = px;
@@ -306,7 +316,7 @@ rm2_display_fill_rect(mrb_state* mrb, mrb_value self) {
   if (y2 > d->height) y2 = d->height;
   if (x >= x2 || y >= y2) return self;
 
-  px = gray565(gray);
+  px = rm2_gray565(gray);
   for (row = y; row < y2; row++) {
     uint16_t* p = d->fb + (size_t)row * d->width + x;
     for (col = x; col < x2; col++) *p++ = px;
@@ -340,20 +350,20 @@ rm2_display_draw_line(mrb_state* mrb, mrb_value self) {
 
   if (gray < 0 || gray > 255)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "gray must be 0..255");
-  if (width < 1)
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "width must be >= 1");
+  if (width < 1 || width > RM2_MAX_SPAN)
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "width must be >= 1 and <= 65535");
 
   dx = x2 > x1 ? x2 - x1 : x1 - x2;
   dy = y2 > y1 ? y2 - y1 : y1 - y2;
   if (dx > RM2_MAX_SPAN || dy > RM2_MAX_SPAN)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "line span too large");
 
-  px = gray565(gray);
+  px = rm2_gray565(gray);
   sx = x1 < x2 ? 1 : -1;
   sy = y1 < y2 ? 1 : -1;
   err = dx - dy;
   for (;;) {
-    stamp(d, x1, y1, width, px);
+    rm2_stamp(d, x1, y1, width, px);
     if (x1 == x2 && y1 == y2) break;
     e2 = 2 * err;
     if (e2 > -dy) {

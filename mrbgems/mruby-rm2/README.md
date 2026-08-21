@@ -19,7 +19,8 @@ flashing refresh), `RM2::A2`. Flags: `RM2::SYNC`, `RM2::FAST_DRAW`.
 `#update` returns the server's ack — `false` means another client is front
 and the update was dropped. `fill_rect`/`update` take exclusive width/height
 and clip to the panel; negative extents raise `ArgumentError`. `draw_line`
-stamps a square brush of `width` px centred on each point of the line.
+stamps a square brush of `width` px on each point of the line, centred but
+biased up-left for even widths.
 
 Tests run against a fake protocol server (`test/fake_server.c`, forked by
 mrbtest via the `mrb_mruby_rm2_gem_test` hook) — see `test/display.rb`.
