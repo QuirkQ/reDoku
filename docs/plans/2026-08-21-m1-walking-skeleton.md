@@ -2596,10 +2596,13 @@ module Redoku
 
     private
 
+    # The empty check comes first on purpose: an early return for "nothing
+    # changed" would make it unreachable for a source list that starts empty,
+    # and `wait` returns false immediately for an empty array — so the loop
+    # would spin at 100% CPU with no exit but SIGTERM.
     def drop_hung_up_sources
       live = @sources.reject { |source| source.hung_up? }
-      return if live.size == @sources.size
-      @sources = live
+      @sources = live if live.size != @sources.size
       @running = false if @sources.empty?
     end
 
