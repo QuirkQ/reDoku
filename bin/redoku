@@ -434,8 +434,25 @@ cmd_play() {
   # Ctrl-C here kills ssh, not the game: the watchdog is deliberately left
   # alive so it still TERMs the game at second N, but the panel stays taken
   # until then.
+  #
+  # 'setsid' is what keeps the watchdog out of the game's process group, and
+  # it is load-bearing: the display server pauses a client it demotes with
+  # kill(-getpgid(pid), SIGSTOP) — the WHOLE group. In a non-interactive
+  # 'sh -c' job control is off, so without it the game, the watchdog subshell
+  # and the waiting shell all share the group sshd made, and anything taking
+  # front during the window (xochitl restarting, another rm2fb client, a
+  # stray 'rm2fbctl switch') freezes the watchdog along with the game: N
+  # seconds becomes unbounded, ssh never sees EOF, and the panel stays taken.
+  # In its own session the watchdog cannot be stopped by the game's demotion.
+  #
+  # $! is still the game: setsid() only fails for a process-group leader, and
+  # a background child of this shell is not one, so setsid execs in place
+  # rather than forking. This is not the setsid PLAN.md §5 refuses — that one
+  # is about the game keeping its controlling terminal so Ctrl-C reaches it
+  # as SIGINT, which is the interactive path above; this path has no tty at
+  # all.
   say "running the game for ${PLAY_SECS}s, unattended"
-  _timed="$REMOTE_GAME & rp=\$!; (sleep $PLAY_SECS; kill -TERM \$rp 2>/dev/null) >/dev/null 2>&1 & sp=\$!; wait \$rp; rc=\$?; kill \$sp 2>/dev/null; exit \$rc"
+  _timed="setsid $REMOTE_GAME & rp=\$!; (sleep $PLAY_SECS; kill -TERM \$rp 2>/dev/null) >/dev/null 2>&1 & sp=\$!; wait \$rp; rc=\$?; kill \$sp 2>/dev/null; exit \$rc"
   _rc=0
   remote "$_timed" || _rc=$?
   case $_rc in
