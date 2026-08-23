@@ -92,6 +92,29 @@ assert('Renderer flush methods pick the documented waveforms') do
   assert_equal [10, 20, 30, 40, RM2::DU, RM2::FAST_DRAW], d.updates[0]
 end
 
+assert('Renderer inverts a pressed button and puts it back symmetrically') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  x, y, w, h = Redoku::Layout.button_rect(:new)
+  r.press_button(:new)
+  # Inverted: black paper, white border, white label.
+  assert_equal 0, d.gray_at(x + 10, y + h / 2)
+  assert_equal 255, d.gray_at(x, y)
+  # DU + FAST_DRAW, not the GL16 chrome convention: this has to land in a
+  # tenth of the time, because for Quit it has to beat the teardown it
+  # announces.
+  assert_equal [x, y, w, h, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+
+  r.release_button(:new)
+  # Back to normal, and in the SAME waveform: a press arriving in a tenth of
+  # a second and a release fading back over a GL16's half second would not
+  # read as one gesture.
+  assert_equal 255, d.gray_at(x + 10, y + h / 2)
+  assert_equal 0, d.gray_at(x, y)
+  assert_equal d.updates[0], d.updates[1]
+  assert_equal 2, d.updates.size
+end
+
 assert('Renderer draws nothing outside the panel') do
   d = TestDisplay.new
   Redoku::Renderer.new(d).draw_all(:hard)

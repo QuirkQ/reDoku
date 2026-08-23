@@ -67,6 +67,17 @@ class WedgedDisplay < TestDisplay
   end
 end
 
+# A display that acks every flush except a button's. Contrived on purpose:
+# it isolates the one guarantee N1 established for Quit and this task
+# extends to all three buttons — the press flash is a courtesy and the
+# action is the contract — from the pre-existing question of what an
+# action's OWN failed flush should do.
+class DeafButtonsDisplay < TestDisplay
+  def update(x, y, w, h, waveform: RM2::GL16, flags: 0)
+    raise 'no ack from the display server' if Redoku::Layout.button_at(x, y)
+    super(x, y, w, h, waveform: waveform, flags: flags)
+  end
+end
 
 # A monotonic clock a test can drive. The cooldown is half a second of real
 # time; asserting against a real clock would mean sleeping through it once
@@ -325,27 +336,164 @@ assert('the Quit acknowledgement is held on the panel before the loop stops') do
   # One hold, for the configured duration, watching nothing: waiting on the
   # real sources would end the instant the next pen sample arrived, and the
   # flash it is there to show would be gone before anyone saw it.
-  assert_equal [[[], Redoku::App::QUIT_ACK_MS]], waiter.calls
+  assert_equal [[[], Redoku::App::PRESS_ACK_MS]], waiter.calls
   # ...and the flash had already reached the panel when the hold began,
   # which is the ordering that makes the pause worth anything.
   assert_equal [1], waiter.updates_at
   assert_equal [qx, qy, qw, qh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
 end
 
-assert('New and Level do not hold: only Quit has to be seen before it goes') do
+assert('every button acknowledges its press, at the button, for the same 200 ms') do
+  [:new, :level, :quit].each do |name|
+    d = TestDisplay.new
+    input = FakeInput.new
+    waiter = TimelineWaiter.new([input], d)
+    app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
+                          FakeSignals.new)
+    bx, by, bw, bh = Redoku::Layout.button_rect(name)
+    d.clear_calls
+    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
+    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
+    # The first thing out is the press, at the button, in the ink waveform.
+    # This used to be Quit's alone, on the premise that New and Level
+    # "repaint as their action and already read as responsive". Both halves
+    # are false on hardware: clear_ink's repaint is pixel-identical on a
+    # board with no ink, and cycle_difficulty's only visible change is a
+    # header label 1480 px from the finger that caused it.
+    assert_equal [bx, by, bw, bh, RM2::DU, RM2::FAST_DRAW], d.updates[0],
+                 name.to_s
+    # Inverted means black paper under a white border and label.
+    assert_equal [bx, by, bw, bh, Redoku::Renderer::BLACK], d.rects[0], name.to_s
+    assert_equal [bx, by, bw, Redoku::Renderer::BUTTON_BORDER,
+                  Redoku::Renderer::WHITE], d.rects[1], name.to_s
+    # Held exactly once, for exactly the duration the owner approved on the
+    # device for Quit. One constant, not a second calibration.
+    assert_equal [[[], Redoku::App::PRESS_ACK_MS]], waiter.calls, name.to_s
+  end
+end
+
+assert('New and Level come back up; Quit stays down because it is leaving') do
+  [:new, :level].each do |name|
+    app, d, = new_app
+    bx, by, bw, bh = Redoku::Layout.button_rect(name)
+    d.clear_calls
+    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
+    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
+    assert_true app.running?, name.to_s
+    # Neither action repaints the buttons — clear_ink flushes the board,
+    # cycle_difficulty the header — so without a release of its own the
+    # button would stay inverted for the rest of the session.
+    assert_equal [bx, by, bw, bh, RM2::DU, RM2::FAST_DRAW],
+                 d.updates[d.updates.size - 1], name.to_s
+    # Same waveform in both directions, so the flash is symmetric: a press
+    # arriving in a tenth of a second and a release fading back over a
+    # GL16's half second would not read as one gesture.
+    assert_equal 0, d.gray_at(bx, by), name.to_s               # border black
+    assert_equal 255, d.gray_at(bx + 10, by + bh / 2), name.to_s # paper white
+  end
+
+  # Quit is the exception, and the one that must NOT be put back: e-ink
+  # holds the last image it was given, so the inverted button is the
+  # goodbye. Restoring it would erase the only feedback the tap gives.
+  app, d, = new_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  d.clear_calls
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_equal 1, d.updates.size
+  assert_equal 255, d.gray_at(qx, qy)
+  assert_equal 0, d.gray_at(qx + 10, qy + qh / 2)
+end
+
+assert('the action runs while the button is held down, not after it comes up') do
   d = TestDisplay.new
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
                         FakeSignals.new)
-  [:new, :level].each do |name|
-    bx, by, bw, bh = Redoku::Layout.button_rect(name)
-    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
-    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
+  nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
+  d.clear_calls
+  app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
+  app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
+  # TWO updates had reached the panel by the time the hold began: the press
+  # flash and the board repaint New exists to do. 200 ms is how long a press
+  # lasts, not a toll to charge before every action — so the work starts the
+  # moment the tap is recognised and the button stays down while it happens.
+  assert_equal [2], waiter.updates_at
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
+  # press, action, release — and the release is after the hold.
+  assert_equal 3, d.updates.size
+  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
+end
+
+assert('the acknowledgement runs each action exactly once') do
+  app, d, = new_app
+  lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
+  3.times do |i|
+    d.clear_calls
+    app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
+    app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
+    # One step per tap: a press that ran cycle_difficulty twice would skip a
+    # difficulty, and one that dropped it would stay put.
+    assert_equal Redoku::Renderer::DIFFICULTIES[(i + 1) % 3], app.difficulty
+    chrome = d.updates.reject { |u| u[4] != RM2::GL16 }
+    assert_equal 1, chrome.size # exactly one header flush per tap
   end
+end
+
+assert('a finger tap is acknowledged exactly the way the pen tap is') do
+  app, d, = new_touch_app
+  nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
+  d.clear_calls
+  app.handle_touch_sample(touch_sample(nx + nw / 2, ny + nh / 2, true))
+  app.handle_touch_sample(touch_sample(nx + nw / 2, ny + nh / 2, false))
+  # One mechanism, not two: both sources arrive at the same press(), so the
+  # feedback falls out rather than being written twice.
+  assert_equal 3, d.updates.size
+  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
+  assert_equal 0, d.gray_at(nx, ny)
+end
+
+assert('a Level press whose flash is refused still cycles the difficulty') do
+  d = DeafButtonsDisplay.new
+  input = FakeInput.new
+  waiter = TimelineWaiter.new([input], d)
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new)
+  lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
+  app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
+  app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
+  # N1 for all three buttons now, not Quit's alone: the display socket
+  # carries a 10 s receive timeout, so a press flash really can raise on the
+  # device — and the player must still get the thing they pressed.
+  assert_equal :medium, app.difficulty
   assert_true app.running?
-  # Both repaint as their action, so they already read as responsive; a hold
-  # here would only make the game feel slower.
+  # Nothing reached the panel to hold or to put back, so neither happened.
+  # The header, which is not a button, went out as usual.
+  assert_equal [], waiter.calls
+  assert_equal 1, d.updates.size
+  assert_equal RM2::GL16, d.updates[0][4]
+end
+
+assert('a New press whose flash is refused still clears the ink') do
+  d = DeafButtonsDisplay.new
+  input = FakeInput.new
+  waiter = TimelineWaiter.new([input], d)
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new)
+  app.handle_sample(pen_sample(300, 400, true))
+  app.handle_sample(pen_sample(340, 440, true))
+  app.handle_sample(pen_sample(340, 440, false))
+  d.clear_calls
+  nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
+  app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
+  app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  assert_equal [[bx, by, bw, bh, RM2::GL16, 0]], d.updates
+  assert_nil app.ink_dirty
+  assert_true app.running?
   assert_equal [], waiter.calls
 end
 
@@ -395,8 +543,10 @@ assert('a tap on Level cycles the difficulty and repaints the header') do
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
     expected = Redoku::Renderer::DIFFICULTIES[(i + 1) % 3]
     assert_equal expected, app.difficulty
-    assert_equal 1, d.updates.size
-    assert_equal RM2::GL16, d.updates[0][4]
+    # press flash, header, release flash — the header is the middle one, and
+    # the only GL16 among them.
+    assert_equal 3, d.updates.size
+    assert_equal RM2::GL16, d.updates[1][4]
   end
 end
 
@@ -410,10 +560,11 @@ assert('a tap on New clears the ink and repaints the board') do
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
   bx, by, bw, bh = Redoku::Layout.board_rect
-  # This GL16 board update is the evidence that the ink was cleared. The
-  # gray_at below only confirms draw_board's white fill covers that cell
-  # pixel: gray_at replays fill_rect calls, and ink is a draw_line.
-  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[0]
+  # This GL16 board update is the evidence that the ink was cleared. It is
+  # updates[1], between the press flash and the release flash. The gray_at
+  # below only confirms draw_board's white fill covers that cell pixel:
+  # gray_at replays fill_rect calls, and ink is a draw_line.
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
   assert_equal 255, d.gray_at(300, 400)
 end
 

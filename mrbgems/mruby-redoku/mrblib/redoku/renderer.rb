@@ -81,27 +81,46 @@ module Redoku
       @d.update(x, y, w, h, waveform: waveform, flags: flags)
     end
 
-    # Repaints one button inverted — black paper, white border and label —
-    # and flushes it as ink rather than chrome. That is deliberate: DU is
-    # the two-level waveform the pen echo uses, so this lands in about a
-    # tenth of the time a GL16 chrome refresh would take, and it is the
-    # acknowledgement for a press whose own action may be to tear the game
-    # down (App#quit). Nothing inverts it back: the caller is either
-    # repainting the button itself or exiting.
+    # Paints one button inverted — black paper, white border and label — and
+    # flushes it as ink rather than chrome. That is deliberate: DU is the
+    # two-level waveform the pen echo uses, so this lands in about a tenth of
+    # the time a GL16 chrome refresh would take, and it is the
+    # acknowledgement for a press whose own action may be slow (New repaints
+    # the whole board) or may be to tear the game down (App#quit).
     def press_button(name)
-      x, y, w, h = Layout.button_rect(name)
-      draw_button(name, x, y, w, h, WHITE, BLACK)
-      @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
+      flash_button(name, WHITE, BLACK)
+    end
+
+    # The other half, and the reason draw_button takes its colours as
+    # arguments: a pressed button has to come back up, because neither of the
+    # two actions that survive their own press repaints the buttons
+    # (cycle_difficulty flushes the header, clear_ink the board), so an
+    # inverted button would otherwise stay inverted for the session. Only
+    # App knows which presses outlive themselves, so App decides — see
+    # App#acknowledge.
+    def release_button(name)
+      flash_button(name, BLACK, WHITE)
     end
 
     private
+
+    # One painter for both directions, so the two cannot drift apart: the
+    # release uses the same DU + FAST_DRAW exception to the chrome
+    # convention, over the same rect, and the flash is therefore symmetric.
+    # A press arriving in a tenth of a second and a release fading back over
+    # a GL16's half second would not read as one gesture.
+    def flash_button(name, ink, paper)
+      x, y, w, h = Layout.button_rect(name)
+      draw_button(name, x, y, w, h, ink, paper)
+      @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
+    end
 
     def header_rect
       [Layout::HEADER_X, Layout::HEADER_Y,
        Layout::BOARD_W, Font::HEIGHT * Layout::TITLE_SCALE]
     end
 
-    # `ink` and `paper` swap for the pressed state (press_button). They are
+    # `ink` and `paper` swap for the pressed state (flash_button). They are
     # the only two grays a button uses, so one pair of arguments inverts the
     # whole thing — frame and label included — with no second code path.
     def draw_button(name, x, y, w, h, ink = BLACK, paper = WHITE)

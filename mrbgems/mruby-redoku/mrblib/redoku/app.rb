@@ -27,11 +27,14 @@ module Redoku
     # tight on purpose, and the choice is made per source at the call site.
     TOUCH_TAP_MAX_PATH = 40
 
-    # How long the Quit acknowledgement is held on the panel before the loop
-    # stops. Feedback nobody can see is not feedback: the DU flash lands and
-    # then the process tears down, and on the device the gap before xochitl
-    # repaints was too short to perceive.
-    QUIT_ACK_MS = 200
+    # How long a pressed button is held inverted on the panel — for Quit,
+    # before the loop stops; for the other two, before the button is painted
+    # back. Feedback nobody can see is not feedback: the DU flash lands and
+    # then the next thing happens, and on the device an unheld flash was not
+    # reliably perceptible. 200 ms is the duration the owner approved on
+    # hardware for Quit, and every button now gets that one rather than a
+    # second calibration of its own.
+    PRESS_ACK_MS = 200
 
     # How long the pen may say nothing at all before its proximity latch is
     # treated as stale. @pen_near only ever becomes false because a packet
@@ -419,44 +422,80 @@ module Redoku
     def press(button)
       case button
       when :quit then quit
-      when :level then cycle_difficulty
-      when :new then clear_ink
+      when :level then acknowledge(:level) { cycle_difficulty }
+      when :new then acknowledge(:new) { clear_ink }
       end
     end
 
-    # New and Level repaint as their action, so they read as responsive for
-    # free. Quit is the one press whose action is to disappear — and e-ink
-    # holds the last image it was given, so the board stays on the panel
-    # through teardown and a tap that worked looks like a tap that did
-    # nothing (observed on the device: the game exits, xochitl comes back a
-    # moment later, and in between the frozen board is all there is to see).
-    # So acknowledge first, in the one waveform fast enough to arrive before
-    # the exit it announces — and then hold it. An earlier version of this
-    # comment argued the opposite, that sending the update was enough and
-    # quitting should not wait on the panel; on the device the flash was not
-    # reliably perceptible, and feedback nobody can see is not feedback.
+    # Quit is the one press that is not put back up. Its action is to
+    # disappear, and e-ink holds the last image it was given, so the board
+    # stays on the panel right through teardown and a tap that worked looks
+    # like a tap that did nothing (observed on the device: the game exits,
+    # xochitl comes back a moment later, and in between the frozen board is
+    # all there is to see). The inverted button is therefore the goodbye —
+    # restoring it would erase the only feedback the tap gives.
     def quit
-      acknowledge_quit
-      @running = false
+      acknowledge(:quit, restore: false) { @running = false }
     end
 
-    # The press is a courtesy; the exit is the contract. The display socket
-    # carries a 10 s receive timeout, so a server that stops acking makes
-    # press_button raise SystemCallError — and an exception here would
-    # unwind past main.rb's explicit display.close, leaving the user's
-    # screen to come back whenever a finalizer got round to it. So the
-    # acknowledgement may fail, and quitting still proceeds.
+    # Every press is answered at the button it was pressed on: paint it
+    # inverted, get that onto the panel, run the action, hold the pressed
+    # state long enough to read, paint it back.
     #
-    # A failed press also skips the hold: there is nothing on the panel to
-    # look at, and a wedged server should be quit fast, not 200 ms slower.
-    def acknowledge_quit
-      @renderer.press_button(:quit)
-      # Not a spin and not a new dependency: RM2::Input.wait with nothing to
-      # watch polls no descriptors for the whole timeout, which is exactly a
-      # bounded sleep (see the rm2 gem's input.c). An empty list is passed on
-      # purpose — waiting on the real sources would return the moment the
-      # next pen sample arrived and hold nothing.
-      @waiter.wait([], QUIT_ACK_MS)
+    # This used to be Quit's alone, on the premise that "New and Level
+    # repaint as their action and already read as responsive". Both halves
+    # are false, and the device said so — the owner's report was that New and
+    # Level "don't flash inverted and nothing visual occured", while both
+    # actions were in fact firing correctly the whole time. clear_ink's
+    # repaint is PIXEL-IDENTICAL on a board with no ink, and
+    # cycle_difficulty's only visible change is a header label about 1480 px
+    # from the finger that caused it, on a 1872 px screen.
+    #
+    # ORDER — the action runs INSIDE the press, not before or after it.
+    # 200 ms is how long a press lasts, not a toll the game may charge for
+    # every tap: New's board repaint starts the moment the tap is recognised
+    # and the button stays down while it happens, which is also what a button
+    # does. Holding first and acting afterwards would make every action
+    # 200 ms later than the tap and buy nothing; acting first and flashing
+    # afterwards would put the acknowledgement after the result it is
+    # supposed to announce.
+    #
+    # FAILURE — the press is a courtesy and the action is the contract (N1),
+    # and that now covers all three buttons rather than Quit's alone, because
+    # this is where display I/O joined the New and Level paths. The display
+    # socket carries a 10 s receive timeout, so any of these flushes can
+    # raise. `yield` sits outside every rescue, so the action happens exactly
+    # once whatever the panel does, and an exception cannot unwind past
+    # main.rb's explicit display.close. A press that never reached the panel
+    # is neither held nor restored: there is nothing out there to hold or to
+    # put back, and a wedged server should be answered fast, not 200 ms
+    # slower. That can leave the shared BUFFER inverted — draw_button only
+    # writes memory and cannot fail on a wedged server — which is harmless,
+    # because the only things that ever flush a button's rect are these two
+    # calls and draw_all + flush_all, and every one of them paints the button
+    # immediately before flushing it.
+    def acknowledge(name, restore: true)
+      pressed = show_press(name)
+      yield
+      finish_press(name, restore) if pressed
+      self
+    end
+
+    def show_press(name)
+      @renderer.press_button(name)
+      true
+    rescue StandardError
+      false
+    end
+
+    # The hold is not a spin and not a new dependency: RM2::Input.wait with
+    # nothing to watch polls no descriptors for the whole timeout, which is
+    # exactly a bounded sleep (see the rm2 gem's input.c). An empty list is
+    # passed on purpose — waiting on the real sources would return the moment
+    # the next pen sample arrived and hold nothing.
+    def finish_press(name, restore)
+      @waiter.wait([], PRESS_ACK_MS)
+      @renderer.release_button(name) if restore
       true
     rescue StandardError
       false
