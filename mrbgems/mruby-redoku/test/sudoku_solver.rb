@@ -115,31 +115,34 @@ assert('Solver.solve with an Rng varies its answer but stays correct') do
   assert_equal solved_values, s.solve(values_of(UNIQUE_81), Redoku::Rng.new(9))
 end
 
-assert('Solver.best_cell returns immediately on a forced cell') do
+assert('Solver.pick returns immediately on a forced cell') do
   s = Redoku::Sudoku::Solver
   g = Redoku::Sudoku::Grid
   # One hole in a solved board is forced by definition, and the early exit
-  # means best_cell must hand it back without scanning on.
+  # means pick must hand it back without scanning on.
   values = solved_values
   values[40] = 0
-  cell = s.best_cell(values)
-  assert_equal 40, cell[0]
-  assert_equal 1, g.count_bits(cell[1])
+  cand = s.build_cand(values)
+  i = s.pick(values, cand)
+  assert_equal 40, i
+  assert_equal 1, g.count_bits(cand[i])
 
   # On a full board there is nothing to choose.
-  assert_nil s.best_cell(solved_values)
+  full = solved_values
+  assert_nil s.pick(full, s.build_cand(full))
 
-  # A contradiction is reported as a ZERO mask rather than as nil, so a
-  # caller can tell "nothing left to do" from "this branch is dead".
+  # A contradiction comes back as a cell with a ZERO mask rather than as nil,
+  # so a caller can tell "nothing left to do" from "this branch is dead".
   wedged = Array.new(81, 0)
   8.times { |c| wedged[c] = c + 1 }
   wedged[17] = 9
-  dead = s.best_cell(wedged)
-  assert_equal 8, dead[0]
-  assert_equal 0, dead[1]
+  wcand = s.build_cand(wedged)
+  dead = s.pick(wedged, wcand)
+  assert_equal 8, dead
+  assert_equal 0, wcand[dead]
 end
 
-assert('Solver.best_cell picks the global minimum, not the first empty cell') do
+assert('Solver.pick takes the global minimum, not the first empty cell') do
   s = Redoku::Sudoku::Solver
   g = Redoku::Sudoku::Grid
 
@@ -170,8 +173,67 @@ assert('Solver.best_cell picks the global minimum, not the first empty cell') do
   assert_equal 0, values[0]
   assert_true counts[0] > min
 
-  cell = s.best_cell(values)
-  assert_equal 0, values[cell[0]]
-  assert_equal min, g.count_bits(cell[1])
-  assert_true cell[0] > 0
+  cand = s.build_cand(values)
+  i = s.pick(values, cand)
+  assert_equal 0, values[i]
+  assert_equal min, g.count_bits(cand[i])
+  assert_true i > 0
+end
+
+assert('Solver.assign and unassign leave the candidate grid exactly as found') do
+  s = Redoku::Sudoku::Solver
+  # The undo list is what makes the incremental candidates safe: a peer whose
+  # bit was already absent must NOT be handed the bit back on unassign, or
+  # the grid would drift looser with every backtrack and the solver would
+  # start accepting illegal boards.
+  # An EMPTY board, so cell 0's peers genuinely still offer the digit and
+  # there is something to remove. (UNIQUE_81 is no good here: every empty
+  # peer of cell 0 is already pinned to a different single digit, so
+  # assigning 1 there removes nothing and the grid correctly does not
+  # change -- which says nothing about whether undo works.)
+  values = Array.new(81, 0)
+  cand = s.build_cand(values)
+  before = cand.dup
+  work = values.dup
+
+  touched = s.assign(work, cand, 0, 5)
+  assert_equal 5, work[0]
+  assert_equal 20, touched.size  # all 20 peers offered the 5
+  assert_false before == cand    # something really did change
+  s.unassign(work, cand, 0, touched)
+  assert_equal 0, work[0]
+  assert_equal before, cand
+
+  # A peer that did NOT offer the digit must not be handed it back, or the
+  # grid drifts looser on every backtrack and the solver starts accepting
+  # illegal boards. Cell 1 is a peer of cell 0; take the 5 away from it
+  # first, and assigning 5 at cell 0 must leave it out of the undo list.
+  cand[1] &= ~(1 << 5)
+  narrowed = cand.dup
+  touched2 = s.assign(work, cand, 0, 5)
+  assert_equal 19, touched2.size
+  assert_false touched2.include?(1)
+  s.unassign(work, cand, 0, touched2)
+  assert_equal narrowed, cand
+
+  # And the same across a whole exhaustive count, which is many assign and
+  # unassign pairs deep: a leak shows up as a mismatch here. `tally` is the
+  # right method to check it on, because it restores unconditionally -- it
+  # has to, or a later branch would count against a corrupted grid.
+  puzzle = values_of(UNIQUE_81)
+  deep = s.build_cand(puzzle)
+  snapshot = deep.dup
+  board = puzzle.dup
+  s.tally(board, deep, 2, nil)
+  assert_equal snapshot, deep
+  assert_equal puzzle, board # the board comes back untouched too
+
+  # `search`, by contrast, deliberately does NOT unwind on success: `solve`
+  # wants the solved board it just built, so the last winning assignment
+  # stays put. Worth pinning so nobody "fixes" it into symmetry with tally.
+  won = values_of(UNIQUE_81)
+  wcand = s.build_cand(won)
+  assert_true s.search(won, wcand, nil)
+  assert_true Redoku::Sudoku::Grid.complete?(won)
+  assert_equal solved_values, won
 end

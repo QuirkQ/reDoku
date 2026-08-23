@@ -14,83 +14,115 @@ module Redoku
     #             optimisation — it is what makes digging terminate at all.
     #
     # Both check CONSISTENCY at the door and then never again. That check is
-    # not decoration: the search only ever looks at empty cells, so a board
+    # not decoration: the search only ever looks at EMPTY cells, so a board
     # that already repeats a digit has nothing wrong with any empty cell and
     # would be "solved" successfully, reporting a contradiction as an answer.
-    # Once past the door the search only ever writes legal digits, so the
-    # invariant holds for free and re-checking per node would be wasted work.
+    # Past the door only legal digits are written, so the invariant holds for
+    # free and re-checking per node would be waste.
     #
-    # Both pick the most-constrained empty cell first (minimum remaining
-    # values). That single heuristic is the difference between a generator
-    # that finishes inside PLAN.md §7's few-hundred-millisecond budget on the
-    # Cortex-A7 and one that explores a doomed branch to depth 60 before
-    # noticing.
+    # CANDIDATES ARE MAINTAINED INCREMENTALLY, and that is the whole
+    # performance story. The obvious version recomputes each empty cell's
+    # candidates from its 20 peers every time it looks for a cell to try,
+    # which is ~1600 operations per search node; digging one puzzle runs 41
+    # searches of many nodes each and cost 922 ms on the build host, against
+    # PLAN.md §7's few-hundred-millisecond budget on a much slower
+    # Cortex-A7. Here `cand` is threaded through the recursion: `assign`
+    # clears one bit from the peers it actually changed and hands back that
+    # list, `unassign` puts exactly those back, and choosing a cell becomes
+    # 81 table lookups. The undo list is what keeps it exact — restoring by
+    # recomputation would be both slower and a chance to drift.
     #
     # Neither entry point mutates its argument.
     class Solver
       def self.solve(values, rng = nil)
         return nil unless Grid.consistent?(values)
         work = values.dup
-        search(work, rng) ? work : nil
+        search(work, build_cand(work), rng) ? work : nil
       end
 
       # Returns min(actual solutions, limit).
       def self.count(values, limit = 2)
         return 0 unless Grid.consistent?(values)
         return 0 if limit <= 0
-        tally(values.dup, limit, nil)
+        work = values.dup
+        tally(work, build_cand(work), limit, nil)
       end
 
       def self.unique?(values)
         count(values, 2) == 1
       end
 
-      # The most constrained empty cell as [index, mask], or nil when the
-      # board is full. Three behaviours the callers depend on:
-      #   - returns immediately on a single-candidate cell, since nothing can
-      #     beat one and scanning on would be pure cost;
-      #   - reports a contradiction as a ZERO mask rather than as nil, so a
-      #     caller can tell "nothing left to do" from "this branch is dead";
-      #   - never considers a filled cell.
-      # Public because it is the load-bearing heuristic and is tested
-      # directly; `search` and `tally` are internal but left public too,
-      # because `private_class_method` is not worth a compatibility risk for
-      # two methods nobody outside calls.
-      def self.best_cell(values)
+      # A filled cell's entry is 0 and is never read: `pick` tests the board
+      # before it touches the mask. That is what lets `assign` leave cand[i]
+      # alone and `unassign` have nothing to put back for the cell itself.
+      def self.build_cand(work)
+        cand = []
+        Grid::CELLS.times do |i|
+          cand << (work[i] == 0 ? Grid.candidates(work, i) : 0)
+        end
+        cand
+      end
+
+      # The most constrained empty cell, or nil when the board is full.
+      # Returns immediately on a cell with one candidate or none: one cannot
+      # be beaten, and none means this branch is already dead, so scanning on
+      # would be pure cost. The caller distinguishes those two by looking at
+      # the mask.
+      def self.pick(work, cand)
         best_i = nil
-        best_mask = 0
         best_n = 10
         i = 0
         while i < Grid::CELLS
-          if values[i] == 0
-            mask = Grid.candidates(values, i)
-            n = Grid.count_bits(mask)
-            return [i, mask] if n <= 1
+          if work[i] == 0
+            n = Grid::BIT_COUNT[cand[i]]
+            return i if n <= 1
             if n < best_n
               best_n = n
-              best_mask = mask
               best_i = i
             end
           end
           i += 1
         end
-        best_i.nil? ? nil : [best_i, best_mask]
+        best_i
       end
 
-      # Depth-first, in place, restoring the cell on the way out so `work` is
-      # left exactly as it was found on a failed branch. Depth is bounded by
-      # the 81 cells, so the recursion cannot run away.
-      def self.search(work, rng)
-        cell = best_cell(work)
-        return true if cell.nil? # no empty cell left: solved
-        i = cell[0]
-        digits = Grid.bits(cell[1])
+      # Writes d at i and removes it from every empty peer that still offered
+      # it, returning just those peers so the undo is exact. cand[i] is left
+      # as it was, because nothing reads a filled cell's mask.
+      def self.assign(work, cand, i, d)
+        bit = 1 << d
+        touched = []
+        Grid::PEERS[i].each do |j|
+          next unless work[j] == 0
+          next if (cand[j] & bit) == 0
+          cand[j] &= ~bit
+          touched << j
+        end
+        work[i] = d
+        touched
+      end
+
+      # The digit is read off the board BEFORE the cell is cleared, which is
+      # the one ordering constraint in here.
+      def self.unassign(work, cand, i, touched)
+        bit = 1 << work[i]
+        touched.each { |j| cand[j] |= bit }
+        work[i] = 0
+      end
+
+      # Depth-first, in place, restoring the cell on the way out so `work`
+      # and `cand` are left exactly as found on a failed branch. Depth is
+      # bounded by the 81 cells, so the recursion cannot run away.
+      def self.search(work, cand, rng)
+        i = pick(work, cand)
+        return true if i.nil? # no empty cell left: solved
+        digits = Grid::BIT_LIST[cand[i]]
         return false if digits.empty? # dead branch
         digits = rng.shuffle(digits) if rng
         digits.each do |d|
-          work[i] = d
-          return true if search(work, rng)
-          work[i] = 0
+          touched = assign(work, cand, i, d)
+          return true if search(work, cand, rng)
+          unassign(work, cand, i, touched)
         end
         false
       end
@@ -98,23 +130,22 @@ module Redoku
       # The same search, except it keeps going after a hit instead of
       # returning, and stops the moment `limit` solutions have been seen.
       #
-      # The budget passed DOWN is the remaining one, not the original: a
-      # child that may only find two more solutions must not be allowed to
-      # enumerate two hundred. Combined with the `found >= limit` early
-      # return, that also guarantees the recursive call always gets a limit
-      # of at least 1, so no child is ever invoked with a budget of zero.
-      def self.tally(work, limit, rng)
-        cell = best_cell(work)
-        return 1 if cell.nil? # a complete board: one solution
-        i = cell[0]
-        digits = Grid.bits(cell[1])
+      # The budget passed DOWN is the remaining one, not the original: a child
+      # that may only find two more solutions must not enumerate two hundred.
+      # Combined with the `found >= limit` early return, that also guarantees
+      # every recursive call gets a limit of at least 1, so no child is ever
+      # invoked with a budget of zero.
+      def self.tally(work, cand, limit, rng)
+        i = pick(work, cand)
+        return 1 if i.nil? # a complete board: one solution
+        digits = Grid::BIT_LIST[cand[i]]
         return 0 if digits.empty?
         digits = rng.shuffle(digits) if rng
         found = 0
         digits.each do |d|
-          work[i] = d
-          found += tally(work, limit - found, rng)
-          work[i] = 0
+          touched = assign(work, cand, i, d)
+          found += tally(work, cand, limit - found, rng)
+          unassign(work, cand, i, touched)
           return found if found >= limit
         end
         found

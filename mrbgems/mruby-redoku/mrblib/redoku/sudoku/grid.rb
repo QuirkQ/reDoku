@@ -125,27 +125,49 @@ module Redoku
         mask
       end
 
-      # Both of these start at 1, because bit 0 is not a digit. A nine-step
-      # loop beats any popcount cleverness at this width, and the idioms that
-      # would express it (Integer#digits, Array#count) are not available here.
-      def self.count_bits(mask)
-        n = 0
-        d = 1
-        while d <= 9
-          n += 1 if (mask & (1 << d)) != 0
-          d += 1
+      # Popcount and digit-list LOOKUP TABLES, indexed by mask, built once at
+      # load. Every mask this engine produces is a subset of ALL, so 1024
+      # entries covers every one of them.
+      #
+      # These are tables rather than the obvious nine-step loop because the
+      # loop was measured as the dominant cost of puzzle generation: the
+      # solver asks "how many candidates" and "which candidates" at every
+      # node of every search, and digging one puzzle runs 41 searches. One
+      # dig cost 922 ms before this (host benchmark, recorded in the M2
+      # ledger). Both start at digit 1, since bit 0 is not a digit.
+      def self.build_bit_tables
+        counts = []
+        lists = []
+        1024.times do |m|
+          n = 0
+          list = []
+          d = 1
+          while d <= 9
+            if (m & (1 << d)) != 0
+              n += 1
+              list << d
+            end
+            d += 1
+          end
+          counts << n
+          lists << list.freeze
         end
-        n
+        [counts, lists]
       end
 
+      BIT_TABLES = build_bit_tables
+      BIT_COUNT = BIT_TABLES[0].freeze
+      BIT_LIST = BIT_TABLES[1].freeze
+
+      def self.count_bits(mask)
+        BIT_COUNT[mask]
+      end
+
+      # A COPY, because the table's rows are shared and frozen and callers
+      # have always been free to treat the result as their own. The solver's
+      # inner loop reads Grid::BIT_LIST directly to skip this allocation.
       def self.bits(mask)
-        out = []
-        d = 1
-        while d <= 9
-          out << d if (mask & (1 << d)) != 0
-          d += 1
-        end
-        out
+        BIT_LIST[mask].dup
       end
 
       # No unit repeats a digit. Empty cells are ignored, so a partly filled
