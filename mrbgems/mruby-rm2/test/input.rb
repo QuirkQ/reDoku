@@ -195,6 +195,27 @@ assert('RM2::Input.wait marks a hangup it sees in revents') do
   end
 end
 
+assert('RM2::Input.wait paces its timeout once every source has hung up') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    File.open(fifo, 'w').close # a writer opens and closes: hangup
+    assert_false RM2::Input.wait([i], 20)
+    assert_true i.hung_up?
+    # POLLHUP is raised on every poll of a hung-up fd and makes poll return
+    # at once, so a wait that keeps polling one spins as fast as its caller
+    # can loop — 100% CPU on a battery device. With no live fd left there is
+    # nothing to poll and the timeout is the only thing left to honour.
+    t0 = Time.now
+    5.times { assert_false RM2::Input.wait([i], 20) }
+    assert_true Time.now - t0 >= 0.05, 'wait returned early: it is not pacing'
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
 assert('RM2::Input.wait times out when no events are pending') do
   path = RM2::TestServer.start
   begin

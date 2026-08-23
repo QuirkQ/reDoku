@@ -74,11 +74,18 @@ rm2_input_new(mrb_state* mrb, int fd) {
   struct RClass* cls =
     mrb_class_get_under(mrb, mrb_module_get(mrb, "RM2"), "Input");
   rm2_input* in;
+  int fl;
 
   /* Non-blocking is an invariant of this object, not a property of the
    * flags the caller passed to Display#open_input: pending_events drains
-   * until EAGAIN, so a blocking fd would park the VM inside read(). */
-  if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+   * until EAGAIN, so a blocking fd would park the VM inside read().
+   *
+   * F_GETFL first, though: those flags went over the wire and the server
+   * opened the node with them, so a bare F_SETFL would clear every status
+   * flag but this one — silently discarding what Display#open_input
+   * advertises it accepts. Add the invariant, do not replace the word. */
+  fl = fcntl(fd, F_GETFL);
+  if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
     int e = errno;
     close(fd);
     errno = e;
@@ -217,14 +224,20 @@ rm2_input_hung_up_p(mrb_state* mrb, mrb_value self) {
 
 /* RM2::Input.wait(inputs, timeout_ms) -> true if any input has events.
  * A signal (SIGTERM, SIGCONT) returns false rather than restarting the
- * poll, so the caller's loop gets a turn to notice its flags. */
+ * poll, so the caller's loop gets a turn to notice its flags.
+ *
+ * Always takes at least as long as it is given when nothing can be ready:
+ * a hung-up fd raises POLLHUP on every poll and makes poll return at once,
+ * so polling one would hand the caller a busy-spin the moment its last live
+ * source died. Hung-up inputs are left out of the pollfd set, and with none
+ * left this waits on no fds at all — which is exactly a sleep. */
 static mrb_value
 rm2_input_s_wait(mrb_state* mrb, mrb_value klass) {
   mrb_value ary;
   mrb_int timeout;
   struct pollfd pfds[RM2_MAX_WAIT];
   rm2_input* ins[RM2_MAX_WAIT];
-  mrb_int len, i;
+  mrb_int len, i, nfds;
   int n, ready;
 
   mrb_get_args(mrb, "Ai", &ary, &timeout);
@@ -237,19 +250,29 @@ rm2_input_s_wait(mrb_state* mrb, mrb_value klass) {
    * arithmetic would hang the game loop with no diagnostic, so say no. */
   if (timeout < 0)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "timeout must be >= 0 milliseconds");
-  if (len == 0) return mrb_false_value();
 
+  /* Every element is still type-checked and still has to be open, whether
+   * or not it ends up in the poll set: a closed input is a caller bug and
+   * must say so on the turn it happens, not silently do nothing. */
+  nfds = 0;
   for (i = 0; i < len; i++) {
     mrb_value v = mrb_ary_ref(mrb, ary, i);
+    rm2_input* in;
     if (!mrb_obj_is_kind_of(mrb, v, mrb_class_ptr(klass)))
       mrb_raise(mrb, E_TYPE_ERROR, "not an RM2::Input");
-    ins[i] = get_open_input(mrb, v);
-    pfds[i].fd = ins[i]->fd;
-    pfds[i].events = POLLIN;
-    pfds[i].revents = 0;
+    in = get_open_input(mrb, v);
+    if (in->hung_up) continue; /* never readable again; see the header */
+    ins[nfds] = in;
+    pfds[nfds].fd = in->fd;
+    pfds[nfds].events = POLLIN;
+    pfds[nfds].revents = 0;
+    nfds++;
   }
 
-  n = poll(pfds, (nfds_t)len,
+  /* poll(NULL, 0, ms) is a portable sleep, and it is what an empty list or
+   * an all-hung-up one gets: nothing to watch, but the caller's loop still
+   * has to be paced or it spins at 100% CPU on a battery device. */
+  n = poll(nfds == 0 ? NULL : pfds, (nfds_t)nfds,
            timeout > (mrb_int)INT_MAX ? INT_MAX : (int)timeout);
   if (n < 0) {
     if (errno == EINTR) return mrb_false_value();
@@ -261,7 +284,7 @@ rm2_input_s_wait(mrb_state* mrb, mrb_value klass) {
    * bare `n > 0` as "events pending" would call a dead fd readable for
    * ever while pending_events returned nothing: only POLLIN is data. */
   ready = 0;
-  for (i = 0; i < len; i++) {
+  for (i = 0; i < nfds; i++) {
     if ((pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
       ins[i]->hung_up = 1;
     if ((pfds[i].revents & POLLIN) != 0) ready = 1;

@@ -106,9 +106,12 @@ module Redoku
     private
 
     # The empty check runs on every turn, not only when the list just shrank:
-    # an App handed no sources at all would otherwise spin hot forever, since
-    # wait answers false immediately for an empty list and never blocks, and
-    # nothing else in the loop would ever stop it.
+    # an App handed no sources at all would otherwise loop forever on a wait
+    # that can never report anything ready, and nothing else in the loop
+    # would ever stop it. RM2::Input.wait paces such a wait rather than
+    # returning at once, so what this prevents is a game nobody can quit —
+    # it stopped being a hot spin when wait learned to sleep on an empty
+    # poll set.
     def drop_hung_up_sources
       @sources = @sources.reject { |source| source.hung_up? }
       @running = false if @sources.empty?

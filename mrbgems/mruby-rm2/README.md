@@ -48,7 +48,11 @@ An input can hang up while still open — rm2fb restarting tears down the
 uinput clones, and the kernel then reports `POLLHUP` and EOF. `wait` and
 `pending_events` both set `#hung_up?` when they see it, and a hung-up input
 never reports readable again, so close it and drop it from the list you pass
-to `wait`. `#closed?` stays false: the fd is still yours to close.
+to `wait`. `#closed?` stays false: the fd is still yours to close. `wait`
+leaves hung-up inputs out of its `poll`, so a list of nothing but dead ones
+(or an empty list) still takes the whole timeout instead of returning at
+once — a caller that has not dropped them yet gets a paced loop, not a
+busy-spin.
 
 ```ruby
 RM2::Control.clients        # => [{pid: 1232, active: true, name: "xochitl"}, ...]

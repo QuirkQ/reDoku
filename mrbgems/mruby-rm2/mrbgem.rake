@@ -13,4 +13,9 @@ MRuby::Gem::Specification.new('mruby-rm2') do |spec|
 
   # Tests read the fake server's logs and assert raw wire bytes.
   spec.add_test_dependency('mruby-pack', core: 'mruby-pack')
+
+  # One test times RM2::Input.wait, to prove it still paces its timeout when
+  # every source has hung up. Declared rather than leaned on: Time reaches
+  # this gem's mrbtest state today only as a test dependency of mruby-io.
+  spec.add_test_dependency('mruby-time', core: 'mruby-time')
 end
