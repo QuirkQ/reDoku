@@ -465,15 +465,22 @@ module Redoku
     # this is where display I/O joined the New and Level paths. The display
     # socket carries a 10 s receive timeout, so any of these flushes can
     # raise. `yield` sits outside every rescue, so the action happens exactly
-    # once whatever the panel does, and an exception cannot unwind past
-    # main.rb's explicit display.close. A press that never reached the panel
-    # is neither held nor restored: there is nothing out there to hold or to
-    # put back, and a wedged server should be answered fast, not 200 ms
-    # slower. That can leave the shared BUFFER inverted — draw_button only
-    # writes memory and cannot fail on a wedged server — which is harmless,
-    # because the only things that ever flush a button's rect are these two
-    # calls and draw_all + flush_all, and every one of them paints the button
+    # once whatever the panel does. A press that never reached the panel is
+    # neither held nor restored: there is nothing out there to hold or to put
+    # back, and a wedged server should be answered fast, not 200 ms slower.
+    # That can leave the shared BUFFER inverted — draw_button only writes
+    # memory and cannot fail on a wedged server — which is harmless, because
+    # the only things that ever flush a button's rect are these two calls and
+    # draw_all + flush_all, and every one of them paints the button
     # immediately before flushing it.
+    #
+    # What this deliberately does NOT cover, because it is the actions' own
+    # pre-existing shape rather than the acknowledgement's: a flush raised by
+    # cycle_difficulty or clear_ink themselves still unwinds out of the loop,
+    # past main.rb's explicit display.close, and leaves the button inverted
+    # on the way out. Containing that means making main.rb close the display
+    # come what may, which is a change to the entry point, not to this
+    # method.
     def acknowledge(name, restore: true)
       pressed = show_press(name)
       yield
