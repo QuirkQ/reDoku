@@ -18,8 +18,25 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+/* Largest coordinate (either sign) and largest line span draw_line accepts.
+ * Both, deliberately: bounding only the span leaves the subtraction that
+ * computes it free to overflow first (see rm2_display_draw_line). */
+#define RM2_MAX_SPAN 65535
+
+/* Receive timeout on the display socket, seconds. Generous on purpose: a
+ * GC16 SYNC update legitimately takes about a second, so anything tight
+ * would break normal drawing. */
+#define RM2_RECV_TIMEOUT_SEC 10
+
+/* EINTR restarts allowed per read_exact call. Every reply on this socket is
+ * a handful of bytes read in one go and signals are rare, so a correct
+ * client never comes close; the bound is there so the call cannot be kept
+ * alive indefinitely by a signal that keeps arriving. */
+#define RM2_EINTR_RETRIES 16
 
 enum { TAG_INIT = 0, TAG_UPDATE = 2, TAG_OPEN_INPUT = 4 };
 
@@ -90,13 +107,21 @@ write_exact(int fd, const void* buf, size_t len) {
   return 0;
 }
 
+/* Every read on this socket is a reply to a request we just sent, so it
+ * either arrives or the server is broken. Two things keep a broken server
+ * from parking us here for ever: the socket's SO_RCVTIMEO (armed in
+ * rm2_display_open), which surfaces as EAGAIN, and the retry bound below.
+ * Without them a server that accepts an update and never acks it wedges the
+ * game past SIGTERM — the handlers only set a flag, and nothing in C polls
+ * it — while xochitl stays SIGSTOPped behind a frozen panel. */
 static int
 read_exact(int fd, void* buf, size_t len) {
   char* p = (char*)buf;
+  int retries = RM2_EINTR_RETRIES;
   while (len > 0) {
     ssize_t n = read(fd, p, len);
     if (n < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR && retries-- > 0) continue;
       return -1;
     }
     if (n == 0) {
@@ -174,6 +199,7 @@ static mrb_value
 rm2_display_open(mrb_state* mrb, mrb_value klass) {
   const char* path = "/var/run/rm2fb.sock";
   struct sockaddr_un addr;
+  struct timeval tv;
   int sock, fb_fd;
   int32_t tag = TAG_INIT;
   init_msg init;
@@ -197,6 +223,15 @@ rm2_display_open(mrb_state* mrb, mrb_value klass) {
   strcpy(addr.sun_path, path);
   if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0)
     fail_close(mrb, sock, -1, "connect to rm2fb socket");
+
+  /* Armed before the first exchange, as on the control socket (control.c:
+   * "the server simply does not answer some failures"), so even the Init
+   * handshake cannot hang. A server that goes quiet now surfaces as a
+   * SystemCallError instead of an unkillable client. */
+  tv.tv_sec = RM2_RECV_TIMEOUT_SEC;
+  tv.tv_usec = 0;
+  if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+    fail_close(mrb, sock, -1, "set display socket receive timeout");
 
   memset(&init, 0, sizeof(init));
   init.own_swtcon = 0;
@@ -345,7 +380,24 @@ rm2_display_pixel(mrb_state* mrb, mrb_value self) {
   return mrb_int_value(mrb, d->fb[(size_t)y * d->width + x]);
 }
 
-#define RM2_MAX_SPAN 65535
+/* mrb_int is int64 on the host build and int32 on the armv7 device (mruby
+ * picks MRB_INT32 for a 32-bit target), which is why every coordinate is
+ * bounded here and not just their difference: on the device a pair 2^31
+ * apart makes x2 - x1 come out NEGATIVE, so it sails through the span guard
+ * below, and Bresenham is then left with an exit condition
+ * (x1 == x2 && y1 == y2) it can never reach. That is an infinite loop
+ * inside C, where nothing polls RM2.terminated?, on a client the server has
+ * SIGSTOPped xochitl behind: a frozen panel at 100% CPU that only SIGKILL
+ * ends. Bounding the coordinates makes x2 - x1, x1 - x2 and rm2_stamp's
+ * x1 + width all provably in range on both ABIs. The wrap itself is
+ * host-invisible; test/display.rb pins the rejection, which is not. */
+static void
+check_coord(mrb_state* mrb, mrb_int v) {
+  /* Both %d and %i consume an mrb_int, so the literal must be cast. */
+  if (v < -RM2_MAX_SPAN || v > RM2_MAX_SPAN)
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "coordinate must be within -%i..%i",
+               (mrb_int)RM2_MAX_SPAN, (mrb_int)RM2_MAX_SPAN);
+}
 
 static mrb_value
 rm2_display_draw_line(mrb_state* mrb, mrb_value self) {
@@ -361,7 +413,13 @@ rm2_display_draw_line(mrb_state* mrb, mrb_value self) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "gray must be 0..255");
   if (width < 1 || width > RM2_MAX_SPAN)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "width must be >= 1 and <= 65535");
+  check_coord(mrb, x1);
+  check_coord(mrb, y1);
+  check_coord(mrb, x2);
+  check_coord(mrb, y2);
 
+  /* Still worth its own check: two in-bounds coordinates can be 131070
+   * apart, and the brush is stamped once per pixel of the longer axis. */
   dx = x2 > x1 ? x2 - x1 : x1 - x2;
   dy = y2 > y1 ? y2 - y1 : y1 - y2;
   if (dx > RM2_MAX_SPAN || dy > RM2_MAX_SPAN)

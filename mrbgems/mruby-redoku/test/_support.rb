@@ -10,7 +10,9 @@
 class TestDisplay
   attr_reader :rects, :lines, :updates
 
-  MAX_SPAN = 65535 # RM2_MAX_SPAN in src/display.c
+  # RM2_MAX_SPAN in src/display.c, where it bounds each draw_line coordinate
+  # as well as the span between them.
+  MAX_SPAN = 65535
 
   def initialize(w = Redoku::Layout::SCREEN_W, h = Redoku::Layout::SCREEN_H)
     @w = w
@@ -48,6 +50,14 @@ class TestDisplay
     raise ArgumentError, 'gray must be 0..255' if gray < 0 || gray > 255
     if width < 1 || width > MAX_SPAN
       raise ArgumentError, 'width must be >= 1 and <= 65535'
+    end
+    # The coordinate bound comes before the span, as it does in C: there the
+    # subtraction below can overflow on the 32-bit device ABI, so a span
+    # computed from unbounded endpoints is not a number worth checking.
+    [x1, y1, x2, y2].each do |v|
+      if v < -MAX_SPAN || v > MAX_SPAN
+        raise ArgumentError, "coordinate must be within -#{MAX_SPAN}..#{MAX_SPAN}"
+      end
     end
     dx = x2 > x1 ? x2 - x1 : x1 - x2
     dy = y2 > y1 ? y2 - y1 : y1 - y2

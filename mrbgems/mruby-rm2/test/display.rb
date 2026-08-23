@@ -192,8 +192,41 @@ assert('draw_line validates its arguments') do
     assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 0, 255) }   # width < 1
     assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 1, 256) }   # gray > 255
     assert_raise(ArgumentError) { d.draw_line(0, 0, 1, 1, 1, -1) }    # gray < 0
-    assert_raise(ArgumentError) { d.draw_line(0, 0, 200000, 0, 1, 0) } # span too large
+    # Both endpoints in bounds, the distance between them is not: this is
+    # the span guard, not the coordinate bound below it.
+    assert_raise(ArgumentError) { d.draw_line(-40000, 0, 40000, 0, 1, 0) }
     assert_raise(ArgumentError) { d.draw_line(0, 0, 65535, 0, 1000000, 0) } # width too large
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('draw_line rejects a coordinate that could overflow its own guard') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    # mrb_int is 64-bit here and 32-bit on the armv7 device, so this host
+    # cannot reproduce the failure these assertions guard against: on the
+    # device 1500000000 - -1500000000 wraps NEGATIVE, sails through the
+    # "line span too large" check, and leaves Bresenham with an exit
+    # condition it can never reach — an infinite loop in C, where nothing
+    # polls RM2.terminated?. What a host test *can* pin, on both ABIs, is
+    # that such a coordinate never reaches the subtraction at all.
+    assert_raise(ArgumentError) { d.draw_line(-1500000000, 0, 1500000000, 0, 1, 0) }
+    assert_raise(ArgumentError) { d.draw_line(0, -1500000000, 0, 1500000000, 1, 0) }
+    # Zero span, so the span guard cannot fire and only the coordinate
+    # bound can: this is the case that used to reach rm2_stamp and overflow
+    # x1 + width there instead.
+    assert_raise(ArgumentError) { d.draw_line(2147480000, 0, 2147480000, 0, 65535, 0) }
+    # The bound itself, on each axis and from both ends. Every span here is
+    # 1 px, so the span guard cannot be what rejects them.
+    assert_raise(ArgumentError) { d.draw_line(65536, 0, 65535, 0, 1, 0) }
+    assert_raise(ArgumentError) { d.draw_line(-65536, 0, -65535, 0, 1, 0) }
+    assert_raise(ArgumentError) { d.draw_line(0, 65536, 0, 65535, 1, 0) }
+    assert_raise(ArgumentError) { d.draw_line(0, -65536, 0, -65535, 1, 0) }
+    # ...and the widest pair that satisfies both bound and span still draws.
+    d.draw_line(-65535, 0, 0, 0, 1, 255)
+    assert_equal 0xFFFF, d.pixel(0, 0)
   ensure
     RM2::TestServer.stop
   end
