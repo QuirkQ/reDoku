@@ -17,8 +17,10 @@
 #   * Binaries are verified to be 32-bit ARM ELF before anything is
 #     copied, every copy is size-checked, and the on-device installer
 #     rolls the device back to stock if anything fails.
-#   * Nothing runs until you confirm (or pass --yes), and --dry-run
-#     shows the plan without touching anything.
+#   * install and uninstall ask before touching the device (or pass --yes);
+#     play does not, since its only write is one binary that play alone
+#     refreshes on every run by design. --dry-run always shows the plan
+#     without doing it, for every command.
 
 set -eu
 
@@ -37,6 +39,7 @@ ARTIFACTS=
 FORCE=0
 PURGE=0
 PLAY_SECS=          # empty = play interactively, until you stop it
+PLAY_SECS_SET=0     # was --seconds given at all, distinct from its value
 YES=0
 DRY=0
 CMD=
@@ -112,7 +115,7 @@ while [ $# -gt 0 ]; do
     -a|--artifacts)  [ $# -ge 2 ] || die "$1 needs a value"; ARTIFACTS=$2; shift ;;
     --force)         FORCE=1 ;;
     --purge)         PURGE=1 ;;
-    --seconds)       [ $# -ge 2 ] || die "$1 needs a value"; PLAY_SECS=$2; shift ;;
+    --seconds)       [ $# -ge 2 ] || die "$1 needs a value"; PLAY_SECS=$2; PLAY_SECS_SET=1; shift ;;
     -y|--yes)        YES=1 ;;
     -n|--dry-run)    DRY=1 ;;
     -h|--help)       usage; exit 0 ;;
@@ -129,11 +132,20 @@ command -v ssh >/dev/null 2>&1 || die "no 'ssh' on this machine"
 [ "$FORCE" -eq 0 ] || [ "$CMD" = install ]   || die "--force only applies to install"
 [ "$PURGE" -eq 0 ] || [ "$CMD" = uninstall ] || die "--purge only applies to uninstall"
 [ -z "$ARTIFACTS" ] || [ "$CMD" = install ]  || die "--artifacts only applies to install"
-[ -z "$PLAY_SECS" ] || [ "$CMD" = play ]     || die "--seconds only applies to play"
+[ "$PLAY_SECS_SET" -eq 0 ] || [ "$CMD" = play ] || die "--seconds only applies to play"
 # It ends up as 'sleep N' on the device, which wants a plain whole number.
-if [ -n "$PLAY_SECS" ]; then
-  case $PLAY_SECS in *[!0-9]*) die "--seconds wants whole seconds, not '$PLAY_SECS'" ;; esac
-  [ "$PLAY_SECS" -ge 1 ] || die "--seconds wants at least 1 second"
+# Checked whenever --seconds was given at all (PLAY_SECS_SET), not just when
+# its value happens to be non-empty — "--seconds ''" must not silently fall
+# through to interactive play. The length arm rejects an over-long number
+# before it reaches -ge/-le, which would otherwise leak a raw shell
+# diagnostic instead of this message.
+if [ "$PLAY_SECS_SET" -eq 1 ]; then
+  case $PLAY_SECS in
+    *[!0-9]* | '') die "--seconds wants whole seconds, not '$PLAY_SECS'" ;;
+    ??????*)       die "--seconds wants at most 86400 seconds (24h)" ;;
+  esac
+  [ "$PLAY_SECS" -ge 1 ]     || die "--seconds wants at least 1 second"
+  [ "$PLAY_SECS" -le 86400 ] || die "--seconds wants at most 86400 seconds (24h)"
 fi
 
 TARGET=$RUSER@$HOST
@@ -364,14 +376,20 @@ cmd_install() {
   [ "$FORCE" -eq 0 ] || _force_arg=' --force'
   say "running the on-device installer (~30 s, includes a 15 s verification wait)"
   if remote "sh $REMOTE_DIR/install.sh$_force_arg"; then
-    say "all done — xochitl is now running through the display server"
-    if [ -n "$GAME" ]; then
-      say "  play it    : bin/redoku play"
+    # remote() returns 0 unconditionally in dry-run, so without this guard
+    # a dry run would print an outcome it never actually got.
+    if [ "$DRY" -eq 1 ]; then
+      say "[dry-run] stops here — nothing above actually ran"
     else
-      say "  play it    : make build, then bin/redoku play"
+      say "all done — xochitl is now running through the display server"
+      if [ -n "$GAME" ]; then
+        say "  play it    : bin/redoku play"
+      else
+        say "  play it    : make build, then bin/redoku play"
+      fi
+      say "  check it   : bin/redoku status"
+      say "  banished it: bin/redoku uninstall"
     fi
-    say "  check it   : bin/redoku status"
-    say "  banished it: bin/redoku uninstall"
   else
     die "the on-device installer failed and rolled the device back to stock
   (its output above says why; the device is safe and unchanged)"

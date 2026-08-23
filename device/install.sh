@@ -25,6 +25,10 @@
 #   /home/root/redoku/bin/rm2fbctl                (optional)
 #   /home/root/redoku/lib/librm2fb_client_swtcon.so
 #
+# bin/redoku also stages /home/root/redoku/bin/redoku (the game) alongside
+# these, but this script neither needs it nor reads it — the display
+# server installs the same way with or without a game build, on purpose.
+#
 # Usage: install.sh [--force]
 #   --force   proceed even if the firmware version differs from the
 #             version this was tested on.

@@ -350,7 +350,7 @@ Portrait, full screen 1404×1872:
 
 ## 9. Build, deploy, test
 
-**Make targets** (each a thin wrapper over Docker/ssh):
+**Make targets, plus `bin/redoku`** (each a thin wrapper over Docker/ssh):
 
 - `make build` — Docker: cross-compile rM2-stuff (server + xochitl shim +
   rm2fbctl, via their `release-toltec` CMake preset) and the `redoku` binary.
