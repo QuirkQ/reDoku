@@ -1,10 +1,12 @@
 module Redoku
   PEN_DEVICE = 'Wacom I2C Digitizer'.freeze
+  TOUCH_DEVICE = 'pt_mt'.freeze
 
   USAGE = <<~TEXT
     usage: redoku [options]
 
     Draws the reDoku board on the reMarkable 2 and echoes pen ink into it.
+    The board takes the pen only; the buttons also take a finger.
     Tap Quit to give the screen back to xochitl.
 
       --clients   list the display server's clients and exit
@@ -52,9 +54,21 @@ module Redoku
     end
     inputs = paths.map { |path| display.open_input(path) }
 
-    App.new(display, inputs, Renderer.new(display)).run
+    # The touchscreen is what makes the buttons finger-tappable, and unlike
+    # the pen it is not required: a device with no such node plays on with
+    # pen-only buttons rather than refusing to start. A node the server
+    # declines to open is still an error, like any other refused input.
+    # Plural for the same reason the pen is — the display server publishes a
+    # uinput clone under the same evdev name, and only the hardware node
+    # carries real contacts.
+    touches = RM2::Input.resolve_all(TOUCH_DEVICE).map do |path|
+      display.open_input(path)
+    end
 
-    inputs.each { |input| input.close }
+    App.new(display, inputs, Renderer.new(display),
+            touch_sources: touches).run
+
+    (inputs + touches).each { |input| input.close }
     display.close # closing the connection hands the panel back to xochitl
     0
   rescue StandardError => e

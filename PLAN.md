@@ -137,7 +137,8 @@ identified **by name**, never by eventN:
 | Power | `snvs-powerkey` | KEY_POWER |
 
 Pen→screen transform: `sx = ABS_Y * 1404/15725`, `sy = 1872 − ABS_X * 1872/20967`.
-Touch→screen: `sx = X`, `sy = 1872 − Y`.
+Touch→screen: `sx = X`, `sy = 1871 − Y` (1871, not 1872: row 1872 does not
+exist, and every mapped point has to be a real panel pixel — `Redoku::Touch`).
 
 **Process-lifecycle contract** — one connection per PID (identified via
 `SO_PEERCRED`); expect SIGSTOP/SIGCONT of our process group; ignore SIGPIPE
@@ -224,8 +225,11 @@ Everything above this line is Ruby.
 
 ### Ruby event loop
 
-Single-threaded poll loop (`RM2::Input.wait`) over the pen fds (touch fd
-optional later) with a timeout that doubles as the recognition-idle timer:
+Single-threaded poll loop (`RM2::Input.wait`) over the pen fds **and the
+touch fds** with a timeout that doubles as the recognition-idle timer. Both
+devices are opened; what they may do differs, and that split is deliberate:
+the board is a writing surface, so **ink is pen-only**, while the buttons
+also answer to a finger.
 
 1. Pen events → `InputRouter` maps raw→screen coordinates, classifies the
    target region (cell / button), and forwards to the active screen.
@@ -235,8 +239,16 @@ optional later) with a timeout that doubles as the recognition-idle timer:
    strokes for that cell go to the recognizer.
 4. Recognizer verdict → cell ink region cleared, printed digit drawn (GL16),
    or rejection feedback (§6).
-5. Buttons (New / Difficulty / Check / Quit) are pen-tap targets: a tap =
-   pen-down+up with little movement and short duration.
+5. Buttons (New / Difficulty / Check / Quit) are tap targets for the pen and
+   for a finger alike: a tap = down+up on the same button with little
+   movement. The finger's travel budget is the looser of the two (a fingertip
+   rolls as it lands), and a touch contact is suppressed while the pen is in
+   proximity and for ~500 ms after it leaves — otherwise the palm you write
+   with would press Quit. A contact that began under the pen has to lift and
+   press again before it counts, so a resting palm cannot fire a button just
+   because the pen was set aside.
+6. Touch events reach nothing else. A finger on the board does not ink, does
+   not select a cell, and does not disturb a pen stroke in progress.
 
 ### mruby build
 

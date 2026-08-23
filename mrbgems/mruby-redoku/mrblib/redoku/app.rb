@@ -3,15 +3,42 @@ module Redoku
   # where the pen went down (ink on the board, a tap on a button, nothing
   # anywhere else), so dragging out of a region can never surprise the user.
   #
-  # `sources` are RM2::Input objects; `waiter` is anything answering
-  # `wait(sources, timeout_ms)` and `signals` anything answering
-  # `terminated?`/`resumed?` — RM2::Input and RM2 in production, fakes in
-  # tests, which is what keeps this loop host-testable.
+  # The pen writes and presses buttons; a finger can only press buttons.
+  # That split is the owner's: the board is a writing surface, so ink is
+  # pen-exclusive, and the two devices are handled by separate code paths
+  # here because they are separate devices — different transforms, different
+  # tap tolerances, and a finger the pen can veto (see touch_suppressed?).
+  #
+  # `sources` are the pen's RM2::Input objects and `touch_sources` the
+  # touchscreen's; `waiter` is anything answering `wait(sources, timeout_ms)`,
+  # `signals` anything answering `terminated?`/`resumed?`, and `clock`
+  # anything answering `monotonic_ms` — RM2::Input and RM2 in production,
+  # fakes in tests, which is what keeps this loop host-testable.
   class App
     INK_GRAY = 0
     INK_WIDTH = 4
     TAP_MAX_PATH = 20 # px of travel still counted as a tap, not a drag
     POLL_MS = 100     # idle wake-up; returns immediately when ink is pending
+
+    # A fingertip is fatter than a pen tip and rolls as it lands, so its
+    # reported point drifts further on a tap that felt perfectly still. The
+    # buttons are 400x140, so the looser threshold costs no precision. Its
+    # own constant rather than a bigger TAP_MAX_PATH: the pen's tolerance is
+    # tight on purpose, and the choice is made per source at the call site.
+    TOUCH_TAP_MAX_PATH = 40
+
+    # How long the Quit acknowledgement is held on the panel before the loop
+    # stops. Feedback nobody can see is not feedback: the DU flash lands and
+    # then the process tears down, and on the device the gap before xochitl
+    # repaints was too short to perceive.
+    QUIT_ACK_MS = 200
+
+    # How long touch stays suppressed after the pen leaves proximity.
+    # BTN_TOOL_PEN flickers out during normal writing, and without a
+    # cooldown one such dropout is a window for a resting palm to press
+    # something. Long enough to absorb the flicker, short enough that
+    # putting the pen down and reaching for a button does not feel laggy.
+    TOUCH_COOLDOWN_MS = 500
 
     # ink_dirty is the pending ink damage as INCLUSIVE corners
     # [x1, y1, x2, y2] — the one rect in this codebase that is not
@@ -20,12 +47,14 @@ module Redoku
     attr_reader :difficulty, :ink_dirty
 
     def initialize(display, sources, renderer, waiter = RM2::Input,
-                   signals = RM2)
+                   signals = RM2, touch_sources: [], clock: RM2)
       @d = display
       @sources = sources
+      @touch = touch_sources
       @renderer = renderer
       @waiter = waiter
       @signals = signals
+      @clock = clock
       @difficulty = Renderer::DIFFICULTIES[0]
       @running = true
       @mode = nil       # :ink, :button, :none, or nil for no stroke open
@@ -33,6 +62,17 @@ module Redoku
       @button = nil     # the button this stroke went down on, if any
       @travel = 0       # distance travelled so far, for tap detection
       @ink_dirty = nil  # pending ink damage, inclusive corners
+
+      # The touch stroke is tracked separately from the pen's, so that a
+      # finger landing on the glass can never cut a stroke short or steal
+      # the pen's @mode. Two contacts open at once is normal on this device.
+      @touch_mode = nil    # :button, :none, or nil for no contact
+      @touch_last = nil
+      @touch_button = nil
+      @touch_travel = 0
+      @touch_blocked = false # this contact met the pen; it can never press
+      @pen_near = false      # pen (or rubber) in proximity, hovering counts
+      @pen_left_at = nil     # monotonic ms when proximity last ended
     end
 
     def running?
@@ -53,14 +93,20 @@ module Redoku
     # One turn of the loop: wait, drain every source, then flush the ink in
     # a single update rather than one per segment. A hung-up source (the
     # server tearing down a uinput clone, a device unbound) never becomes
-    # readable again, so it is dropped; losing every source means the pen is
-    # gone and there is nothing left to play with, so the loop ends (see
-    # drop_hung_up_sources).
+    # readable again, so it is dropped; losing every pen means there is
+    # nothing left to play with, so the loop ends (see
+    # drop_hung_up_sources). Pen and touch are waited on together — one
+    # poll, one timeout — but drained apart, because a touch sample means
+    # something different from a pen sample and is not even in the same
+    # coordinate space.
     def step
-      ready = @waiter.wait(@sources, POLL_MS)
+      ready = @waiter.wait(@sources + @touch, POLL_MS)
       if ready
         @sources.each do |source|
           source.pending_events.each { |sample| handle_sample(sample) }
+        end
+        @touch.each do |source|
+          source.pending_events.each { |sample| handle_touch_sample(sample) }
         end
       end
       drop_hung_up_sources
@@ -70,6 +116,7 @@ module Redoku
 
     def handle_sample(sample)
       raw_x, raw_y, _pressure, tools = sample
+      note_pen_proximity(tools)
       x, y = Pen.to_screen(raw_x, raw_y)
       down = (tools & RM2::Input::TOUCH) != 0
 
@@ -79,6 +126,29 @@ module Redoku
         continue_stroke(x, y)
       elsif @mode
         end_stroke(x, y)
+      end
+      self
+    end
+
+    # A touchscreen contact. It can press a button and do nothing else: no
+    # ink, no cell selection, nothing on the board at all — begin_touch asks
+    # Layout for a button and treats every other point as dead.
+    #
+    # RM2::Input::FINGER, not TOUCH: TOUCH is evdev's BTN_TOUCH, which on
+    # this hardware means the PEN TIP is against the glass. FINGER is the
+    # touchscreen's own bit, set while the one contact the decoder follows
+    # exists (see the MT decode in the rm2 gem's input.c).
+    def handle_touch_sample(sample)
+      raw_x, raw_y, _pressure, tools = sample
+      x, y = Touch.to_screen(raw_x, raw_y)
+      down = (tools & RM2::Input::FINGER) != 0
+
+      if down && @touch_mode.nil?
+        begin_touch(x, y)
+      elsif down
+        continue_touch(x, y)
+      elsif @touch_mode
+        end_touch(x, y)
       end
       self
     end
@@ -114,7 +184,84 @@ module Redoku
     # poll set.
     def drop_hung_up_sources
       @sources = @sources.reject { |source| source.hung_up? }
+      @touch = @touch.reject { |source| source.hung_up? }
+      # The pen list is what decides: reDoku is a pen game, and a session
+      # that can only press buttons has nothing left to do but quit. A dead
+      # touchscreen is merely a game whose buttons went back to pen-only.
       @running = false if @sources.empty?
+    end
+
+    # The digitizer reports BTN_TOOL_PEN (or BTN_TOOL_RUBBER) as soon as the
+    # tool is NEAR the glass, not only when it touches — which is what makes
+    # ordinary writing posture suppress a resting palm for free, before any
+    # contact is made. RM2::Input::TOUCH is the tip actually pressed down and
+    # is deliberately not consulted here.
+    #
+    # This is the pen path's only new work, and it decides nothing about the
+    # pen: it records, for the touch path, where the pen is.
+    def note_pen_proximity(tools)
+      near = (tools & (RM2::Input::PEN | RM2::Input::RUBBER)) != 0
+      @pen_left_at = @clock.monotonic_ms if @pen_near && !near
+      @pen_near = near
+    end
+
+    # True while a touch contact must not be allowed to press anything: the
+    # pen is in proximity, or it left less than TOUCH_COOLDOWN_MS ago.
+    #
+    # A negative elapsed can only mean the clock wrapped — monotonic_ms is
+    # an mrb_int, 32-bit on the device, so it wraps after 24.8 days of
+    # process life — and is read as "long expired". The alternative would be
+    # suppressing touch for another 24 days.
+    def touch_suppressed?
+      return true if @pen_near
+      return false unless @pen_left_at
+      elapsed = @clock.monotonic_ms - @pen_left_at
+      elapsed >= 0 && elapsed < TOUCH_COOLDOWN_MS
+    end
+
+    # @touch_blocked is a latch, not a check: a contact born while the pen
+    # was about must lift and press again before it can ever count, so that
+    # a palm resting on Quit can never fire it merely because the pen was
+    # set aside. It also latches on any later sample taken while the pen is
+    # about, which covers the palm that lands a moment BEFORE the pen is
+    # detected — same hazard, same answer, and re-tapping a button is a
+    # cheap price for never quitting someone's game by accident.
+    def begin_touch(x, y)
+      @touch_last = [x, y]
+      @touch_travel = 0
+      @touch_blocked = touch_suppressed?
+      @touch_button = Layout.button_at(x, y)
+      # A finger on the board (or anywhere off a button) opens a stroke that
+      # can only ever do nothing — the same :none the pen uses, and the
+      # reason a finger cannot ink: nothing here consults Layout.cell_at.
+      @touch_mode = @touch_button ? :button : :none
+    end
+
+    def continue_touch(x, y)
+      @touch_travel += (x - @touch_last[0]).abs + (y - @touch_last[1]).abs
+      @touch_blocked = true if touch_suppressed?
+      @touch_last = [x, y]
+    end
+
+    # Same tap discipline as the pen — start and end on one button, having
+    # travelled little in between — with the finger's own travel budget, and
+    # one extra condition the pen does not have: the pen must have stayed
+    # away for the whole contact.
+    def end_touch(x, y)
+      @touch_travel += (x - @touch_last[0]).abs + (y - @touch_last[1]).abs
+      @touch_blocked = true if touch_suppressed?
+      press(@touch_button) if touch_tap?(x, y)
+      @touch_mode = nil
+      @touch_last = nil
+      @touch_button = nil
+      @touch_travel = 0
+      @touch_blocked = false
+    end
+
+    def touch_tap?(x, y)
+      @touch_mode == :button && !@touch_blocked &&
+        @touch_travel <= TOUCH_TAP_MAX_PATH &&
+        Layout.button_at(x, y) == @touch_button
     end
 
     # @last and @travel are kept for every stroke, not only an inking one:
@@ -195,11 +342,35 @@ module Redoku
     # nothing (observed on the device: the game exits, xochitl comes back a
     # moment later, and in between the frozen board is all there is to see).
     # So acknowledge first, in the one waveform fast enough to arrive before
-    # the exit it announces, and do not wait on the panel: the update is
-    # sent, its ack is a socket round trip, and quitting is no slower for it.
+    # the exit it announces — and then hold it. An earlier version of this
+    # comment argued the opposite, that sending the update was enough and
+    # quitting should not wait on the panel; on the device the flash was not
+    # reliably perceptible, and feedback nobody can see is not feedback.
     def quit
-      @renderer.press_button(:quit)
+      acknowledge_quit
       @running = false
+    end
+
+    # The press is a courtesy; the exit is the contract. The display socket
+    # carries a 10 s receive timeout, so a server that stops acking makes
+    # press_button raise SystemCallError — and an exception here would
+    # unwind past main.rb's explicit display.close, leaving the user's
+    # screen to come back whenever a finalizer got round to it. So the
+    # acknowledgement may fail, and quitting still proceeds.
+    #
+    # A failed press also skips the hold: there is nothing on the panel to
+    # look at, and a wedged server should be quit fast, not 200 ms slower.
+    def acknowledge_quit
+      @renderer.press_button(:quit)
+      # Not a spin and not a new dependency: RM2::Input.wait with nothing to
+      # watch polls no descriptors for the whole timeout, which is exactly a
+      # bounded sleep (see the rm2 gem's input.c). An empty list is passed on
+      # purpose — waiting on the real sources would return the moment the
+      # next pen sample arrived and hold nothing.
+      @waiter.wait([], QUIT_ACK_MS)
+      true
+    rescue StandardError
+      false
     end
 
     def cycle_difficulty

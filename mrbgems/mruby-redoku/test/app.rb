@@ -37,6 +37,51 @@ class FakeWaiter
   end
 end
 
+# Records how much had already reached the panel at each wait, so a test can
+# assert what App had painted by the time it paused, rather than just that
+# both things happened.
+class TimelineWaiter < FakeWaiter
+  attr_reader :updates_at
+
+  def initialize(sources, display)
+    super(sources)
+    @d = display
+    @updates_at = []
+  end
+
+  def wait(sources, timeout_ms)
+    @updates_at << @d.updates.size
+    super(sources, timeout_ms)
+  end
+end
+
+# A display whose flush fails the way a wedged server's does: the display
+# socket carries a 10 s receive timeout, so #update gives up and raises
+# instead of answering. A RuntimeError stands in for the real
+# SystemCallError, so that this gem's tests do not depend on which errno gem
+# their mrbtest state happens to carry; App rescues StandardError, which both
+# of them are.
+class WedgedDisplay < TestDisplay
+  def update(x, y, w, h, waveform: RM2::GL16, flags: 0)
+    raise 'no ack from the display server'
+  end
+end
+
+# A monotonic clock a test can drive. The cooldown is half a second of real
+# time; asserting against a real clock would mean sleeping through it once
+# per assertion, so App takes the clock the same way it takes its waiter.
+class FakeClock
+  attr_accessor :ms
+
+  def initialize(ms = 0)
+    @ms = ms
+  end
+
+  def monotonic_ms
+    @ms
+  end
+end
+
 # Stands in for the RM2 module's signal flags, so one test's SIGTERM cannot
 # leak into another's loop.
 class FakeSignals
@@ -73,6 +118,29 @@ def screen_of(sample)
   Redoku::Pen.to_screen(sample[0], sample[1])
 end
 
+# The packet the digitizer sends when the tool leaves proximity: the last
+# position, with every tool bit clear. Distinct from pen_sample(.., false),
+# which is the pen hovering — still in proximity, and still suppressing
+# touch.
+def pen_away_sample(sx, sy)
+  s = pen_sample(sx, sy, false)
+  [s[0], s[1], 0, 0]
+end
+
+# A touchscreen sample, built the same way from the screen point it should
+# land on. The pt_mt node reports no pressure and no BTN_TOOL/BTN_TOUCH:
+# RM2::Input::FINGER, set from the multitouch tracking id, is the whole of
+# what it says about contact — which is why a finger cannot be mistaken for
+# a pen tip. This mapping is exact in both directions (the touchscreen
+# reports one unit per panel pixel), so these tests may assert against the
+# point they asked for; the first assertion below pins that.
+def touch_sample(sx, sy, down)
+  raw_x = sx * Redoku::Touch::MAX_X / (Redoku::Layout::SCREEN_W - 1)
+  raw_y = Redoku::Touch::MAX_Y -
+          sy * Redoku::Touch::MAX_Y / (Redoku::Layout::SCREEN_H - 1)
+  [raw_x, raw_y, 0, down ? RM2::Input::FINGER : 0]
+end
+
 def new_app(batches = [])
   d = TestDisplay.new
   input = FakeInput.new(batches)
@@ -80,6 +148,20 @@ def new_app(batches = [])
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
                         FakeWaiter.new([input]), signals)
   [app, d, input, signals]
+end
+
+# An App with a touchscreen as well as a pen, and a clock under the test's
+# control.
+def new_touch_app(pen_batches = [], touch_batches = [])
+  d = TestDisplay.new
+  pen = FakeInput.new(pen_batches)
+  finger = FakeInput.new(touch_batches)
+  clock = FakeClock.new
+  waiter = FakeWaiter.new([pen, finger])
+  app = Redoku::App.new(d, [pen], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new, touch_sources: [finger],
+                        clock: clock)
+  [app, d, clock, waiter, pen, finger]
 end
 
 assert('App echoes ink along the pen path inside the board') do
@@ -226,6 +308,61 @@ assert('a tap on Quit acknowledges itself before the game tears down') do
                 Redoku::Renderer::WHITE], d.rects[1]
   assert_equal 255, d.gray_at(qx, qy)          # border, top-left: white now
   assert_equal 0, d.gray_at(qx + 10, qy + qh / 2) # paper, left of the label
+end
+
+assert('the Quit acknowledgement is held on the panel before the loop stops') do
+  d = TestDisplay.new
+  input = FakeInput.new
+  waiter = TimelineWaiter.new([input], d)
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new)
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  d.clear_calls
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_false app.running?
+  # One hold, for the configured duration, watching nothing: waiting on the
+  # real sources would end the instant the next pen sample arrived, and the
+  # flash it is there to show would be gone before anyone saw it.
+  assert_equal [[[], Redoku::App::QUIT_ACK_MS]], waiter.calls
+  # ...and the flash had already reached the panel when the hold began,
+  # which is the ordering that makes the pause worth anything.
+  assert_equal [1], waiter.updates_at
+  assert_equal [qx, qy, qw, qh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+end
+
+assert('New and Level do not hold: only Quit has to be seen before it goes') do
+  d = TestDisplay.new
+  input = FakeInput.new
+  waiter = TimelineWaiter.new([input], d)
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new)
+  [:new, :level].each do |name|
+    bx, by, bw, bh = Redoku::Layout.button_rect(name)
+    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
+    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
+  end
+  assert_true app.running?
+  # Both repaint as their action, so they already read as responsive; a hold
+  # here would only make the game feel slower.
+  assert_equal [], waiter.calls
+end
+
+assert('Quit proceeds when the acknowledgement cannot be delivered') do
+  d = WedgedDisplay.new
+  input = FakeInput.new
+  waiter = TimelineWaiter.new([input], d)
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
+                        FakeSignals.new)
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, false))
+  # The press is a courtesy; the exit is the contract. A server that stops
+  # acking must not turn a Quit tap into an exception that unwinds past
+  # main.rb's explicit display.close and leaves the panel to a finalizer.
+  assert_false app.running?
+  # Nothing landed on the panel, so there is nothing to hold for either.
+  assert_equal [], waiter.calls
 end
 
 assert('a long drag across Quit is not a tap') do
@@ -378,4 +515,158 @@ assert('App#run repaints when the server resumes us') do
   assert_equal 2, d.updates.size
   assert_equal RM2::GC16, d.updates[0][4]
   assert_equal RM2::GC16, d.updates[1][4]
+end
+
+assert('a finger tap presses the button it landed on') do
+  app, d, = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  cx = qx + qw / 2
+  cy = qy + qh / 2
+  s = touch_sample(cx, cy, true)
+  # The helper's mapping is exact in both directions, which is what lets the
+  # assertions below name the screen point they mean.
+  assert_equal [cx, cy], Redoku::Touch.to_screen(s[0], s[1])
+  d.clear_calls
+  app.handle_touch_sample(s)
+  app.handle_touch_sample(touch_sample(cx, cy, false))
+  assert_false app.running?
+  assert_equal [qx, qy, qw, qh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+end
+
+assert('a finger on the board inks nothing and selects nothing') do
+  app, d, = new_touch_app
+  d.clear_calls
+  app.handle_touch_sample(touch_sample(300, 400, true))
+  app.handle_touch_sample(touch_sample(340, 440, true))
+  app.handle_touch_sample(touch_sample(340, 440, false))
+  # Ink is the pen's alone, by the owner's instruction: a finger dragged
+  # across the board draws no line, marks no damage and flushes nothing.
+  assert_equal [], d.lines
+  assert_nil app.ink_dirty
+  app.flush_ink
+  assert_equal [], d.updates
+end
+
+assert('a finger that starts off a button can never press one') do
+  app, = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  # Same rule the pen follows: what a stroke does is decided where it went
+  # down, so dragging onto Quit is not a press.
+  app.handle_touch_sample(touch_sample(300, 400, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_true app.running?
+end
+
+assert('a finger arriving while the pen is in proximity presses nothing') do
+  app, d, = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  # Hovering, not writing: BTN_TOOL_PEN with no BTN_TOUCH. That is the state
+  # the digitizer is in while a hand rests on the glass to write, which is
+  # what makes proximity worth listening to — the palm is suppressed before
+  # it has touched anything.
+  app.handle_sample(pen_sample(300, 400, false))
+  d.clear_calls
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_true app.running?
+  assert_equal [], d.updates
+end
+
+assert('a contact born under the pen stays dead once the cooldown expires') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(pen_sample(300, 400, false))                        # hover
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true)) # palm
+  app.handle_sample(pen_away_sample(300, 400))                          # set down
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS + 1
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  # The latch, not an instantaneous check: a palm already resting on Quit
+  # when the pen was set aside is not a deliberate press, however long it
+  # waits. It has to lift and press again.
+  assert_true app.running?
+end
+
+assert('a finger tap inside the cooldown presses nothing') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(pen_sample(300, 400, false))
+  app.handle_sample(pen_away_sample(300, 400))
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS - 1
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  # Proximity flickers out during ordinary writing; without the cooldown
+  # each flicker is a window a palm can land in.
+  assert_true app.running?
+end
+
+assert('a fresh finger tap once the cooldown has expired does press') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(pen_sample(300, 400, false))
+  app.handle_sample(pen_away_sample(300, 400))
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  # Suppression has to end, or setting the pen down and reaching for a
+  # button would never work at all.
+  assert_false app.running?
+end
+
+assert('a 30 px drag is a tap from a finger and not from the pen') do
+  assert_true Redoku::App::TAP_MAX_PATH < 30
+  assert_true Redoku::App::TOUCH_TAP_MAX_PATH >= 30
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  x0 = qx + 50
+  y0 = qy + qh / 2
+
+  app, = new_touch_app
+  app.handle_touch_sample(touch_sample(x0, y0, true))
+  app.handle_touch_sample(touch_sample(x0 + 30, y0, true))
+  app.handle_touch_sample(touch_sample(x0 + 30, y0, false))
+  assert_false app.running? # a fingertip rolls; 30 px is still a tap
+
+  # The identical drag from the pen is a drag, and the pen's own rounding
+  # cannot close a 10 px gap on either side of either threshold.
+  pen_app, = new_app
+  pen_app.handle_sample(pen_sample(x0, y0, true))
+  pen_app.handle_sample(pen_sample(x0 + 30, y0, true))
+  pen_app.handle_sample(pen_sample(x0 + 30, y0, false))
+  assert_true pen_app.running?
+end
+
+assert('App#step waits on pen and touch together and drains both in one turn') do
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  down = touch_sample(qx + qw / 2, qy + qh / 2, true)
+  up = touch_sample(qx + qw / 2, qy + qh / 2, false)
+  app, d, clock, waiter, pen, finger = new_touch_app(
+    [[pen_sample(300, 400, true), pen_sample(340, 440, true)],
+     [pen_away_sample(340, 440)]],
+    [[down, up], [], [down, up]]
+  )
+  app.step
+  # One poll over both devices, on one timeout.
+  assert_equal [[pen, finger], Redoku::App::POLL_MS], waiter.calls[0]
+  assert_equal 1, d.lines.size # the pen's two samples inked one segment
+  # ...and the finger's tap was drained in the same turn, suppressed by the
+  # pen it shared that turn with. Had the pen list not been drained first,
+  # this tap would have quit the game — which makes this the assertion that
+  # both sources really were read on one turn.
+  assert_true app.running?
+
+  app.step # the pen leaves proximity, which starts the cooldown
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS
+  app.step # a fresh contact, on a quiet digitizer: this one presses
+  assert_false app.running?
+end
+
+assert('App#step drops a hung-up touchscreen and plays on with the pen') do
+  app, _d, _clock, waiter, pen, finger = new_touch_app
+  finger.hung_up = true
+  app.step
+  # A dead touchscreen is a game whose buttons went back to pen-only, not a
+  # game that is over. A dead pen is the one that ends it.
+  assert_true app.running?
+  app.step
+  assert_equal [pen], waiter.calls[1][0]
 end
