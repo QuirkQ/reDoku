@@ -456,8 +456,14 @@ gesture, Check, difficulty menu, win screen, state persistence. This is the
 `{uuid}.metadata`/`.content`, installed by script, one xochitl restart to
 index). `redoku-watcher.service`: inotify `IN_OPEN` on the decoy's `.pdf`
 content file, 5 s debounce, spawn game (its `Init` takes the screen
-automatically). Quit: game switches front back to xochitl's pid (looked up
-via `GetClients` by name) and exits. Fallback if `IN_OPEN` proves noisy or
+automatically). Quit: the game closes its display connection and exits, and
+the server promotes the next client — which is xochitl. It must NOT
+`switch_to` xochitl's pid: the server SIGSTOPs the whole process group of the
+client it demotes, so a live client that switches away from itself freezes
+inside the call and never reaches its exit path (see §3's process-lifecycle
+contract, `src/control.c`'s header, and `mruby-rm2/README.md`). `GetClients`
+stays useful for the watcher's "is the game already a client" check, not for
+handing the panel back. Fallback if `IN_OPEN` proves noisy or
 cached-away on 3.27: watch the decoy's `.metadata` for `lastOpened` writes
 (`IN_CLOSE_WRITE`) instead — verified empirically in M4's first task.
 
