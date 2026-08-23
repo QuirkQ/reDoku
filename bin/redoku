@@ -142,7 +142,20 @@ command -v ssh >/dev/null 2>&1 || die "no 'ssh' on this machine"
 if [ "$PLAY_SECS_SET" -eq 1 ]; then
   case $PLAY_SECS in
     *[!0-9]* | '') die "--seconds wants whole seconds, not '$PLAY_SECS'" ;;
-    ??????*)       die "--seconds wants at most 86400 seconds (24h)" ;;
+  esac
+  # Leading zeros go before the length arm below, which judges a number by
+  # how long it is: '000000' is six characters and zero seconds, and telling
+  # someone it is more than 24 hours is worse than saying nothing. Only
+  # digits are left by now, so this loop can only shorten the value, and it
+  # stops at the last digit ('0' and '0012' become '0' and '12').
+  while true; do
+    case $PLAY_SECS in
+      0?*) PLAY_SECS=${PLAY_SECS#0} ;;
+      *)   break ;;
+    esac
+  done
+  case $PLAY_SECS in
+    ??????*) die "--seconds wants at most 86400 seconds (24h)" ;;
   esac
   [ "$PLAY_SECS" -ge 1 ]     || die "--seconds wants at least 1 second"
   [ "$PLAY_SECS" -le 86400 ] || die "--seconds wants at most 86400 seconds (24h)"
@@ -440,6 +453,15 @@ cmd_play() {
   # it outright; redoku handles SIGTERM and exits 0 instead, so a timed run
   # ending either way is a run that ended when we asked it to.
   #
+  # SIGCONT follows the TERM, and a SIGKILL follows both 5 s later, because a
+  # signal sent to a STOPPED process just sits there pending: the display
+  # server stops a client it demotes, and such a game never runs to handle
+  # its SIGTERM at all, so the deadline this option promises was not a
+  # deadline. CONT lets it wake up and quit cleanly (giving the panel back on
+  # its own terms); KILL is the guarantee, needs no CONT of its own — a
+  # stopped process dies of it regardless — and surfaces as exit 137, which
+  # the case below reports for what it is.
+  #
   # The watchdog's >/dev/null 2>&1 is what makes an early death report early.
   # 'kill $sp' kills the subshell, not the sleep it forked, and an orphaned
   # sleep holding the remote stdout keeps the ssh channel from reaching EOF —
@@ -470,11 +492,24 @@ cmd_play() {
   # as SIGINT, which is the interactive path above; this path has no tty at
   # all.
   say "running the game for ${PLAY_SECS}s, unattended"
-  _timed="setsid $REMOTE_GAME & rp=\$!; (sleep $PLAY_SECS; kill -TERM \$rp 2>/dev/null) >/dev/null 2>&1 & sp=\$!; wait \$rp; rc=\$?; kill \$sp 2>/dev/null; exit \$rc"
+  _watchdog="sleep $PLAY_SECS; kill -TERM \$rp 2>/dev/null; kill -CONT \$rp 2>/dev/null; sleep 5; kill -KILL \$rp 2>/dev/null"
+  _timed="setsid $REMOTE_GAME & rp=\$!; ($_watchdog) >/dev/null 2>&1 & sp=\$!; wait \$rp; rc=\$?; kill \$sp 2>/dev/null; exit \$rc"
   _rc=0
   remote "$_timed" || _rc=$?
+  # remote() returns 0 unconditionally in dry-run, so without this the case
+  # below would announce an outcome from a run that never happened — the trap
+  # wave B fixed for 'install', in the one other place that had it.
+  if [ "$DRY" -eq 1 ]; then
+    say "[dry-run] stops here — nothing above actually ran"
+    return 0
+  fi
   case $_rc in
     0|143) say "the timed run ended cleanly (exit $_rc)" ;;
+    137)   die "the game was SIGKILLed (exit 137)
+  It did not stop for SIGTERM within 5 s of the ${PLAY_SECS}s deadline — it was
+  ignoring the signal, or the display server had it stopped and even SIGCONT
+  did not get it to quit. The panel is back either way; 'bin/redoku status'
+  says what is running now." ;;
     *)     die "the game exited $_rc — its output above says why" ;;
   esac
 }

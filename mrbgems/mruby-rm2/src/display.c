@@ -393,7 +393,10 @@ rm2_display_pixel(mrb_state* mrb, mrb_value self) {
  * host-invisible; test/display.rb pins the rejection, which is not. */
 static void
 check_coord(mrb_state* mrb, mrb_int v) {
-  /* Both %d and %i consume an mrb_int, so the literal must be cast. */
+  /* %i consumes an mrb_int and %d a plain int (mruby 4.0's mrb_vformat, in
+   * its src/error.c) — they are not interchangeable, and an mrb_int passed
+   * to %d is a varargs type mismatch wherever the two differ in width, as
+   * they do on the host. Hence %i here, and hence the casts. */
   if (v < -RM2_MAX_SPAN || v > RM2_MAX_SPAN)
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "coordinate must be within -%i..%i",
                (mrb_int)RM2_MAX_SPAN, (mrb_int)RM2_MAX_SPAN);
