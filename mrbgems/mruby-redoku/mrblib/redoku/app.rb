@@ -182,10 +182,24 @@ module Redoku
 
     def press(button)
       case button
-      when :quit then @running = false
+      when :quit then quit
       when :level then cycle_difficulty
       when :new then clear_ink
       end
+    end
+
+    # New and Level repaint as their action, so they read as responsive for
+    # free. Quit is the one press whose action is to disappear — and e-ink
+    # holds the last image it was given, so the board stays on the panel
+    # through teardown and a tap that worked looks like a tap that did
+    # nothing (observed on the device: the game exits, xochitl comes back a
+    # moment later, and in between the frozen board is all there is to see).
+    # So acknowledge first, in the one waveform fast enough to arrive before
+    # the exit it announces, and do not wait on the panel: the update is
+    # sent, its ack is a socket round trip, and quitting is no slower for it.
+    def quit
+      @renderer.press_button(:quit)
+      @running = false
     end
 
     def cycle_difficulty

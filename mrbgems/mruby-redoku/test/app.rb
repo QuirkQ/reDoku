@@ -205,6 +205,29 @@ assert('a tap on Quit stops the loop') do
   assert_false app.running?
 end
 
+assert('a tap on Quit acknowledges itself before the game tears down') do
+  app, d, = new_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  d.clear_calls
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_sample(pen_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_false app.running?
+  # Quit is the one button whose action is not a repaint, and e-ink holds
+  # the last image it was given right through teardown — so the inverted
+  # flash below is the only feedback the player gets that the tap landed.
+  # It goes out with the ink waveform (DU + FAST_DRAW), not GL16: this has
+  # to beat the teardown it announces.
+  assert_equal 1, d.updates.size
+  assert_equal [qx, qy, qw, qh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+  # Inverted means the paper is black and the border is white — the label
+  # is drawn in the same white, so the whole button reads as pressed.
+  assert_equal [qx, qy, qw, qh, Redoku::Renderer::BLACK], d.rects[0]
+  assert_equal [qx, qy, qw, Redoku::Renderer::BUTTON_BORDER,
+                Redoku::Renderer::WHITE], d.rects[1]
+  assert_equal 255, d.gray_at(qx, qy)          # border, top-left: white now
+  assert_equal 0, d.gray_at(qx + 10, qy + qh / 2) # paper, left of the label
+end
+
 assert('a long drag across Quit is not a tap') do
   app, = new_app
   qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)

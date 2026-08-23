@@ -81,6 +81,19 @@ module Redoku
       @d.update(x, y, w, h, waveform: waveform, flags: flags)
     end
 
+    # Repaints one button inverted — black paper, white border and label —
+    # and flushes it as ink rather than chrome. That is deliberate: DU is
+    # the two-level waveform the pen echo uses, so this lands in about a
+    # tenth of the time a GL16 chrome refresh would take, and it is the
+    # acknowledgement for a press whose own action may be to tear the game
+    # down (App#quit). Nothing inverts it back: the caller is either
+    # repainting the button itself or exiting.
+    def press_button(name)
+      x, y, w, h = Layout.button_rect(name)
+      draw_button(name, x, y, w, h, WHITE, BLACK)
+      @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
+    end
+
     private
 
     def header_rect
@@ -88,19 +101,22 @@ module Redoku
        Layout::BOARD_W, Font::HEIGHT * Layout::TITLE_SCALE]
     end
 
-    def draw_button(name, x, y, w, h)
-      @d.fill_rect(x, y, w, h, WHITE)
-      @d.fill_rect(x, y, w, BUTTON_BORDER, BLACK)              # top
-      @d.fill_rect(x, y + h - BUTTON_BORDER, w, BUTTON_BORDER, BLACK) # bottom
-      @d.fill_rect(x, y, BUTTON_BORDER, h, BLACK)              # left
-      @d.fill_rect(x + w - BUTTON_BORDER, y, BUTTON_BORDER, h, BLACK) # right
+    # `ink` and `paper` swap for the pressed state (press_button). They are
+    # the only two grays a button uses, so one pair of arguments inverts the
+    # whole thing — frame and label included — with no second code path.
+    def draw_button(name, x, y, w, h, ink = BLACK, paper = WHITE)
+      @d.fill_rect(x, y, w, h, paper)
+      @d.fill_rect(x, y, w, BUTTON_BORDER, ink)              # top
+      @d.fill_rect(x, y + h - BUTTON_BORDER, w, BUTTON_BORDER, ink) # bottom
+      @d.fill_rect(x, y, BUTTON_BORDER, h, ink)              # left
+      @d.fill_rect(x + w - BUTTON_BORDER, y, BUTTON_BORDER, h, ink) # right
 
       label = name.to_s.upcase
       scale = Layout::BUTTON_LABEL_SCALE
       Font.draw(@d, label,
                 x + (w - Font.width(label, scale)) / 2,
                 y + (h - Font::HEIGHT * scale) / 2,
-                scale, BLACK)
+                scale, ink)
     end
   end
 end
