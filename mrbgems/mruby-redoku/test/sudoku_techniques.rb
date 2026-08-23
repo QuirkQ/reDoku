@@ -101,6 +101,102 @@ assert('Techniques.solve finishes a singles-only board and says so') do
   assert_true [:naked_single, :hidden_single].include?(result[:hardest])
 end
 
+assert('Techniques.solve counts how often each rule was needed') do
+  t = Redoku::Sudoku::Techniques
+  # `hardest` says which rule was the worst; `counts` says how much work the
+  # board took. Rating needs both: one pointing pair and nine of them are not
+  # the same puzzle, and `hardest` calls them both :pointing.
+
+  # A singles-only board writes one digit per hole and eliminates nothing, so
+  # the counts must add up to exactly the number of holes. The hole count is
+  # derived from the board rather than written in by hand, so this does not
+  # depend on a fixture's arithmetic being restated correctly in a comment.
+  values = values_of(EASY_81)
+  holes = 0
+  values.each { |d| holes += 1 if d == 0 }
+  assert_true holes > 0 # premise: a board with no holes would pass trivially
+
+  result = t.solve(values)
+  assert_true result[:solved]
+  total = 0
+  result[:counts].each_value { |n| total += n }
+  assert_equal(holes, total)
+
+  # A rule that never fired is ABSENT, not zero. Callers weight the keys they
+  # find, so "never looked for" must not read as "used 0 times" -- that is the
+  # difference between a rule being unnecessary and a rule being unimplemented.
+  assert_false result[:counts].has_key?(:naked_pair)
+  assert_false result[:counts].has_key?(:hidden_pair)
+  assert_false result[:counts].has_key?(:pointing)
+
+  # Six holes, same accounting.
+  six = t.solve(values_of(UNIQUE_81))
+  filled = 0
+  six[:counts].each_value { |n| filled += n }
+  assert_equal(6, filled)
+
+  # A board that needed nothing gets an empty log, not a nil one, so a caller
+  # can sum it without checking.
+  done = t.solve(solved_values)
+  assert_equal({}, done[:counts])
+  assert_nil done[:hardest]
+
+  # A stalled board logs the work it DID manage before giving up, which is
+  # what lets a rater tell "stalled immediately" from "stalled at the end".
+  stalled = t.solve(values_of(MULTI_81))
+  assert_false stalled[:solved]
+  assert_false stalled[:counts].nil?
+end
+
+assert('Techniques.place keeps hard-won eliminations across a write') do
+  t = Redoku::Sudoku::Techniques
+  # This is the whole reason the candidate grid is maintained incrementally
+  # rather than rebuilt: an elimination a rule paid for must survive the next
+  # digit being written. Rebuilding from the board would hand the 8 back to
+  # cell 60 here, and the pointing pair that removed it would have to be
+  # found all over again.
+  work = Array.new(81, 0)
+  cand = t.candidate_grid(work)
+  cand[60] &= ~(1 << 8) # as if an eliminator had ruled the 8 out
+  t.place(work, cand, 0, 3)
+
+  assert_equal(3, work[0])
+  assert_equal(0, cand[0])                # the written cell holds nothing more
+  assert_equal(0, cand[1] & (1 << 3))     # a peer loses the digit
+  assert_equal(0, cand[9] & (1 << 3))     # column peer too
+  assert_equal(0, cand[10] & (1 << 3))    # box peer too
+  assert_equal(0, cand[60] & (1 << 8))    # AND the earlier elimination stands
+  # A cell sharing no unit with cell 0 keeps the digit.
+  assert_true (cand[80] & (1 << 3)) != 0
+end
+
+assert('Techniques.place is sound on a peer that is already filled') do
+  t = Redoku::Sudoku::Techniques
+  # A filled peer has a zero mask, so stripping a bit from it must be a
+  # no-op rather than something that needs guarding against.
+  work = Array.new(81, 0)
+  cand = t.candidate_grid(work)
+  t.place(work, cand, 1, 3)
+  assert_equal(0, cand[1])
+  t.place(work, cand, 0, 5) # cell 1 is a peer of cell 0 and already filled
+  assert_equal(0, cand[1])
+  assert_equal(3, work[1])  # and its digit is untouched
+end
+
+assert('Techniques.tally accumulates rather than overwrites') do
+  t = Redoku::Sudoku::Techniques
+  counts = {}
+  t.tally(counts, :pointing)
+  assert_equal(1, counts[:pointing])
+  t.tally(counts, :pointing)
+  t.tally(counts, :pointing)
+  assert_equal(3, counts[:pointing])
+  # A second rule does not disturb the first.
+  t.tally(counts, :naked_pair)
+  assert_equal(3, counts[:pointing])
+  assert_equal(1, counts[:naked_pair])
+end
+
 assert('Techniques.solve reports nil hardest for an already-solved board') do
   result = Redoku::Sudoku::Techniques.solve(solved_values)
   assert_true result[:solved]

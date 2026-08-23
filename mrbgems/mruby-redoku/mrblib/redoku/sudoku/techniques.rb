@@ -10,13 +10,25 @@ module Redoku
     # Two of the five rules WRITE a digit (the singles). Three only ELIMINATE
     # candidates (the pairs and pointing). That difference drives everything:
     #
-    #   - Candidates live in a `cand` array of 81 masks, held across
-    #     elimination steps and rebuilt from the board only after a digit is
-    #     written. An earlier design rebuilt it every pass, which threw every
-    #     elimination away the moment it was made — so a pair would be
-    #     rediscovered for ever and the loop would never end. Holding it is
-    #     also what a person does: eliminations accumulate until something
-    #     becomes forced.
+    #   - Candidates live in a `cand` array of 81 masks and are maintained
+    #     INCREMENTALLY: writing a digit clears that cell's mask and strips
+    #     the digit from its 20 peers, and nothing else is touched. Two
+    #     earlier designs did worse. Rebuilding every pass threw every
+    #     elimination away the moment it was made, so a pair was rediscovered
+    #     for ever and the loop never ended. Rebuilding after each write
+    #     terminated, but still discarded all accumulated eliminations at
+    #     every write — 1620 peer lookups to reconstruct what 20 updates
+    #     would have preserved, which measured 37 ms per solve against the
+    #     search solver's 1 ms and put this class out of reach of the rating
+    #     path it exists to serve.
+    #
+    #     Keeping eliminations across writes is sound, because an elimination
+    #     only ever removes a candidate that provably cannot be there, and a
+    #     write cannot make it possible again. It is also what a person does:
+    #     you do not forget that a cell cannot be a 7 just because you filled
+    #     in a different cell. Being strictly stronger, it can make `hardest`
+    #     come out EASIER than the rebuilding version did — it never makes it
+    #     harder — because a deduction kept is a deduction not re-derived.
     #
     #   - Every elimination rule returns true ONLY if a mask actually shrank.
     #     That is the termination argument, and it is why the "does not fire
@@ -45,6 +57,7 @@ module Redoku
         work = values.dup
         cand = candidate_grid(work)
         hardest = nil
+        counts = {}
         passes = 0
 
         while passes < MAX_PASSES
@@ -52,17 +65,17 @@ module Redoku
 
           i = find_naked_single(cand)
           if i
-            work[i] = Grid.bits(cand[i])[0]
+            place(work, cand, i, Grid::BIT_LIST[cand[i]][0])
             hardest = harder(hardest, :naked_single)
-            cand = candidate_grid(work)
+            tally(counts, :naked_single)
             next
           end
 
           spot = find_hidden_single(cand)
           if spot
-            work[spot[0]] = spot[1]
+            place(work, cand, spot[0], spot[1])
             hardest = harder(hardest, :hidden_single)
-            cand = candidate_grid(work)
+            tally(counts, :hidden_single)
             next
           end
 
@@ -71,21 +84,37 @@ module Redoku
           # cheap writing rules get another look after each one.
           if naked_pair(cand)
             hardest = harder(hardest, :naked_pair)
+            tally(counts, :naked_pair)
             next
           end
           if hidden_pair(cand)
             hardest = harder(hardest, :hidden_pair)
+            tally(counts, :hidden_pair)
             next
           end
           if pointing(cand)
             hardest = harder(hardest, :pointing)
+            tally(counts, :pointing)
             next
           end
 
           break # nothing applies: stalled, and that is an answer
         end
 
-        { values: work, solved: Grid.complete?(work), hardest: hardest }
+        { values: work, solved: Grid.complete?(work), hardest: hardest,
+          counts: counts }
+      end
+
+      # HOW OFTEN each rule was needed, not just which was hardest. The
+      # difference matters for rating: a board that needs one pointing pair
+      # and a board that needs nine of them are not the same puzzle, and
+      # `hardest` calls them both ":pointing". Keyed by technique, absent
+      # rather than zero when a rule never fired -- callers weight the keys
+      # they find, so a rule added to ORDER cannot silently read as "used 0
+      # times" when the real answer is "never looked for".
+      def self.tally(counts, name)
+        counts.store(name, (counts[name] || 0) + 1)
+        counts
       end
 
       # -1 for nil, so any real technique outranks "nothing needed yet".
@@ -97,10 +126,28 @@ module Redoku
         rank(a) >= rank(b) ? a : b
       end
 
+      # Write `d` at `i` and keep the candidate grid true, in 21 updates
+      # rather than a fresh 81-cell rebuild: the cell itself holds nothing
+      # more, and no peer may hold that digit any longer. Every other mask is
+      # left exactly as it was, which is what preserves the eliminations the
+      # pair and pointing rules paid for.
+      #
+      # Stripping the bit from a peer that is already FILLED is harmless: a
+      # filled cell's mask is 0, so there is nothing to clear.
+      def self.place(work, cand, i, d)
+        work[i] = d
+        cand[i] = 0
+        bit = 1 << d
+        Grid::PEERS[i].each { |j| cand[j] &= ~bit }
+        self
+      end
+
       # 81 masks. A FILLED cell gets 0, not its candidates: that is what lets
       # every rule below treat "mask is zero" as "not my business" without
       # consulting the board, and it is why an already-placed digit can never
       # be counted as a home for itself.
+      #
+      # Only used to seed the grid now; `place` maintains it from there.
       def self.candidate_grid(work)
         cand = []
         Grid::CELLS.times do |i|
