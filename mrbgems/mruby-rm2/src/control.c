@@ -35,6 +35,10 @@
 #define CTL_SWITCH_TO 2
 #define CTL_MAX_CLIENTS 64
 #define CTL_TIMEOUT_SEC 2
+/* One spelling for the default path: it used to be a literal in three
+ * places, and the switch_to default was the one nobody would notice drift
+ * in. */
+#define CTL_SOCKET_PATH "/var/run/rm2fb.control.sock"
 
 typedef struct {
   int32_t type;
@@ -101,7 +105,7 @@ fail_close(mrb_state* mrb, int sock, const char* msg) {
 
 static const char*
 control_path(mrb_state* mrb) {
-  const char* path = "/var/run/rm2fb.control.sock";
+  const char* path = CTL_SOCKET_PATH;
   mrb_get_args(mrb, "|z", &path);
   return path;
 }
@@ -165,7 +169,7 @@ rm2_control_s_clients(mrb_state* mrb, mrb_value klass) {
 static mrb_value
 rm2_control_s_switch_to(mrb_state* mrb, mrb_value klass) {
   mrb_int pid;
-  const char* path = "/var/run/rm2fb.control.sock";
+  const char* path = CTL_SOCKET_PATH;
   control_req req;
   int sock;
   uint8_t ok = 0;
@@ -194,5 +198,5 @@ rm2_control_init(mrb_state* mrb, struct RClass* rm2) {
   mrb_define_module_function(mrb, cls, "switch_to", rm2_control_s_switch_to,
                              MRB_ARGS_ARG(1, 1));
   mrb_define_const(mrb, cls, "SOCKET_PATH",
-                   mrb_str_new_lit(mrb, "/var/run/rm2fb.control.sock"));
+                   mrb_str_new_lit(mrb, CTL_SOCKET_PATH));
 }

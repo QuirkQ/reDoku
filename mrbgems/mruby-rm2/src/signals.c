@@ -37,7 +37,7 @@ on_cont(int sig) {
 
 static mrb_value
 rm2_s_setup_signals(mrb_state* mrb, mrb_value self) {
-  struct sigaction term, cont, pipe;
+  struct sigaction term, cont, sigpipe;
 
   memset(&term, 0, sizeof(term));
   term.sa_handler = on_terminate;
@@ -51,9 +51,9 @@ rm2_s_setup_signals(mrb_state* mrb, mrb_value self) {
     mrb_sys_fail(mrb, "install SIGCONT handler");
 
   /* A dead server must surface as EPIPE from send(), not as a signal. */
-  memset(&pipe, 0, sizeof(pipe));
-  pipe.sa_handler = SIG_IGN;
-  if (sigaction(SIGPIPE, &pipe, NULL) < 0)
+  memset(&sigpipe, 0, sizeof(sigpipe));
+  sigpipe.sa_handler = SIG_IGN;
+  if (sigaction(SIGPIPE, &sigpipe, NULL) < 0)
     mrb_sys_fail(mrb, "ignore SIGPIPE");
 
   return mrb_nil_value();
