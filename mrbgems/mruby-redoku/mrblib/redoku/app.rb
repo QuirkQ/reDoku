@@ -311,6 +311,13 @@ module Redoku
     # about, which covers the palm that lands a moment BEFORE the pen is
     # detected — same hazard, same answer, and re-tapping a button is a
     # cheap price for never quitting someone's game by accident.
+    #
+    # That second half is best-effort, not a second rule, and the honest
+    # reason is the kernel: it drops a frame in which nothing changed, so a
+    # PERFECTLY still contact emits nothing after its down packet and there
+    # is no later sample to re-latch on. In practice a resting palm jitters
+    # and end_touch re-checks at the lift, so the hole is narrow — but it is
+    # a hole, and the birth latch is what actually carries the guarantee.
     def begin_touch(x, y)
       @touch_last = [x, y]
       @touch_travel = 0
