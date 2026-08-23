@@ -16,15 +16,26 @@ checkerboard demo flashed onto the e-ink and xochitl's UI came back, and
 `rm2fbctl list` works (live-client `switch` deferred to M1, which builds
 the first long-running client).
 
-**M1's walking skeleton is implemented and host-tested 2026-08-21**:
-`mruby-rm2` grew input, the control socket and signal flags; `mruby-redoku`
-holds the layout, bitmap font, renderer, pen mapping and event loop; and
-`mruby-bin-redoku` links it all into the `redoku` executable, cross-built
-for armv7 and put on the device by `bin/redoku install` / `play`. Green on
-2231 host assertions plus a bintest that runs the real binary. **The
-remaining M1 gate is on-device verification of the pen path** — ink under a
-real digitizer, `New` / `Level` / `Quit` as pen taps, and Quit handing the
-screen back to xochitl. Next: Milestone 2 — the sudoku engine.
+**Milestone 1 is complete 2026-08-23.** `mruby-rm2` grew input, the control
+socket, signal flags and a monotonic clock; `mruby-redoku` holds the layout,
+bitmap font, renderer, pen and touch mapping and the event loop; and
+`mruby-bin-redoku` links it all into the `redoku` executable, cross-built for
+armv7 and put on the device by `bin/redoku install` / `play`. Green on 2269
+host assertions plus a bintest that runs the real binary.
+
+Verified on the real device, not inferred: the board paints, pen ink echoes
+under a real digitizer, taps land on both button rows from the pen *and* a
+finger, palm suppression holds while writing, and Quit hands the panel back
+to xochitl. Two defects the device found that no host test could — Quit and
+then New/Level each reading as a button that did nothing — are why §5's
+"every button acknowledges its press" exists. M1 also grew two features past
+its original scope on the owner's instruction: finger-tappable buttons and
+the press acknowledgement.
+
+**The one thing still unwitnessed on hardware is the final build itself**
+(the button-feedback and proximity-recovery work): worth checking that New
+and Level now flash at the button, and that palm suppression is exactly as
+good as it was. Next: Milestone 2 — the sudoku engine.
 
 ---
 
