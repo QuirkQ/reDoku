@@ -33,6 +33,23 @@ module Redoku
     # repaints was too short to perceive.
     QUIT_ACK_MS = 200
 
+    # How long the pen may say nothing at all before its proximity latch is
+    # treated as stale. @pen_near only ever becomes false because a packet
+    # said so, and two documented things eat that packet: the display server
+    # drains the evdev backlog of a client it had SIGSTOPped (PLAN.md §5),
+    # and SYN_DROPPED, which input.c discards a torn packet for. With no
+    # expiry, one lost packet suppresses every finger tap for the rest of the
+    # session, recoverable only by waving the pen into range and out again —
+    # which nobody would guess.
+    #
+    # Twice the cooldown and ten loop turns: long enough that a pen genuinely
+    # hovering over the glass keeps its own latch alive (the digitizer
+    # reports at about 100 Hz while a tool is in range, and a held hand
+    # always jitters), short enough that a lost packet costs a second instead
+    # of a session. It is a recovery, not a relaxation — see
+    # expire_pen_proximity.
+    PEN_SILENCE_MS = 1000
+
     # How long touch stays suppressed after the pen leaves proximity.
     # BTN_TOOL_PEN flickers out during normal writing, and without a
     # cooldown one such dropout is a window for a resting palm to press
@@ -73,6 +90,7 @@ module Redoku
       @touch_blocked = false # this contact met the pen; it can never press
       @pen_near = false      # pen (or rubber) in proximity, hovering counts
       @pen_left_at = nil     # monotonic ms when proximity last ended
+      @pen_seen_at = nil     # monotonic ms of the last pen packet of any kind
     end
 
     def running?
@@ -105,6 +123,13 @@ module Redoku
         @sources.each do |source|
           source.pending_events.each { |sample| handle_sample(sample) }
         end
+        # Between the two drains, not before both: a turn that took a second
+        # inside a GC16 SYNC repaint leaves the pen's packets queued, and
+        # decoding them first is what stops a slow repaint from looking like
+        # a silent digitizer. After that the touch samples of this same turn
+        # are judged against proximity we have just re-checked, so the first
+        # tap after a lost packet is the one that works.
+        expire_pen_proximity
         @touch.each do |source|
           source.pending_events.each { |sample| handle_touch_sample(sample) }
         end
@@ -167,7 +192,18 @@ module Redoku
 
     # After a SIGCONT the server has already re-flashed our buffer, but a
     # full repaint is the cheap way to be certain the panel matches us.
+    #
+    # It is also where the input-derived latches are thrown away, and that
+    # half matters more than the repaint. We were SIGSTOPped, and the display
+    # server drains the evdev backlog of a client it thaws (PLAN.md §5), so
+    # every packet the user generated while we were frozen is gone. If the
+    # pen left proximity in that window, @pen_near would stay true for ever
+    # and every finger tap would be dead for the rest of the session; if a
+    # contact lifted, @touch_mode would stay open and no later tap would
+    # complete. Both are latches with nothing else to clear them, so both are
+    # cleared here rather than waited on.
     def handle_resume
+      forget_input_state
       @renderer.draw_all(@difficulty)
       @renderer.flush_all
       self
@@ -201,8 +237,54 @@ module Redoku
     # pen: it records, for the touch path, where the pen is.
     def note_pen_proximity(tools)
       near = (tools & (RM2::Input::PEN | RM2::Input::RUBBER)) != 0
-      @pen_left_at = @clock.monotonic_ms if @pen_near && !near
+      # Stamped for EVERY pen packet, near or not, because what
+      # expire_pen_proximity needs to know is when the digitizer last said
+      # anything at all. One vDSO clock_gettime per sample, against a sample
+      # that already costs a transform and a brush stamp.
+      @pen_seen_at = @clock.monotonic_ms
+      @pen_left_at = @pen_seen_at if @pen_near && !near
       @pen_near = near
+    end
+
+    # Treats a digitizer that has gone completely quiet as a pen that is no
+    # longer there. This is the recovery half of PEN_SILENCE_MS: without it a
+    # single lost proximity-off packet disables the touchscreen for the whole
+    # session, silently, with no diagnostic and no discoverable way back.
+    #
+    # It expires the latch and nothing more — no cooldown is started here,
+    # unlike an observed proximity-off. The cooldown absorbs BTN_TOOL_PEN
+    # flicker, and flicker is packets; silence is the absence of packets, so
+    # there is nothing to absorb and no reason to make the recovery a second
+    # and a half instead of a second.
+    #
+    # It does not loosen suppression while the pen is genuinely about: a pen
+    # in range reports continuously, so its own packets keep resetting the
+    # deadline. And a contact that was open while the pen was still being
+    # seen stays latched dead regardless — @touch_blocked is per contact, and
+    # only a lift (or a resume) clears it.
+    def expire_pen_proximity
+      return self unless @pen_near && @pen_seen_at
+      elapsed = @clock.monotonic_ms - @pen_seen_at
+      # A negative elapsed is the 32-bit wrap touch_suppressed? documents,
+      # and reads the same way here: expired. Recovering a second early once
+      # every 24.8 days beats a dead touchscreen for the same window.
+      @pen_near = false if elapsed < 0 || elapsed >= PEN_SILENCE_MS
+      self
+    end
+
+    # Everything the loop believes about the glass, unlearned. Called on
+    # resume, where none of it can be trusted any more (see handle_resume).
+    #
+    # A fresh cooldown rather than a clean slate: a hand is quite likely to
+    # be on the glass at the moment the game comes back, and the pen's next
+    # packet is the first evidence either way. The pen's own stroke state is
+    # deliberately left alone — an interrupted stroke is one wrong line, not
+    # a dead input device, and the pen path is verified on hardware.
+    def forget_input_state
+      @pen_near = false
+      @pen_seen_at = nil
+      @pen_left_at = @clock.monotonic_ms
+      close_touch_contact
     end
 
     # True while a touch contact must not be allowed to press anything: the
@@ -251,6 +333,13 @@ module Redoku
       @touch_travel += (x - @touch_last[0]).abs + (y - @touch_last[1]).abs
       @touch_blocked = true if touch_suppressed?
       press(@touch_button) if touch_tap?(x, y)
+      close_touch_contact
+    end
+
+    # The touch contact's state, as if no finger had ever been on the glass.
+    # Shared with forget_input_state, because a resume has to do exactly this
+    # to a contact whose lift packet it may never see.
+    def close_touch_contact
       @touch_mode = nil
       @touch_last = nil
       @touch_button = nil

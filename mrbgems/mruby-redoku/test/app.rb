@@ -67,6 +67,7 @@ class WedgedDisplay < TestDisplay
   end
 end
 
+
 # A monotonic clock a test can drive. The cooldown is half a second of real
 # time; asserting against a real clock would mean sleeping through it once
 # per assertion, so App takes the clock the same way it takes its waiter.
@@ -669,4 +670,132 @@ assert('App#step drops a hung-up touchscreen and plays on with the pen') do
   assert_true app.running?
   app.step
   assert_equal [pen], waiter.calls[1][0]
+end
+
+assert('a resume forgets that the pen was ever near') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(pen_sample(300, 400, false)) # hovering: touch suppressed
+  app.handle_resume
+  # The display server drains the evdev backlog of a client it thaws
+  # (PLAN.md §5), so the packet saying the pen left proximity is lost
+  # precisely when the user switches away from the game and back. @pen_near
+  # is a latch with nothing to clear it: without this reset every finger tap
+  # is dead for the rest of the session, recoverable only by waving the pen
+  # into range and out again, which nobody would guess.
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_false app.running?
+end
+
+assert('a resume starts a fresh cooldown rather than a clean slate') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(pen_sample(300, 400, false))
+  app.handle_resume
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS - 1
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  # A hand is quite likely to be on the glass at the moment the game comes
+  # back, and the pen's next sample is the first evidence either way — so
+  # the reset above must not be a licence to fire Quit immediately.
+  assert_true app.running?
+end
+
+assert('a resume closes a contact whose lift packet may have been dropped') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  # A contact opens, then the game is frozen and thawed with its lift packet
+  # still in the backlog the server drains. Left open, @touch_mode routes
+  # every later contact to continue_touch and no tap ever completes again.
+  app.handle_touch_sample(touch_sample(300, 400, true))
+  app.handle_resume
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_false app.running?
+end
+
+assert('pen proximity expires when the digitizer goes silent') do
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app, _d, clock = new_touch_app(
+    [], [[touch_sample(qx + qw / 2, qy + qh / 2, true),
+          touch_sample(qx + qw / 2, qy + qh / 2, false)]]
+  )
+  app.handle_sample(pen_sample(300, 400, false)) # hovering, then silence
+  clock.ms += Redoku::App::PEN_SILENCE_MS
+  app.step
+  # SYN_DROPPED discards a torn packet (input.c), and the packet it discards
+  # can be the one that says the pen left proximity. No resume hook can see
+  # that, so proximity has to be able to expire on its own too.
+  assert_false app.running?
+end
+
+assert('a pen in proximity suppresses touch right up to the silence timeout') do
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app, _d, clock = new_touch_app(
+    [], [[touch_sample(qx + qw / 2, qy + qh / 2, true),
+          touch_sample(qx + qw / 2, qy + qh / 2, false)]]
+  )
+  app.handle_sample(pen_sample(300, 400, false))
+  clock.ms += Redoku::App::PEN_SILENCE_MS - 1
+  app.step
+  # The expiry is a recovery from a LOST packet, not a licence to allow taps
+  # while the pen is demonstrably about. Palm suppression is verified on
+  # hardware and must not get looser by a millisecond.
+  assert_true app.running?
+end
+
+assert('every pen packet restarts the silence timeout') do
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app, _d, clock = new_touch_app(
+    [], [[touch_sample(qx + qw / 2, qy + qh / 2, true),
+          touch_sample(qx + qw / 2, qy + qh / 2, false)]]
+  )
+  app.handle_sample(pen_sample(300, 400, false))
+  clock.ms += Redoku::App::PEN_SILENCE_MS - 1
+  app.handle_sample(pen_sample(301, 401, false)) # still hovering
+  clock.ms += Redoku::App::PEN_SILENCE_MS - 1
+  app.step
+  # A hovering pen reports at about 100 Hz and a held hand always jitters,
+  # so the deadline is measured from the LAST packet, not the first. Stamp
+  # it once and a long hover would expire while the pen was still there.
+  assert_true app.running?
+end
+
+assert('a finger already down when the pen arrives is latched dead') do
+  app, = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true)) # palm
+  app.handle_sample(pen_sample(300, 400, false)) # the pen reaches the glass
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  # Decision 2 as literally written latches at BIRTH, which leaves the palm
+  # that lands a moment BEFORE the pen is detected — the same hazard. The
+  # latch is re-armed on any sample taken while the pen is about, so this
+  # contact is dead by the time it lifts.
+  assert_true app.running?
+end
+
+assert('a contact that met the pen mid-drag stays dead after the pen leaves') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  x0 = qx + qw / 2
+  y0 = qy + qh / 2
+  app.handle_touch_sample(touch_sample(x0, y0, true))     # born, pen away
+  app.handle_sample(pen_sample(300, 400, false))           # pen arrives
+  app.handle_touch_sample(touch_sample(x0 + 1, y0, true))  # the contact jitters
+  app.handle_sample(pen_away_sample(300, 400))             # pen leaves again
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS + 1
+  app.handle_touch_sample(touch_sample(x0 + 1, y0, false))
+  # Only continue_touch's re-latch can keep this dead: the contact was born
+  # while the pen was away, and by the lift the pen is long gone and the
+  # cooldown has expired.
+  #
+  # Best-effort by nature, and the honest limit worth knowing: the kernel
+  # drops a frame in which nothing changed, so a PERFECTLY still contact
+  # emits nothing after its down packet and there is no later sample to
+  # re-latch on. A resting palm jitters, and end_touch re-checks at the
+  # lift, so the hole is narrow — but it is a hole, not a second rule.
+  assert_true app.running?
 end
