@@ -9,6 +9,28 @@ module Redoku
     DIFFICULTIES = [:easy, :medium, :hard].freeze
     BUTTON_BORDER = 3
 
+    # Givens print darker than the player's own entries (PLAN.md §8), so a
+    # glance tells clue from guess without reading digit shapes. GIVEN_GRAY
+    # is full black rather than a lighter tone: it is the ink that must
+    # survive the most e-ink refreshes over a session, and black is what GC16
+    # holds cleanest.
+    GIVEN_GRAY = 0
+    ENTRY_GRAY = 96
+
+    # 14 gives a 70 x 98 px glyph in a 140 px cell: PLAN.md §8 asks for
+    # "~96 px" digits, and 98 is that target reached by a whole integer
+    # scale (Font.draw only ever steps a glyph by whole pixels), leaving
+    # 35 px of side margin and 21 px above and below — comfortably clear of
+    # both the cell border and BLOCK_LINE's 2 px overhang into the cell.
+    DIGIT_SCALE = 14
+
+    # The splash ('GENERATING...') is the other full-board-width text the
+    # renderer prints, so it takes the header's own scale rather than
+    # inventing a third one: same visual weight as REDOKU, and verified
+    # (test/renderer.rb) to still leave more than half the board's width
+    # spare on top of that, so a longer status message would fit too.
+    SPLASH_SCALE = Layout::TITLE_SCALE
+
     def initialize(display)
       @d = display
     end
@@ -55,6 +77,52 @@ module Redoku
       Layout.buttons.each do |name, x, y, w, h|
         draw_button(name, x, y, w, h)
       end
+      self
+    end
+
+    # `index` is a FLAT 0..80 cell index, matching Grid's own currency — the
+    # caller (draw_puzzle) already has one per cell and Grid.row_of/col_of
+    # are the tested way to turn it into Layout's (col, row), so re-deriving
+    # i / 9 and i % 9 here would just be a second copy that could disagree.
+    def draw_digit(index, digit, gray)
+      col = Sudoku::Grid.col_of(index)
+      row = Sudoku::Grid.row_of(index)
+      x, y, w, h = Layout.cell_rect(col, row)
+      text = digit.to_s
+      gw = Font.width(text, DIGIT_SCALE)
+      gh = Font::HEIGHT * DIGIT_SCALE
+      Font.draw(@d, text, x + (w - gw) / 2, y + (h - gh) / 2, DIGIT_SCALE, gray)
+      self
+    end
+
+    # Every filled cell of `grid`, given or entered, in its own ink. Blank
+    # cells are skipped rather than drawn as ' ' — Font.draw has no glyph for
+    # it anyway, but skipping also means this can be called on a half-solved
+    # board without painting anything for the holes.
+    def draw_puzzle(grid)
+      Sudoku::Grid::CELLS.times do |i|
+        next if grid.empty?(i)
+        gray = grid.given?(i) ? GIVEN_GRAY : ENTRY_GRAY
+        draw_digit(i, grid.value_at(i), gray)
+      end
+      self
+    end
+
+    # Fills the board area white and centres `text` in it — a status message
+    # (PLAN.md §8's "Generating…") shown while the generator is digging and
+    # the board underneath it is not yet something worth looking at. Filling
+    # white erases whatever grid or puzzle was there before on purpose: the
+    # caller repaints with draw_board + draw_puzzle once generation finishes,
+    # so nothing here needs to survive that. Painting only inside board_rect,
+    # rather than a wider area, is also what lets the caller's existing
+    # flush_board cover exactly the region this dirties — a second flush
+    # region would be a second way to do the one thing flush_board does.
+    def draw_splash(text)
+      x, y, w, h = Layout.board_rect
+      @d.fill_rect(x, y, w, h, WHITE)
+      tw = Font.width(text, SPLASH_SCALE)
+      th = Font::HEIGHT * SPLASH_SCALE
+      Font.draw(@d, text, x + (w - tw) / 2, y + (h - th) / 2, SPLASH_SCALE, BLACK)
       self
     end
 

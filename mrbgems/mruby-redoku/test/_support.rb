@@ -90,6 +90,58 @@ class TestDisplay
     @lines = []
     @updates = []
   end
+
+  # How many fill_rect calls have been recorded. Used only to prove drawing
+  # happened at all, not where.
+  def draw_count
+    @rects.size
+  end
+
+  # Distinct gray values among recorded rects that are not white (255) — i.e.
+  # actual ink, not background fill. Proves givens and entries render in two
+  # different grays without caring how many rects each one took.
+  def inked_grays
+    grays = []
+    @rects.each do |_x, _y, _w, _h, gray|
+      grays << gray if gray != 255 && !grays.include?(gray)
+    end
+    grays
+  end
+
+  # True when at least one ink rect (a fill_rect in a gray other than white)
+  # was recorded, AND every ink rect recorded lies entirely inside the given
+  # rectangle. The "every", not "any", is what makes this a real containment
+  # check: an `any?` version would still pass with a glyph half outside its
+  # cell, as long as one stray pixel happened to land inside.
+  def painted_within?(x, y, w, h)
+    ink = @rects.select { |_rx, _ry, _rw, _rh, gray| gray != 255 }
+    return false if ink.size == 0
+    ink.all? do |rx, ry, rw, rh, _gray|
+      rx >= x && ry >= y && rx + rw <= x + w && ry + rh <= y + h
+    end
+  end
+
+  # True when some ink rect lies entirely inside cell `index`'s rect, inset on
+  # every side by Layout::BLOCK_LINE. The inset is load-bearing: draw_board
+  # paints grid lines centred on cell boundaries, so up to BLOCK_LINE/2 px of
+  # line overhangs into every cell — without the inset, that overhang alone
+  # would make every cell report a glyph and the assertion would be vacuous.
+  # A digit at DIGIT_SCALE leaves 21 px of vertical margin, far clear of a
+  # 4 px inset, so the inset costs the real case nothing.
+  def glyph_in_cell?(index)
+    col = Redoku::Sudoku::Grid.col_of(index)
+    row = Redoku::Sudoku::Grid.row_of(index)
+    x, y, w, h = Redoku::Layout.cell_rect(col, row)
+    inset = Redoku::Layout::BLOCK_LINE
+    ix = x + inset
+    iy = y + inset
+    iw = w - 2 * inset
+    ih = h - 2 * inset
+    @rects.any? do |rx, ry, rw, rh, gray|
+      next false if gray == 255
+      rx >= ix && ry >= iy && rx + rw <= ix + iw && ry + rh <= iy + ih
+    end
+  end
 end
 
 # --- sudoku fixtures, shared by the grid, solver, technique, rater and

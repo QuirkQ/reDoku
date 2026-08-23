@@ -127,3 +127,113 @@ assert('Renderer draws nothing outside the panel') do
     assert_true y + h <= Redoku::Layout::SCREEN_H, "rect too tall: #{[x, y, w, h]}"
   end
 end
+
+assert('Renderer draws a digit centred in its cell') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  scale = Redoku::Renderer::DIGIT_SCALE
+  r.draw_digit(0, 5, Redoku::Renderer::GIVEN_GRAY)
+
+  x, y, w, h = Redoku::Layout.cell_rect(0, 0)
+  gw = Redoku::Font.width('5', scale)
+  gh = Redoku::Font::HEIGHT * scale
+  # The glyph must fit inside the cell with a visible margin on both axes.
+  assert_true gw < w
+  assert_true gh < h
+  # Every pixel it painted lies inside the centred glyph box.
+  assert_true d.painted_within?(x + (w - gw) / 2, y + (h - gh) / 2, gw, gh)
+end
+
+assert('Renderer draws a digit into the right cell, not always the first') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  scale = Redoku::Renderer::DIGIT_SCALE
+  # Cell 80 is col 8, row 8 — the opposite corner from cell 0. A draw_digit
+  # that ignored its index would paint at cell 0 and fail here.
+  r.draw_digit(80, 7, Redoku::Renderer::GIVEN_GRAY)
+  x, y, w, h = Redoku::Layout.cell_rect(8, 8)
+  gw = Redoku::Font.width('7', scale)
+  gh = Redoku::Font::HEIGHT * scale
+  assert_true d.painted_within?(x + (w - gw) / 2, y + (h - gh) / 2, gw, gh)
+end
+
+assert('Renderer draws givens darker than entries') do
+  assert_equal 0, Redoku::Renderer::GIVEN_GRAY
+  assert_true Redoku::Renderer::ENTRY_GRAY > Redoku::Renderer::GIVEN_GRAY
+  assert_true Redoku::Renderer::ENTRY_GRAY < Redoku::Renderer::WHITE
+end
+
+assert('DIGIT_SCALE puts a spec-sized digit in the cell with clear margin') do
+  scale = Redoku::Renderer::DIGIT_SCALE
+  height = Redoku::Font::HEIGHT * scale
+  # PLAN.md §8 asks for digits at "~96 px". 7 glyph rows at scale 14 is
+  # 98 px — the whole scale that lands nearest that target.
+  assert_true height >= 90
+  assert_true height <= 105
+  # It clears the block border on both sides rather than touching it.
+  assert_true height + 2 * Redoku::Layout::BLOCK_LINE < Redoku::Layout::CELL
+  # A larger scale would still FIT the cell (7*18 = 126 < 140) but would
+  # overshoot the spec, so what pins this number is §8, not the geometry.
+  assert_true Redoku::Font::HEIGHT * (scale + 2) > 105
+end
+
+assert('Renderer draws every filled cell of a puzzle and no empty one') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  grid = grid_of(EASY_81)
+  r.draw_board
+  drawn = d.draw_count
+  r.draw_puzzle(grid)
+  assert_true d.draw_count > drawn
+  # EASY_81 is '.23456789...' with blanks at cell 0 and cell 80 only.
+  assert_false d.glyph_in_cell?(0)
+  assert_true d.glyph_in_cell?(1)
+  assert_false d.glyph_in_cell?(80)
+  assert_true d.glyph_in_cell?(79)
+end
+
+assert('Renderer prints givens in given ink and entries in entry ink') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  grid = grid_of(EASY_81)
+  # Cell 0 is blank in EASY_81, so it can hold a player entry.
+  grid.set_entry(0, 1)
+  r.draw_puzzle(grid)
+  # A given and an entry are both on the board, in two different grays.
+  assert_true d.inked_grays.include?(Redoku::Renderer::GIVEN_GRAY)
+  assert_true d.inked_grays.include?(Redoku::Renderer::ENTRY_GRAY)
+end
+
+assert('Renderer draws a splash the font can actually print') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  text = 'GENERATING...'
+  # Every character must have a glyph. Font.draw silently draws NOTHING for
+  # an unknown character and just advances the cursor, so a lowercase or
+  # ellipsis character would render as blank space with no error at all.
+  text.each_char { |ch| assert_true !Redoku::Font::GLYPHS[ch].nil? }
+
+  r.draw_splash(text)
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  sw = Redoku::Font.width(text, Redoku::Renderer::SPLASH_SCALE)
+  assert_true sw < bw
+  # The splash lands inside the board area, so flush_board covers it.
+  assert_true d.painted_within?(bx, by, bw, bh)
+end
+
+# SPLASH_SCALE is not handed to us the way DIGIT_SCALE is — Task 5a chose it,
+# so its arithmetic gets its own assertion rather than trust. Picked to match
+# Layout::TITLE_SCALE (the header's scale) for visual consistency between the
+# two full-board-width texts the renderer prints, and verified here rather
+# than assumed: 'GENERATING...' is 13 characters, and this proves it clears
+# the board with more than half its width still empty on both sides
+# combined, not just barely inside it.
+assert('SPLASH_SCALE matches the header scale and leaves a wide margin') do
+  scale = Redoku::Renderer::SPLASH_SCALE
+  assert_equal Redoku::Layout::TITLE_SCALE, scale
+  text = 'GENERATING...'
+  sw = Redoku::Font.width(text, scale)
+  bw = Redoku::Layout::BOARD_W
+  assert_true sw < bw
+  assert_true sw < bw / 2
+end
