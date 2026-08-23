@@ -165,7 +165,18 @@ apply_mt_event(rm2_input* in, const struct input_event* ev) {
      * (input_mt_report_slot_state, then input_report_abs), so by the time
      * these arrive mt_contact already names the slot they belong to. Events
      * for any other slot are dropped here, which is what keeps a second
-     * finger from moving the followed contact's point. */
+     * finger from moving the followed contact's point.
+     *
+     * The price of having no per-slot table: the kernel de-duplicates
+     * ABS_MT_POSITION_* per slot, so if a fresh contact lands on a slot
+     * whose stored coordinate already equals its own, no position event is
+     * emitted and x/y still hold the PREVIOUS followed contact's point —
+     * the first sample of that contact then reports where the last finger
+     * was. It needs an exact-pixel coincidence on a slot reuse, so it is
+     * close to unreachable, and the benign corner is checked: at process
+     * start x/y are 0, which maps to screen (0, 1871), outside all three
+     * button rects. Fixing it properly means the table, and nothing in
+     * reDoku wants one. */
     case ABS_MT_POSITION_X:
       if (in->mt_slot == in->mt_contact) in->x = ev->value;
       break;

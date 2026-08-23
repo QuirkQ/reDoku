@@ -247,7 +247,19 @@ also answer to a finger.
    with would press Quit. A contact that began under the pen has to lift and
    press again before it counts, so a resting palm cannot fire a button just
    because the pen was set aside.
-6. Touch events reach nothing else. A finger on the board does not ink, does
+6. **Every** button press is acknowledged at the button: it paints inverted
+   in the ink waveform, the action runs while it is held down, and it paints
+   back ~200 ms later (Quit is not painted back — it is leaving). Not
+   optional polish: verified on the device, an action whose only visible
+   result is elsewhere on the panel, or is pixel-identical to what was
+   already there, reads as a button that did nothing at all.
+7. Proximity suppression is recoverable. The pen's proximity state is an
+   event latch, and a lost proximity-off packet — the display server drains
+   the evdev backlog of a client it thaws, and `SYN_DROPPED` discards torn
+   packets — would otherwise disable the touchscreen for the whole session.
+   So a resume forgets it, and it also expires after ~1 s of complete pen
+   silence.
+8. Touch events reach nothing else. A finger on the board does not ink, does
    not select a cell, and does not disturb a pen stroke in progress.
 
 ### mruby build

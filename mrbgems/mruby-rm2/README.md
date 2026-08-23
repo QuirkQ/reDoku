@@ -87,7 +87,11 @@ freeze the caller. Give the screen back by closing the display and exiting.
 glass, how long a stroke has been idle — from `CLOCK_MONOTONIC`, which a
 clock correction cannot move. Its epoch is the first call, not boot, so the
 count stays inside the device build's 32-bit `mrb_int`; only differences
-between two readings are meaningful.
+between two readings are meaningful. Two limits go with that: the count is
+masked into 31 bits, so it wraps after 24.8 days of process life and a
+difference across the wrap reads as negative (treat that as "long ago"); and
+`CLOCK_MONOTONIC` does not advance while the machine is suspended, so this
+counts awake milliseconds, not wall time.
 
 `terminated?` is sticky — once the process has been asked to quit it stays
 true. `resumed?` is consumed on read: each SIGCONT is reported exactly once,

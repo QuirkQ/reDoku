@@ -18,10 +18,18 @@ end
 assert('Touch.to_screen is not the pen transform') do
   # The two devices are mounted differently, and mixing the transforms up
   # would put every finger press somewhere else entirely: the pen swaps its
-  # axes, the touchscreen does not.
+  # axes, the touchscreen does not. So the same raw pair goes through both
+  # here — the name claims a difference, and this is it.
   x, y = Redoku::Touch.to_screen(100, 200)
   assert_equal 100, x
   assert_equal Redoku::Touch::MAX_Y - 200, y
+  px, py = Redoku::Pen.to_screen(100, 200)
+  assert_true [px, py] != [x, y], "pen gave #{[px, py]} too"
+  # And different in the specific way that matters: the pen's screen x comes
+  # from its raw Y (200 of 15725, so near the left edge) and its screen y
+  # from its raw X counted backwards (100 of 20966, so near the bottom).
+  assert_true px < 100, "px=#{px}"
+  assert_true py > 1800, "py=#{py}"
 end
 
 assert('Touch.to_screen clamps a raw point to the panel') do

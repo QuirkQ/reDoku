@@ -17,6 +17,11 @@
  * living that long is another matter. A caller that subtracts two readings
  * (the only supported use) then sees such a wrap as one interval expiring
  * early, not as a deadline that can never be reached.
+ *
+ * CLOCK_MONOTONIC does not advance while the machine is suspended to RAM,
+ * so "how long ago did the pen leave the glass" measures awake time. For
+ * every interval this gem measures that is the wanted answer, but it is not
+ * what "milliseconds forward" would lead you to assume.
  */
 #include "rm2.h"
 
@@ -44,7 +49,17 @@ rm2_s_monotonic_ms(mrb_state* mrb, mrb_value self) {
    * count to a whole second is still the right total. */
   ms = (int64_t)(now.tv_sec - g_base.tv_sec) * 1000 +
        (int64_t)(now.tv_nsec - g_base.tv_nsec) / 1000000;
-  return mrb_int_value(mrb, (mrb_int)ms);
+  /* Masked to 31 bits rather than cast straight down. ms cannot be negative
+   * (the epoch is the first reading and the clock only moves forward), but
+   * it does exceed INT32_MAX after 24.8 days of process life, and int64 ->
+   * int32 is IMPLEMENTATION-DEFINED past that in C99, not wrapping by
+   * guarantee. The mask says what happens instead of asking the compiler:
+   * the result is always in 0..INT32_MAX, so it fits any mrb_int exactly,
+   * on the device's 32-bit build and the host's 64-bit one alike. The cost
+   * is one interval expiring early every 24.8 days, which the only
+   * supported use — subtracting two readings — already handles by reading a
+   * negative difference as "long expired" (App#touch_suppressed?). */
+  return mrb_int_value(mrb, (mrb_int)(ms & 0x7fffffff));
 }
 
 void

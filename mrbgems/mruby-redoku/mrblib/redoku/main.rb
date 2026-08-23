@@ -55,14 +55,30 @@ module Redoku
     inputs = paths.map { |path| display.open_input(path) }
 
     # The touchscreen is what makes the buttons finger-tappable, and unlike
-    # the pen it is not required: a device with no such node plays on with
-    # pen-only buttons rather than refusing to start. A node the server
-    # declines to open is still an error, like any other refused input.
-    # Plural for the same reason the pen is — the display server publishes a
+    # the pen it is not required — so nothing about it may keep the game from
+    # starting. A missing node, or one the server declines to open, costs the
+    # player finger buttons and nothing else: reDoku is a pen game, and
+    # App#drop_hung_up_sources already treats a touchscreen that dies
+    # mid-session exactly this way ("a game whose buttons went back to
+    # pen-only"). Whatever did open stays open and is still polled — one node
+    # of two is still a touchscreen, and the one that failed may well be the
+    # uinput clone that carries no contacts anyway.
+    #
+    # Plural for the same reason the pen is: the display server publishes a
     # uinput clone under the same evdev name, and only the hardware node
-    # carries real contacts.
-    touches = RM2::Input.resolve_all(TOUCH_DEVICE).map do |path|
-      display.open_input(path)
+    # carries real contacts. That is 2 pen + 2 touch fds of the 8
+    # RM2::Input.wait accepts on the owner's device — worth watching, because
+    # a firmware publishing more clones than that would raise from the first
+    # wait rather than from an open, which this rescue does not cover.
+    touches = []
+    begin
+      RM2::Input.resolve_all(TOUCH_DEVICE).each do |path|
+        touches << display.open_input(path)
+      end
+    rescue StandardError => e
+      # Not fatal, but not silent either: a player who expected to tap a
+      # button with a finger should be told why they cannot.
+      $stderr.puts "redoku: touchscreen unavailable (#{e.message})"
     end
 
     App.new(display, inputs, Renderer.new(display),

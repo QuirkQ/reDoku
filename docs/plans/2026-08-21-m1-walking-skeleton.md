@@ -2144,6 +2144,19 @@ git commit -m "feat(redoku): render the board, header, and buttons"
 
 ### Task 6: Pen mapping and the event loop
 
+> **Amended after on-device testing — read this before the code below.** The
+> `press` in Task 6 is superseded. It assumed a button's action is its own
+> feedback, which the device disproved: `clear_ink`'s board repaint is
+> pixel-identical on a board with no ink, and `cycle_difficulty`'s only
+> visible change is a header label ~1480 px away from the finger that caused
+> it. Both actions fired correctly and the owner reported the buttons as not
+> working. What ships instead: **every** press paints its own button inverted
+> (`Renderer#press_button`, DU + FAST_DRAW), runs the action while it is held
+> down, and paints it back ~200 ms later (`App::PRESS_ACK_MS`) — except Quit,
+> which is leaving and keeps the inverted button as its goodbye. See
+> `App#acknowledge`. Do not restore the "repaints as its action, so it reads
+> as responsive for free" reasoning; that is the bug.
+
 The skeleton's behaviour: ink follows the pen inside the board, taps hit buttons, New wipes the ink, Level cycles the difficulty label, Quit ends the loop. Both classes are driven entirely through injected collaborators, so the whole loop is testable on the host without a display server.
 
 **Files:**
@@ -2648,6 +2661,9 @@ module Redoku
       @mode == :button && @path <= TAP_MAX_PATH
     end
 
+    # SUPERSEDED — see the amendment note at the top of Task 6. Every press
+    # is acknowledged at its own button now; a bare dispatch is what made New
+    # and Level look broken on the device.
     def press(button)
       case button
       when :quit then @running = false
@@ -2978,6 +2994,12 @@ git commit -m "feat(redoku): build and deploy the redoku binary"
 | Launched via SSH | 7 |
 
 **Deliberate scope decisions** (each one YAGNI, not an oversight): `blit`, `RM2::Inotify`, `setsid`, touch input (`pt_mt`), the `Check` button, and the BDF font pipeline are all absent because M1 has no consumer for them. The `Check` button in particular would be dead UI until there is a puzzle to check, so M1 renders three buttons, not four.
+
+**Amended after on-device testing.** Three of those decisions did not survive the device, and PLAN.md §5 now records what shipped:
+
+- **`setsid`** — needed by `bin/redoku play --seconds`, whose watchdog the display server would otherwise freeze along with the game it is watching (they shared a process group, and demotion SIGSTOPs the whole group).
+- **Touch input (`pt_mt`)** — shipped. Tapping a 400×140 button with a finger did nothing at all, which reads as a broken game, so the touchscreen is opened alongside the pen and drained on the same poll. Buttons take a finger; the board stays pen-only, because it is a writing surface. A touch contact is suppressed while the pen is in proximity and for 500 ms after, or the palm you write with presses Quit.
+- **Button feedback** — see the amendment at the top of Task 6. Every button acknowledges its own press; the plan's assumption that an action is its own feedback was wrong on this panel.
 
 **Placeholder scan:** every code step contains the code to write; no "TBD", no "add error handling", no "similar to Task N".
 
