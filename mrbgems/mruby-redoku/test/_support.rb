@@ -91,3 +91,83 @@ class TestDisplay
     @updates = []
   end
 end
+
+# --- sudoku fixtures, shared by the grid, solver, technique, rater and
+# generator suites. 81 characters, '.' for an empty cell, read row-major.
+# They live here rather than in one suite because four files assert against
+# them, and a board that drifts between copies is a bug nobody would find.
+
+# A complete, valid solution: rows 1-3 are 123456789 shifted by 3 each time,
+# and the lower two bands repeat the trick on a permuted digit set. Its
+# validity is not taken on trust -- test/sudoku_grid.rb asserts
+# Grid.consistent?(solved_values), so a typo here fails there first.
+SOLVED_81 =
+  '123456789' \
+  '456789123' \
+  '789123456' \
+  '214365897' \
+  '365897214' \
+  '897214365' \
+  '531642978' \
+  '642978531' \
+  '978531642'
+
+# SOLVED_81 with the two opposite corners blanked. Both holes are forced by
+# their row alone, so singles finish it and the Rater must call it easy.
+EASY_81 =
+  '.23456789' \
+  '456789123' \
+  '789123456' \
+  '214365897' \
+  '365897214' \
+  '897214365' \
+  '531642978' \
+  '642978531' \
+  '97853164.'
+
+# Six holes, still exactly one solution: each blank is pinned by its column.
+# Used to check that Solver.count says 1 on a board with real gaps rather
+# than only on a finished one.
+UNIQUE_81 =
+  '....56789' \
+  '456789123' \
+  '789123456' \
+  '214365897' \
+  '365897214' \
+  '897214365' \
+  '531642978' \
+  '642978531' \
+  '9785316..'
+
+# Three givens on an otherwise empty board, so the solution count runs into
+# the billions. Exists to prove the counting solver EARLY-EXITS: a count
+# that tries to be exact here never returns.
+MULTI_81 =
+  '1........' \
+  '.........' \
+  '.........' \
+  '.........' \
+  '....5....' \
+  '.........' \
+  '.........' \
+  '.........' \
+  '........9'
+
+# An 81-char board string as the engine's values array: 0 for empty.
+def values_of(str)
+  out = []
+  str.each_char { |ch| out << (ch == '.' ? 0 : ch.to_i) }
+  out
+end
+
+def solved_values
+  values_of(SOLVED_81)
+end
+
+def grid_of(str)
+  Redoku::Sudoku::Grid.parse(str)
+end
+
+def r_shuffle_with_seed(list, seed)
+  Redoku::Rng.new(seed).shuffle(list)
+end
