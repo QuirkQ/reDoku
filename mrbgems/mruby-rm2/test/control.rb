@@ -8,7 +8,10 @@ assert('RM2::Control.clients parses the client table') do
     assert_equal 'xochitl', clients[0][:name]
     assert_equal 4711, clients[1][:pid]
     assert_false clients[1][:active]
-    assert_equal 'redoku', clients[1][:name]
+    # Fills all 32 bytes of name[], unterminated: proves the parse walks the
+    # whole buffer instead of relying on a NUL that need not be there.
+    assert_equal 'unterminated-32-byte-client-name', clients[1][:name]
+    assert_equal 32, clients[1][:name].bytesize
     # GetClients = type 0, pid 0, 8 bytes on the wire.
     req = RM2::TestServer.last_control_request
     assert_equal 8, req.bytesize
@@ -54,6 +57,11 @@ assert('a write to a dead server raises instead of killing the process') do
   path = RM2::TestServer.start
   d = nil
   begin
+    # setup_signals is not what this assertion depends on: it passes with or
+    # without the call below, because MSG_NOSIGNAL on display.c's send()
+    # turns a broken pipe into EPIPE regardless of SIGPIPE's disposition.
+    # Called anyway to mirror real game startup — do not read its presence
+    # here as license to drop MSG_NOSIGNAL.
     RM2.setup_signals
     d = RM2::Display.open(path)
     assert_true d.update(0, 0, 10, 10)

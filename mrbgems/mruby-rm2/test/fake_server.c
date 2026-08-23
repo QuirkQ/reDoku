@@ -320,7 +320,9 @@ fs_serve_control(int sock, int log_fd) {
       memset(buf, 0, sizeof(buf));
       memcpy(buf, &count, sizeof(count));
       fs_put_client(&buf[4], 1232, 1, "xochitl");
-      fs_put_client(&buf[4 + 52], 4711, 0, "redoku");
+      /* Exactly 32 bytes: exercises the unterminated-name case fs_put_client
+       * documents but which "redoku" (7 bytes) never reached. */
+      fs_put_client(&buf[4 + 52], 4711, 0, "unterminated-32-byte-client-name");
       if (sendto(sock, buf, sizeof(buf), 0, (struct sockaddr*)&from,
                  from_len) < 0)
         _exit(1);

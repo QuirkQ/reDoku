@@ -82,9 +82,10 @@ assert('Renderer flush methods pick the documented waveforms') do
   assert_equal [x, y, w, h, RM2::GL16, 0], d.updates[0]
   d.clear_calls
   r.flush_header
+  # 56 is a literal, not Font::HEIGHT * TITLE_SCALE: recomputing the same
+  # expression here would let a bug shared by both copies cancel out.
   assert_equal [Redoku::Layout::HEADER_X, Redoku::Layout::HEADER_Y,
-                Redoku::Layout::BOARD_W,
-                Redoku::Font::HEIGHT * Redoku::Layout::TITLE_SCALE,
+                Redoku::Layout::BOARD_W, 56,
                 RM2::GL16, 0], d.updates[0]
   d.clear_calls
   r.flush_rect(10, 20, 30, 40, waveform: RM2::DU, flags: RM2::FAST_DRAW)

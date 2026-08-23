@@ -2,7 +2,8 @@ require 'open3'
 require 'timeout'
 
 # cmd_bin comes from mruby's test/bintest.rb: it resolves the built binary
-# in the target's BUILD_DIR and copes with EMULATOR / .exe suffixes.
+# in the target's BUILD_DIR and copes with the .exe suffix. (EMULATOR is
+# handled by cmd_list, which this bintest does not use.)
 REDOKU = cmd_bin('redoku')
 
 # How long any redoku invocation here may take. Everything under test either
@@ -40,6 +41,10 @@ def run_redoku(*args)
         # It exited in the gap between the limit expiring and the kill.
       end
       flunk("redoku #{args.join(' ')} did not exit within #{RUN_LIMIT}s")
+      # flunk records without raising, so without this the timeout falls
+      # through to [nil, nil, nil] and the next assert_include crashes with
+      # NoMethodError instead of reporting the timeout as a plain KO.
+      return ['', '', -1]
     end
     [out, err, status]
   end

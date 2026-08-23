@@ -30,9 +30,11 @@ class TestDisplay
     @h
   end
 
-  # The checks in fill_rect, draw_line and update below are every ArgumentError
-  # the C Display raises (src/display.c), with the same message text, so an
-  # argument this mock accepts is one the device accepts too. Two real
+  # The checks in fill_rect, draw_line and update below mirror every
+  # ArgumentError the C Display raises (src/display.c), with the same message
+  # text, kept in sync by hand rather than by anything shared with the C —
+  # so an argument this mock accepts is meant to be one the device accepts
+  # too, not guaranteed to be. Two real
   # behaviours are deliberately NOT reproduced, so do not read these as a full
   # emulation: the C clips out-of-panel geometry instead of raising, which the
   # mock must not do because gray_at replays @rects verbatim and clipping would
