@@ -15,6 +15,7 @@ void rm2_display_init(mrb_state* mrb, struct RClass* rm2);
 void rm2_input_init(mrb_state* mrb, struct RClass* rm2);
 void rm2_control_init(mrb_state* mrb, struct RClass* rm2);
 void rm2_signals_init(mrb_state* mrb, struct RClass* rm2);
+void rm2_clock_init(mrb_state* mrb, struct RClass* rm2);
 
 /* Wraps an already-open evdev fd in a fresh RM2::Input. Takes ownership:
  * the object closes the fd. Defined in input.c, called from display.c's

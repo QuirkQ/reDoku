@@ -20,7 +20,12 @@ flashing refresh), `RM2::A2`. Flags: `RM2::SYNC`, `RM2::FAST_DRAW`.
 and the update was dropped. `fill_rect`/`update` take exclusive width/height
 and clip to the panel; negative extents raise `ArgumentError`. `draw_line`
 stamps a square brush of `width` px on each point of the line, centred but
-biased up-left for even widths.
+biased up-left for even widths. Its `width` must be `1..65535`, and every
+coordinate it is given must be within `-65535..65535` — off-panel geometry is
+clipped, but a coordinate outside that range raises `ArgumentError` rather
+than being clipped, because `mrb_int` is 32-bit on the device and the
+difference of two far-apart endpoints wraps there. Panel coordinates are
+never anywhere near the bound; arithmetic gone wrong is what reaches it.
 
 ```ruby
 paths  = RM2::Input.resolve_all('Wacom I2C Digitizer')  # real node + uinput clone
@@ -38,11 +43,18 @@ node, TCP-injected ones to the clone), so a client that wants both opens
 every match. Input fds are requested over the display connection — the
 server allows one socket per PID. A sample is `[x, y, pressure, tools]` in
 raw device coordinates, one per `SYN_REPORT`; `tools` is a bitmask of
-`RM2::Input::PEN`, `RUBBER` and `TOUCH`, where `TOUCH` is evdev's
-`BTN_TOUCH` — the pen tip pressed against the glass, not a finger. Only
-`ABS_X`, `ABS_Y` and `ABS_PRESSURE` are decoded, so the `pt_mt` touchscreen
-(which reports `ABS_MT_POSITION_X`/`_Y` instead) would yield samples with
-all-zero coordinates until multitouch axes are added.
+`RM2::Input::PEN`, `RUBBER`, `TOUCH` and `FINGER`.
+
+`TOUCH` is evdev's `BTN_TOUCH`: **the pen tip pressed against the glass, not
+a finger.** A finger is `FINGER`, and it comes from a different device — the
+`pt_mt` touchscreen, whose contacts are reported through the multitouch axes
+(`ABS_MT_SLOT`, `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X`/`_Y`) with no
+`BTN_TOUCH` and no pressure at all. Those axes are decoded down to **one
+contact**: the first to arrive sets `FINGER` and reports its position in the
+sample's `x`/`y`, and further contacts are ignored until they lift and press
+again. That is enough to tap a button, which is what the touchscreen is for
+here; a gesture recogniser would need per-slot tracking, which this does not
+do.
 
 An input can hang up while still open — rm2fb restarting tears down the
 uinput clones, and the kernel then reports `POLLHUP` and EOF. `wait` and
@@ -59,6 +71,7 @@ RM2::Control.clients        # => [{pid: 1232, active: true, name: "xochitl"}, ..
 RM2::Control.switch_to(pid) # hand the panel to another client
 
 RM2.setup_signals           # SIGTERM/SIGINT -> RM2.terminated?, SIGCONT -> RM2.resumed?
+RM2.monotonic_ms            # ms on a clock that never steps; differences only
 ```
 
 The control socket is a separate `SOCK_DGRAM` RPC endpoint at
@@ -69,6 +82,12 @@ Both methods take an optional path so tests can point at a fake.
 Never `switch_to` away from a live display client of your own process: the
 server SIGSTOPs the demoted client's whole process group, so the call would
 freeze the caller. Give the screen back by closing the display and exiting.
+
+`monotonic_ms` measures short intervals — how long ago the pen left the
+glass, how long a stroke has been idle — from `CLOCK_MONOTONIC`, which a
+clock correction cannot move. Its epoch is the first call, not boot, so the
+count stays inside the device build's 32-bit `mrb_int`; only differences
+between two readings are meaningful.
 
 `terminated?` is sticky — once the process has been asked to quit it stays
 true. `resumed?` is consumed on read: each SIGCONT is reported exactly once,

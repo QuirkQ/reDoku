@@ -9,6 +9,7 @@ mrb_mruby_rm2_gem_init(mrb_state* mrb) {
   rm2_display_init(mrb, rm2);
   rm2_control_init(mrb, rm2);
   rm2_signals_init(mrb, rm2);
+  rm2_clock_init(mrb, rm2);
 }
 
 void

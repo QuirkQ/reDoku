@@ -150,6 +150,103 @@ assert('RM2::Input drops the packet torn by SYN_DROPPED, then resyncs') do
   end
 end
 
+# The multitouch packets a real pt_mt touchscreen sends, as [type, code,
+# value]: EV_ABS=3 with ABS_MT_SLOT=0x2f, ABS_MT_POSITION_X=0x35,
+# _Y=0x36, ABS_MT_TRACKING_ID=0x39. No BTN_TOUCH and no pressure: a finger
+# is reported entirely through the MT axes, which is why it needs its own
+# tool bit rather than the pen's.
+assert('RM2::Input decodes one multitouch contact as a FINGER sample') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    w = File.open(fifo, 'w')
+    w.write RM2::TestServer.pack_events([
+      [3, 0x2f, 0], [3, 0x39, 12], [3, 0x35, 700], [3, 0x36, 900], [0, 0, 0],
+      [3, 0x35, 720], [0, 0, 0], # the contact slides sideways
+      [3, 0x39, -1], [0, 0, 0]   # tracking id -1: it is gone
+    ])
+    w.flush
+    assert_true RM2::Input.wait([i], 500)
+    samples = i.pending_events
+    assert_equal 3, samples.size
+    assert_equal [700, 900, 0, RM2::Input::FINGER], samples[0]
+    assert_equal [720, 900, 0, RM2::Input::FINGER], samples[1]
+    # The release repeats the last position with the bit cleared, the same
+    # shape the pen's lift has, so one caller handles both edges.
+    assert_equal [720, 900, 0, 0], samples[2]
+    w.close
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('RM2::Input follows one contact and ignores the other slots') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    w = File.open(fifo, 'w')
+    w.write RM2::TestServer.pack_events([
+      [3, 0x2f, 0], [3, 0x39, 12], [3, 0x35, 100], [3, 0x36, 200], [0, 0, 0],
+      [3, 0x2f, 1], [3, 0x39, 13], [3, 0x35, 900], [3, 0x36, 800], [0, 0, 0],
+      [3, 0x2f, 0], [3, 0x35, 110], [0, 0, 0], # the followed contact moves
+      [3, 0x2f, 1], [3, 0x39, -1], [0, 0, 0],  # the other one lifts
+      [3, 0x2f, 0], [3, 0x39, -1], [0, 0, 0]   # and then ours does
+    ])
+    w.flush
+    assert_true RM2::Input.wait([i], 500)
+    samples = i.pending_events
+    assert_equal 5, samples.size
+    f = RM2::Input::FINGER
+    assert_equal [100, 200, 0, f], samples[0]
+    assert_equal [100, 200, 0, f], samples[1] # a second finger moves nothing
+    assert_equal [110, 200, 0, f], samples[2]
+    assert_equal [110, 200, 0, f], samples[3] # nor does its release end ours
+    assert_equal [110, 200, 0, 0], samples[4]
+    w.close
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
+assert('RM2::Input picks up an unfollowed contact only once it presses again') do
+  path = RM2::TestServer.start
+  begin
+    d = RM2::Display.open(path)
+    fifo = RM2::TestServer.make_fifo
+    i = d.open_input(fifo)
+    w = File.open(fifo, 'w')
+    w.write RM2::TestServer.pack_events([
+      [3, 0x2f, 0], [3, 0x39, 1], [3, 0x35, 50], [3, 0x36, 60], [0, 0, 0],
+      [3, 0x2f, 1], [3, 0x39, 2], [3, 0x35, 900], [3, 0x36, 910], [0, 0, 0],
+      [3, 0x2f, 0], [3, 0x39, -1], [0, 0, 0], # the followed contact goes
+      [3, 0x2f, 1], [3, 0x35, 905], [0, 0, 0], # slot 1 is still held, still ignored
+      [3, 0x2f, 1], [3, 0x39, -1], [0, 0, 0],  # it lifts
+      [3, 0x2f, 1], [3, 0x39, 3], [3, 0x35, 800], [3, 0x36, 810], [0, 0, 0]
+    ])
+    w.flush
+    assert_true RM2::Input.wait([i], 500)
+    samples = i.pending_events
+    assert_equal 6, samples.size
+    f = RM2::Input::FINGER
+    assert_equal [50, 60, 0, f], samples[0]
+    assert_equal [50, 60, 0, f], samples[1]
+    assert_equal [50, 60, 0, 0], samples[2]
+    # A contact that began in another's shadow stays invisible while it is
+    # held, however long the glass is free: nothing but a fresh press makes
+    # it the followed one.
+    assert_equal [50, 60, 0, 0], samples[3]
+    assert_equal [50, 60, 0, 0], samples[4]
+    assert_equal [800, 810, 0, f], samples[5]
+    w.close
+  ensure
+    RM2::TestServer.stop
+  end
+end
+
 assert('RM2::Input reports a hangup instead of reading as always ready') do
   path = RM2::TestServer.start
   begin

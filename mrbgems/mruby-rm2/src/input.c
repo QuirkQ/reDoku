@@ -9,6 +9,16 @@
  * carry over from the previous one, so we keep the sticky axis/tool state
  * here and emit one sample per SYN_REPORT.
  *
+ * Two kinds of node are decoded, into the same [x, y, pressure, tools]
+ * sample: the pen digitizer (ABS_X/ABS_Y/ABS_PRESSURE with BTN_TOOL_PEN,
+ * BTN_TOOL_RUBBER, BTN_TOUCH) and the multitouch screen (ABS_MT_*, folded
+ * down to a single contact — see apply_mt_event). A sample does not say
+ * which node it came from and must not be asked to: the packet that ends a
+ * stroke has every tool bit clear on either device, so the two are
+ * indistinguishable at exactly the moment it would matter. A caller that
+ * needs to tell them apart keeps the inputs apart — it opened them by name
+ * and knows which is which.
+ *
  * Two lifecycle rules a caller has to know about:
  *
  *  - The fd is always non-blocking, whatever open flags were asked for:
@@ -40,14 +50,25 @@
 #define RM2_MAX_WAIT 8       /* pollfds accepted by RM2::Input.wait */
 #define RM2_READ_EVENTS 64   /* events per read() */
 
-/* RM2::Input tool bits, as reported in a sample's `tools` field. */
-enum { RM2_TOOL_PEN = 1, RM2_TOOL_RUBBER = 2, RM2_TOOL_TOUCH = 4 };
+/* RM2::Input tool bits, as reported in a sample's `tools` field.
+ *
+ * TOUCH is evdev's BTN_TOUCH: the PEN TIP pressed against the glass. It has
+ * never meant a finger, and adding the touchscreen did not change that —
+ * a finger is FINGER, from the multitouch axes of a different device. */
+enum {
+  RM2_TOOL_PEN = 1,
+  RM2_TOOL_RUBBER = 2,
+  RM2_TOOL_TOUCH = 4,
+  RM2_TOOL_FINGER = 8
+};
 
 typedef struct {
   int fd;
   int hung_up;                   /* POLLHUP/POLLERR/POLLNVAL, or read() EOF */
   int resync;                    /* inside a packet torn by SYN_DROPPED */
   int32_t x, y, pressure, tools; /* sticky evdev state */
+  int32_t mt_slot;               /* ABS_MT_SLOT: whose MT events follow */
+  int32_t mt_contact;            /* the slot we follow, -1 when none is down */
 } rm2_input;
 
 static void
@@ -100,7 +121,60 @@ rm2_input_new(mrb_state* mrb, int fd) {
   in->y = 0;
   in->pressure = 0;
   in->tools = 0;
+  in->mt_slot = 0;    /* evdev's slot 0 is current until ABS_MT_SLOT says so */
+  in->mt_contact = -1;
   return mrb_obj_value(mrb_data_object_alloc(mrb, cls, in, &rm2_input_type));
+}
+
+/* Multitouch, evdev protocol B, folded down to ONE contact.
+ *
+ * A packet from the touchscreen selects a slot with ABS_MT_SLOT, then
+ * reports that slot's ABS_MT_TRACKING_ID — non-negative while the contact
+ * exists, -1 when it ends — and its ABS_MT_POSITION_X/_Y. Slot and id are
+ * sticky, exactly like the pen's axes.
+ *
+ * Only the first contact to arrive is followed, and a per-slot table is
+ * deliberately not kept: the touchscreen is here so that three 400x140
+ * buttons can be tapped with a finger, and a button needs one point and a
+ * down/up edge. A second finger has nothing to add, so a contact beginning
+ * while another is already down is ignored until it lifts and presses
+ * again. Real gestures would need the table; nothing in reDoku wants one.
+ *
+ * The contact lands in the same x/y fields a pen sample uses, and its
+ * presence in the FINGER bit — never TOUCH, which is BTN_TOUCH and belongs
+ * to the pen tip. */
+static void
+apply_mt_event(rm2_input* in, const struct input_event* ev) {
+  switch (ev->code) {
+    case ABS_MT_SLOT:
+      in->mt_slot = ev->value;
+      break;
+    case ABS_MT_TRACKING_ID:
+      if (ev->value >= 0) {
+        if (in->mt_contact < 0) {
+          in->mt_contact = in->mt_slot;
+          in->tools |= RM2_TOOL_FINGER;
+        }
+      }
+      else if (in->mt_slot == in->mt_contact) {
+        in->mt_contact = -1;
+        in->tools &= ~RM2_TOOL_FINGER;
+      }
+      break;
+    /* The driver reports a new contact's slot state before its position
+     * (input_mt_report_slot_state, then input_report_abs), so by the time
+     * these arrive mt_contact already names the slot they belong to. Events
+     * for any other slot are dropped here, which is what keeps a second
+     * finger from moving the followed contact's point. */
+    case ABS_MT_POSITION_X:
+      if (in->mt_slot == in->mt_contact) in->x = ev->value;
+      break;
+    case ABS_MT_POSITION_Y:
+      if (in->mt_slot == in->mt_contact) in->y = ev->value;
+      break;
+    default:
+      break;
+  }
 }
 
 /* Folds one event into the sticky state. Returns 1 at a packet boundary
@@ -129,6 +203,7 @@ apply_event(rm2_input* in, const struct input_event* ev) {
       if (ev->code == ABS_X) in->x = ev->value;
       else if (ev->code == ABS_Y) in->y = ev->value;
       else if (ev->code == ABS_PRESSURE) in->pressure = ev->value;
+      else apply_mt_event(in, ev);
       return 0;
     case EV_KEY: {
       int bit = 0;
@@ -242,7 +317,10 @@ rm2_input_s_wait(mrb_state* mrb, mrb_value klass) {
 
   mrb_get_args(mrb, "Ai", &ary, &timeout);
   len = RARRAY_LEN(ary);
-  /* Both %d and %i consume an mrb_int, so the literal must be cast. */
+  /* %i consumes an mrb_int and %d a plain int (mruby 4.0's mrb_vformat, in
+   * its src/error.c) — they are not interchangeable, and an mrb_int passed
+   * to %d is a varargs type mismatch wherever the two differ in width, as
+   * they do on the host. Hence %i here, and hence the casts. */
   if (len > RM2_MAX_WAIT)
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "at most %i inputs, got %i",
                (mrb_int)RM2_MAX_WAIT, len);
@@ -310,7 +388,9 @@ rm2_input_init(mrb_state* mrb, struct RClass* rm2) {
 
   mrb_define_const(mrb, cls, "PEN", mrb_int_value(mrb, RM2_TOOL_PEN));
   mrb_define_const(mrb, cls, "RUBBER", mrb_int_value(mrb, RM2_TOOL_RUBBER));
+  /* BTN_TOUCH — the pen tip on the glass. A finger is FINGER, below. */
   mrb_define_const(mrb, cls, "TOUCH", mrb_int_value(mrb, RM2_TOOL_TOUCH));
+  mrb_define_const(mrb, cls, "FINGER", mrb_int_value(mrb, RM2_TOOL_FINGER));
   mrb_define_const(mrb, cls, "MAX_WAIT", mrb_int_value(mrb, RM2_MAX_WAIT));
   mrb_define_const(mrb, cls, "NONBLOCK", mrb_int_value(mrb, O_NONBLOCK));
   mrb_define_const(mrb, cls, "EVENT_SIZE",
