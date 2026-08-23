@@ -52,6 +52,47 @@ module Redoku
         count(values, 2) == 1
       end
 
+      # A board needing more search than this is reported AS the cap rather
+      # than measured exactly. 4000 is the figure super-sudoku uses for the
+      # same purpose, and the reasoning carries over: anything past it is
+      # far beyond what a person would sit through, so the exact number stops
+      # carrying information and only costs time to obtain.
+      COST_CAP = 4000
+
+      # HOW MUCH GUESSING this puzzle takes — the difficulty measure, and the
+      # thing the Rater and Generator steer by.
+      #
+      # This follows Fatemi, Kazemi & Mehrasa, "Rating and Generating Sudoku
+      # Puzzles Based On Constraint Satisfaction Problems", which rates a
+      # puzzle by the work a CSP solver needs rather than by its clue count.
+      #
+      # What is counted is DECISIONS, not nodes: every attempt at a cell that
+      # had more than one candidate, retries after a backtrack included. A
+      # cell with a single candidate is propagation, not a choice, so it is
+      # free. A puzzle that falls out by propagation alone therefore costs 0,
+      # which is exactly the statement "no guessing was needed".
+      #
+      # Counting raw nodes was tried first and measured WRONG: it fell as
+      # clues were removed (p50 of 12 at 45 clues against 5 at 34), because a
+      # heavily-clued board resolves one forced cell per node while a sparse
+      # one clears many in a single cascade. That number tracks how the
+      # cascade chunks its work, not how hard the puzzle is.
+      #
+      # Deliberately DETERMINISTIC — no rng is accepted. The cost has to be a
+      # property of the puzzle, not of the order a shuffle happened to try
+      # digits in, or the same board would rate differently every call and
+      # the generator would be steering by noise.
+      #
+      # An inconsistent or unsolvable board answers COST_CAP: not a
+      # measurement, just "do not use this".
+      def self.cost(values)
+        return COST_CAP unless Grid.consistent?(values)
+        work = values.dup
+        counter = [0]
+        return COST_CAP unless search(work, build_cand(work), nil, counter)
+        counter[0]
+      end
+
       # A filled cell's entry is 0 and is never read: `pick` tests the board
       # before it touches the mask. That is what lets `assign` leave cand[i]
       # alone and `unassign` have nothing to put back for the cell itself.
@@ -169,16 +210,31 @@ module Redoku
       # Depth-first, in place, restoring the cell on the way out so `work`
       # and `cand` are left exactly as found on a failed branch. Depth is
       # bounded by the 81 cells, so the recursion cannot run away.
-      def self.search(work, cand, rng)
+      # `counter`, when given, is a one-element array holding the node count —
+      # mruby has no by-reference integer, and threading a return value would
+      # mean distinguishing "not solved" from "solved in 0 nodes". Passing it
+      # also arms the COST_CAP bail-out, so `cost` cannot run away on a board
+      # nobody would attempt; `solve` passes nothing and is unaffected.
+      def self.search(work, cand, rng, counter = nil)
         i = pick(work, cand)
         return true if i.nil? # no empty cell left: solved
         digits = Grid::BIT_LIST[cand[i]]
         return false if digits.empty? # dead branch
+        # A cell with one candidate is not a decision, it is bookkeeping. Only
+        # a cell with a real choice counts towards the cost, and every ATTEMPT
+        # at it counts — so a wrong turn that has to be backtracked is paid
+        # for, which is what makes the number track how hard the puzzle is
+        # rather than how big it is. See `cost`.
+        branching = digits.size > 1
         digits = rng.shuffle(digits) if rng
         digits.each do |d|
+          if counter && branching
+            counter[0] += 1
+            return false if counter[0] > COST_CAP
+          end
           trail = assign(work, cand, i, d)
           next if trail.nil? # propagation found a contradiction; nothing to undo
-          return true if search(work, cand, rng)
+          return true if search(work, cand, rng, counter)
           unassign(work, cand, trail)
         end
         false

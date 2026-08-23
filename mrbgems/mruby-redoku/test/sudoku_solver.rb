@@ -298,3 +298,267 @@ assert('Solver.assign undoes its own partial cascade on a contradiction') do
   assert_true Redoku::Sudoku::Grid.complete?(won)
   assert_equal solved_values, won
 end
+
+assert('Solver.cost is exactly 0 when no guessing was needed') do
+  s = Redoku::Sudoku::Solver
+  # cost is a count of DECISIONS, so "0" is not "cheap", it is the statement
+  # "this puzzle falls out by propagation alone". The Rater turns this number
+  # into points -- so many per guess -- and the Generator steers by the score
+  # that comes out, which makes 0 the difference between "no guessing was
+  # needed" and a per-guess premium. Hence == 0 rather than < something: a
+  # solver that charged one unit for a forced cell would still look small and
+  # would still be wrong.
+  assert_equal 0, s.cost(solved_values)     # nothing at all to do
+  assert_equal 0, s.cost(values_of(EASY_81))   # two holes, both forced by row
+  assert_equal 0, s.cost(values_of(UNIQUE_81)) # six holes, each pinned by column
+end
+
+assert('Solver.cost charges nothing for a long forced cascade') do
+  s = Redoku::Sudoku::Solver
+  g = Redoku::Sudoku::Grid
+  # The distinction the code comment says was measured wrong once before:
+  # counting raw NODES made cost FALL as clues were removed, because a
+  # heavily-clued board resolves one forced cell per node while a sparse one
+  # clears many in a single cascade. So a board that resolves a lot of cells
+  # with no branching has to come out at 0, not at "one per cell".
+  #
+  # Blanking the first 15 cells of SOLVED_81 does that: fifteen holes, still
+  # exactly one solution, and no cell ever offers a real choice by the time
+  # `pick` reaches it.
+  board = solved_values
+  15.times { |i| board[i] = 0 }
+
+  # Premise checks, because "0" would be unremarkable if every hole were a
+  # singleton from the start -- then nothing would be cascading. Count the
+  # holes that begin with MORE than one candidate: those are the ones that
+  # only become free because an earlier assignment narrowed them.
+  holes = 0
+  multi = 0
+  81.times do |i|
+    next unless board[i] == 0
+    holes += 1
+    multi += 1 if g.count_bits(g.candidates(board, i)) > 1
+  end
+  assert_equal 15, holes
+  assert_true multi > 0
+  assert_equal 1, s.count(board) # still a proper puzzle, not a guessing game
+
+  # (Measured 2026-08-23: 15 holes, 9 of them starting with two candidates,
+  # and the first cascade alone fills six cells.) None of it is a decision.
+  assert_equal 0, s.cost(board)
+end
+
+assert('Solver.cost rises as clues are removed, it does not fall') do
+  s = Redoku::Sudoku::Solver
+  # The direction is the point. The rejected node-counting metric was p50 12
+  # at 45 clues against 5 at 34 -- backwards -- and no single-board assertion
+  # would have caught that, because each number looked plausible on its own.
+  # Three boards off the same solution, differing only in how much was
+  # erased, pin the ordering itself.
+  #
+  # Properties rather than exact numbers here: how much guessing a given
+  # blanking pattern forces is a legitimate thing to shift when `pick`'s
+  # heuristic is tuned, but it must never shift direction. (Measured
+  # 2026-08-23: 0, 9 and 30 for 12, 27 and 60 blanks.)
+  few = solved_values
+  12.times { |i| few[i] = 0 }
+  some = solved_values
+  27.times { |i| some[i] = 0 }
+  many = solved_values
+  60.times { |i| many[i] = 0 }
+
+  c_few = s.cost(few)
+  c_some = s.cost(some)
+  c_many = s.cost(many)
+  assert_equal 0, c_few          # a dozen forced holes is still free
+  assert_true c_some > c_few
+  assert_true c_many > c_some
+end
+
+assert('Solver.cost is above 0 once the board forces a guess') do
+  s = Redoku::Sudoku::Solver
+  # The other half of the 0 semantic: a board that cannot be propagated to a
+  # finish must charge for the guesses. If this ever came back 0 the Rater
+  # would file the emptiest board there is as the easiest puzzle there is.
+  #
+  # The exact figures are recorded but not asserted. They are stable per
+  # build -- the repeat assertions below prove that -- but they are a
+  # function of `pick`'s tie-breaking and of trying digits in 1..9 order,
+  # both of which are implementation choices someone may legitimately retune.
+  # What must not drift is that they are above 0 and below the cap.
+  multi = s.cost(values_of(MULTI_81)) # measured 41 (3 givens)
+  empty = s.cost(Array.new(81, 0))    # measured 47
+  assert_true multi > 0
+  assert_true empty > 0
+  # A real measurement must stay clear of the cap, or "capped" and "measured"
+  # would be indistinguishable to every caller.
+  assert_true multi < s::COST_CAP
+  assert_true empty < s::COST_CAP
+
+  # And the smallest non-zero case in this family: blanking one more cell than
+  # the forced-cascade board above is enough to introduce a genuine choice.
+  # (Measured 1 -- that board has two solutions, so whichever digit is tried
+  # first at the branching cell completes it and nothing is backtracked. Not
+  # asserted as 1: a different tie-break could pick a cell whose first digit
+  # is wrong and pay 2, which is still the same statement.)
+  edge = solved_values
+  16.times { |i| edge[i] = 0 }
+  assert_true s.cost(edge) > 0
+end
+
+assert('Solver.cost answers the same number every time, and takes no rng') do
+  s = Redoku::Sudoku::Solver
+  # The Generator steers by this number through the Rater's score: it digs,
+  # rates, and keeps or reverts. If cost varied between calls it would be
+  # steering by noise and puzzles would land in whichever difficulty band the
+  # last coin flip chose, so equality across repeated calls is the assertion,
+  # not "roughly the same".
+  a = s.cost(values_of(MULTI_81))
+  assert_equal a, s.cost(values_of(MULTI_81))
+  assert_equal a, s.cost(values_of(MULTI_81))
+  b = s.cost(Array.new(81, 0))
+  assert_equal b, s.cost(Array.new(81, 0))
+
+  # `cost` deliberately accepts no rng. Pinned by arity, because the whole
+  # guarantee is that no caller CAN inject an ordering -- an optional rng
+  # parameter added "for symmetry with solve" would silently reopen it.
+  raised = false
+  begin
+    s.cost(values_of(MULTI_81), Redoku::Rng.new(1))
+  rescue ArgumentError
+    raised = true
+  end
+  assert_true raised
+
+  # And the reason that matters: digit order really does move the number. The
+  # same search WITH a shuffle counts a different number of decisions on the
+  # same board, so a cost that accepted an rng would be reporting the seed as
+  # much as the puzzle. Scan a handful of seeds rather than naming two, so
+  # this asserts "some seed disagrees" and not a particular Rng output.
+  varied = false
+  seed = 1
+  while seed <= 8
+    work = Array.new(81, 0)
+    counter = [0]
+    s.search(work, s.build_cand(work), Redoku::Rng.new(seed), counter)
+    varied = true if counter[0] != b
+    seed += 1
+  end
+  assert_true varied
+end
+
+assert('Solver.cost answers COST_CAP for boards that are not measurements') do
+  s = Redoku::Sudoku::Solver
+  g = Redoku::Sudoku::Grid
+  # Callers get one number back and no error channel, so a board that cannot
+  # be rated has to answer something no real puzzle answers. COST_CAP is that
+  # something. The failure this guards against is not a crash, it is a
+  # plausible SMALL number: an inconsistent board whose search "succeeds"
+  # against its own empty cells would come back as an easy puzzle, and the
+  # Generator would happily ship it.
+  assert_true s::COST_CAP > 0
+
+  # Inconsistent: cell 0 is empty in EASY_81 and row 0 already holds 2..9, so
+  # only 1 fits. A 2 there duplicates cell 1's digit -- illegal before any
+  # search starts, exactly as in the solve test above.
+  bad = values_of(EASY_81)
+  bad[0] = 2
+  assert_false g.consistent?(bad)
+  assert_equal s::COST_CAP, s.cost(bad)
+
+  # Consistent but unsolvable: row 0 holds 1..8 and cell 17 holds 9, so
+  # nothing repeats but cell 8 has no candidate at all. This is the case the
+  # door's consistency check cannot catch, so it has to be the search's
+  # failure that produces the cap.
+  wedged = Array.new(81, 0)
+  8.times { |c| wedged[c] = c + 1 }
+  wedged[17] = 9
+  assert_true g.consistent?(wedged)
+  assert_equal 0, g.candidates(wedged, 8)
+  assert_nil s.solve(wedged)
+  assert_equal s::COST_CAP, s.cost(wedged)
+end
+
+assert('Solver.cost does not mutate the board it was given') do
+  s = Redoku::Sudoku::Solver
+  # The Rater and Generator rate boards they are still holding -- the
+  # Generator rates the very array it is digging -- so a cost call that left
+  # a solved board behind would turn the puzzle under construction into its
+  # own answer.
+  multi = values_of(MULTI_81)
+  before = multi.dup
+  s.cost(multi)
+  assert_equal before, multi
+
+  empty = Array.new(81, 0)
+  s.cost(empty)
+  assert_equal Array.new(81, 0), empty
+
+  easy = values_of(EASY_81)
+  before_easy = easy.dup
+  s.cost(easy)
+  assert_equal before_easy, easy
+
+  # The two capped paths too: they leave by a different exit, and the wedged
+  # one goes through the search before failing.
+  bad = values_of(EASY_81)
+  bad[0] = 2
+  before_bad = bad.dup
+  s.cost(bad)
+  assert_equal before_bad, bad
+
+  wedged = Array.new(81, 0)
+  8.times { |c| wedged[c] = c + 1 }
+  wedged[17] = 9
+  before_wedged = wedged.dup
+  s.cost(wedged)
+  assert_equal before_wedged, wedged
+end
+
+assert('Solver.search counts decisions and caps only when given a counter') do
+  s = Redoku::Sudoku::Solver
+  g = Redoku::Sudoku::Grid
+  # `cost` is a thin wrapper, so the counting and the bail-out are really
+  # properties of `search`. Two things are pinned here that cost alone cannot
+  # show.
+  #
+  # First: the counter `search` fills is the number `cost` reports -- nothing
+  # is added or lost in the wrapper.
+  work = values_of(MULTI_81)
+  counter = [0]
+  assert_true s.search(work, s.build_cand(work), nil, counter)
+  assert_equal s.cost(values_of(MULTI_81)), counter[0]
+
+  # Second: passing a counter is what ARMS the cap, and the cap trips on a
+  # decision. Starting the counter at the cap means the first real choice
+  # takes it over, so an empty board -- nine candidates at every cell --
+  # must abandon immediately and leave the board untouched, having written
+  # nothing at all.
+  empty = Array.new(81, 0)
+  work = empty.dup
+  counter = [s::COST_CAP]
+  assert_false s.search(work, s.build_cand(work), nil, counter)
+  assert_equal empty, work
+  assert_true counter[0] > s::COST_CAP
+
+  # ...whereas a board that needs no decisions is not stopped by an exhausted
+  # budget at all, because it never spends any. This is the same "forced is
+  # free" rule as in cost, observed from the other side: with the counter
+  # already AT the cap, EASY_81 still solves and the counter never moves.
+  easy = values_of(EASY_81)
+  work = easy.dup
+  counter = [s::COST_CAP]
+  assert_true s.search(work, s.build_cand(work), nil, counter)
+  assert_equal s::COST_CAP, counter[0]
+  assert_true g.complete?(work)
+
+  # `solve` passes no counter, so the cap cannot reach it. Note what the pair
+  # below does and does not show: the empty board spends decisions (so the
+  # bail-out is live for `cost` on it) and `solve` still finishes -- but its
+  # cost is far under the cap, so this is not a demonstration that `solve`
+  # survives a board that WOULD exceed it. No cheap fixture for that exists;
+  # the guarantee is structural, in `solve` passing no counter at all, and
+  # the pre-loaded counter above is what stands in for the expensive case.
+  assert_true s.cost(empty) > 0
+  assert_true g.complete?(s.solve(empty))
+end

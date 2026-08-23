@@ -90,6 +90,231 @@ assert('pointing does not fire when the box homes straddle two lines') do
   assert_equal(b5 | (1 << 6), cand[3])
 end
 
+# --- The triples and the X-wing get THREE assertions each, and the third is
+# the one that earns its keep:
+#
+#   1. it fires, eliminates exactly the right bits, and leaves the pattern's
+#      own cells alone;
+#   2. it declines when there is nothing left to eliminate -- that is the
+#      termination argument, and a rule reporting progress it did not make
+#      makes `solve` loop until MAX_PASSES;
+#   3. it declines on a NEAR MISS: a shape a plausibly-wrong version of the
+#      rule fires on. Each near-miss below names the specific wrong rule it
+#      rules out, because "returns false on something" is not evidence of
+#      anything by itself.
+
+assert('naked_triple strips a three-cell triple from the rest of its unit') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # Row 0. Cells 0, 1 and 2 hold {1,2} {2,3} {1,3}: two candidates each, three
+  # between them, so the 1, the 2 and the 3 of row 0 all live in those cells.
+  # Note that no PAIR inside this is locked -- naked_pair cannot see it, which
+  # is the whole reason the rule exists.
+  cand[0] = (1 << 1) | (1 << 2)
+  cand[1] = (1 << 2) | (1 << 3)
+  cand[2] = (1 << 1) | (1 << 3)
+  cand[3] = (1 << 1) | (1 << 4)          # so this cell can only be 4
+  cand[4] = (1 << 3) | (1 << 5) | (1 << 6)
+  cand[5] = (1 << 7) | (1 << 8)          # nothing of the triple's, untouched
+
+  assert_true t.naked_triple(cand)
+  assert_equal((1 << 4), cand[3])
+  assert_equal((1 << 5) | (1 << 6), cand[4])
+  assert_equal((1 << 7) | (1 << 8), cand[5])
+  assert_equal((1 << 1) | (1 << 2), cand[0]) # the triple itself is untouched
+  assert_equal((1 << 2) | (1 << 3), cand[1])
+  assert_equal((1 << 1) | (1 << 3), cand[2])
+
+  assert_false t.naked_triple(cand)
+end
+
+assert('naked_triple does not fire when the rest of the unit is already clear') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # A real triple, but the only other cell in the unit offers none of its
+  # three digits, so there is nothing to remove.
+  cand[0] = (1 << 1) | (1 << 2)
+  cand[1] = (1 << 2) | (1 << 3)
+  cand[2] = (1 << 1) | (1 << 3)
+  cand[3] = (1 << 4) | (1 << 5)
+  before = cand.dup
+
+  assert_false t.naked_triple(cand)
+  assert_equal(before, cand)
+end
+
+assert('naked_triple needs the union to be three digits, not just three cells') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # Cells 0, 1 and 2 have two candidates each -- but {1,2} {3,4} {1,3} unions
+  # to FOUR digits, so they own nothing and cell 3 keeps its 1. A version that
+  # tests only the members' sizes, or ORs just the first two, strips cell 3
+  # down to {5}.
+  cand[0] = (1 << 1) | (1 << 2)
+  cand[1] = (1 << 3) | (1 << 4)
+  cand[2] = (1 << 1) | (1 << 3)
+  cand[3] = (1 << 1) | (1 << 5)
+  before = cand.dup
+
+  assert_false t.naked_triple(cand)
+  assert_equal(before, cand)
+end
+
+assert('hidden_triple confines three digits to the three cells that can hold them') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # Row 0. Digit 1 can only be at cell 0 or 1, digit 2 at 0 or 2, digit 3 at
+  # 1 or 2 -- three digits with three cells between them. Those cells are
+  # therefore full, and the 7, 8 and 9 loitering in them go.
+  cand[0] = (1 << 1) | (1 << 2) | (1 << 7)
+  cand[1] = (1 << 1) | (1 << 3) | (1 << 8)
+  cand[2] = (1 << 2) | (1 << 3) | (1 << 9)
+  cand[3] = (1 << 7) | (1 << 8)
+  cand[4] = (1 << 7) | (1 << 9)
+
+  assert_true t.hidden_triple(cand)
+  assert_equal((1 << 1) | (1 << 2), cand[0])
+  assert_equal((1 << 1) | (1 << 3), cand[1])
+  assert_equal((1 << 2) | (1 << 3), cand[2])
+  assert_equal((1 << 7) | (1 << 8), cand[3]) # the other cells keep their 7s
+  assert_equal((1 << 7) | (1 << 9), cand[4])
+
+  assert_false t.hidden_triple(cand)
+end
+
+assert('hidden_triple does not fire when the three cells hold nothing extra') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # The same confinement, but the three cells already hold only the three
+  # digits, so claiming progress here is what makes the solver spin.
+  cand[0] = (1 << 1) | (1 << 2)
+  cand[1] = (1 << 1) | (1 << 3)
+  cand[2] = (1 << 2) | (1 << 3)
+  cand[3] = (1 << 7) | (1 << 8)
+  cand[4] = (1 << 7) | (1 << 9)
+  before = cand.dup
+
+  assert_false t.hidden_triple(cand)
+  assert_equal(before, cand)
+end
+
+assert('hidden_triple needs the SAME three cells, not three homes each') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # This is hidden_pair's caught defect one size up, and the reason to spell
+  # it out again: three homes each is not the rule, the UNION being three
+  # cells is. In row 0 digit 1 lives at cells 0-2, digit 2 at 3-5, digit 3 at
+  # 6-8. Each has exactly three homes; together they cover all nine cells and
+  # confine nothing. The wrong rule fires and strips cell 0 to {1}.
+  cand[0] = (1 << 1) | (1 << 7)
+  cand[1] = (1 << 1) | (1 << 8)
+  cand[2] = (1 << 1) | (1 << 9)
+  cand[3] = (1 << 2) | (1 << 7)
+  cand[4] = (1 << 2) | (1 << 8)
+  cand[5] = (1 << 2) | (1 << 9)
+  cand[6] = (1 << 3) | (1 << 7)
+  cand[7] = (1 << 3) | (1 << 8)
+  cand[8] = (1 << 3) | (1 << 9)
+  before = cand.dup
+
+  assert_false t.hidden_triple(cand)
+  assert_equal(before, cand)
+end
+
+assert('x_wing clears the digit from both columns of a two-row lock') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  b5 = 1 << 5
+  # Digit 5 has exactly two homes in row 0 (cols 1 and 7) and exactly two in
+  # row 4 (the same cols 1 and 7). One of each row's two must be a 5 and they
+  # cannot share a column, so between them they use up both columns: no other
+  # cell of column 1 or column 7 can be a 5.
+  cand[1]  = b5 | (1 << 1)   # r0c1
+  cand[7]  = b5 | (1 << 2)   # r0c7
+  cand[37] = b5 | (1 << 3)   # r4c1
+  cand[43] = b5 | (1 << 4)   # r4c7
+  cand[19] = b5 | (1 << 6)   # r2c1 -- in a locked column, loses the 5
+  cand[79] = b5 | (1 << 7)   # r8c7 -- likewise
+  # A cell in row 4 but neither column. It must hold no 5, or row 4 would
+  # have three homes and there would be no X-wing to find at all.
+  cand[40] = (1 << 8) | (1 << 9)
+
+  assert_true t.x_wing(cand)
+  assert_equal((1 << 6), cand[19])
+  assert_equal((1 << 7), cand[79])
+  assert_equal(b5 | (1 << 1), cand[1])   # the four corners keep their 5s
+  assert_equal(b5 | (1 << 2), cand[7])
+  assert_equal(b5 | (1 << 3), cand[37])
+  assert_equal(b5 | (1 << 4), cand[43])
+  assert_equal((1 << 8) | (1 << 9), cand[40])
+
+  assert_false t.x_wing(cand)
+end
+
+assert('x_wing works transposed: two columns locking two rows') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  b4 = 1 << 4
+  # The dual, which is a different pattern on the same board and not free:
+  # digit 4 has two homes in column 2 (rows 1 and 5) and two in column 6 (the
+  # same rows), so it is cleared from the rest of rows 1 and 5. Note the rows
+  # themselves have THREE homes each here, so the row-wise scan finds nothing
+  # -- only the column-wise scan sees this.
+  cand[11] = b4 | (1 << 1)   # r1c2
+  cand[15] = b4 | (1 << 3)   # r1c6
+  cand[47] = b4 | (1 << 2)   # r5c2
+  cand[51] = b4 | (1 << 5)   # r5c6
+  cand[17] = b4 | (1 << 6)   # r1c8 -- in a locked row, loses the 4
+  cand[45] = b4 | (1 << 7)   # r5c0 -- likewise
+
+  assert_true t.x_wing(cand)
+  assert_equal((1 << 6), cand[17])
+  assert_equal((1 << 7), cand[45])
+  assert_equal(b4 | (1 << 1), cand[11])
+  assert_equal(b4 | (1 << 3), cand[15])
+  assert_equal(b4 | (1 << 2), cand[47])
+  assert_equal(b4 | (1 << 5), cand[51])
+
+  assert_false t.x_wing(cand)
+end
+
+assert('x_wing does not fire when the locked columns are already clear') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  b5 = 1 << 5
+  # A genuine X-wing with no victims: no other cell of column 1 or 7 offers a
+  # 5 in the first place.
+  cand[1]  = b5 | (1 << 1)
+  cand[7]  = b5 | (1 << 2)
+  cand[37] = b5 | (1 << 3)
+  cand[43] = b5 | (1 << 4)
+  cand[19] = (1 << 6) | (1 << 8) # column 1, but holds no 5
+  before = cand.dup
+
+  assert_false t.x_wing(cand)
+  assert_equal(before, cand)
+end
+
+assert('x_wing needs BOTH columns to match, not just one') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  b5 = 1 << 5
+  # Digit 5 has two homes in row 0 (cols 1 and 7) and two in row 4 (cols 1
+  # and 8). They share column 1, and that is not enough: the row-4 five could
+  # be at column 8, leaving the row-0 five free to be at column 7 and the
+  # column-1 five somewhere else entirely. A version that compares only the
+  # first home's column fires here and wrongly takes the 5 from cell 19.
+  cand[1]  = b5 | (1 << 1)   # r0c1
+  cand[7]  = b5 | (1 << 2)   # r0c7
+  cand[37] = b5 | (1 << 3)   # r4c1
+  cand[44] = b5 | (1 << 4)   # r4c8, NOT c7
+  cand[19] = b5 | (1 << 6)   # r2c1, the cell a wrong rule would strip
+  before = cand.dup
+
+  assert_false t.x_wing(cand)
+  assert_equal(before, cand)
+end
+
 assert('Techniques.solve finishes a singles-only board and says so') do
   t = Redoku::Sudoku::Techniques
   g = Redoku::Sudoku::Grid
@@ -125,9 +350,12 @@ assert('Techniques.solve counts how often each rule was needed') do
   # A rule that never fired is ABSENT, not zero. Callers weight the keys they
   # find, so "never looked for" must not read as "used 0 times" -- that is the
   # difference between a rule being unnecessary and a rule being unimplemented.
-  assert_false result[:counts].has_key?(:naked_pair)
-  assert_false result[:counts].has_key?(:hidden_pair)
   assert_false result[:counts].has_key?(:pointing)
+  assert_false result[:counts].has_key?(:naked_pair)
+  assert_false result[:counts].has_key?(:naked_triple)
+  assert_false result[:counts].has_key?(:hidden_pair)
+  assert_false result[:counts].has_key?(:hidden_triple)
+  assert_false result[:counts].has_key?(:x_wing)
 
   # Six holes, same accounting.
   six = t.solve(values_of(UNIQUE_81))
@@ -251,16 +479,27 @@ end
 
 assert('Techniques rank orders the rules cheapest first') do
   t = Redoku::Sudoku::Techniques
-  assert_equal([:naked_single, :hidden_single, :naked_pair, :hidden_pair,
-                :pointing], t::ORDER)
+  assert_equal([:naked_single, :hidden_single, :pointing, :naked_pair,
+                :naked_triple, :hidden_pair, :hidden_triple, :x_wing],
+               t::ORDER)
   # nil is cheaper than every real technique, so "nothing needed yet" never
   # beats a rule that was actually used.
   assert_true t.rank(:naked_single) > t.rank(nil)
-  assert_true t.rank(:pointing) > t.rank(:naked_pair)
-  assert_true t.rank(:naked_pair) > t.rank(:hidden_single)
+  # The singles are cheaper than anything that only eliminates.
+  assert_true t.rank(:pointing) > t.rank(:hidden_single)
+  # Locked candidates is the CHEAPEST eliminator, not the dearest: Sudoku
+  # Explainer scores pointing 2.6 against naked pair 3.0, and HoDoKu 50
+  # against 60. This assertion is the one that fails if someone puts
+  # :pointing back at the end of ORDER, where it used to be.
+  assert_true t.rank(:naked_pair) > t.rank(:pointing)
+  # Each rule is dearer than the smaller version of itself, and the X-wing --
+  # the only rule that reasons across two units -- is dearest of all.
+  assert_true t.rank(:naked_triple) > t.rank(:naked_pair)
+  assert_true t.rank(:hidden_triple) > t.rank(:hidden_pair)
+  assert_true t.rank(:x_wing) > t.rank(:hidden_triple)
   # harder picks the more expensive of two, in either argument order.
-  assert_equal(:pointing, t.harder(:naked_single, :pointing))
-  assert_equal(:pointing, t.harder(:pointing, :naked_single))
+  assert_equal(:x_wing, t.harder(:naked_single, :x_wing))
+  assert_equal(:x_wing, t.harder(:x_wing, :naked_single))
   assert_equal(:naked_single, t.harder(nil, :naked_single))
   assert_nil t.harder(nil, nil)
 end

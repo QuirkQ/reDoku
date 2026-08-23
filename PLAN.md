@@ -336,19 +336,33 @@ Pure Ruby, zero device dependencies (fully unit-testable on host).
 - **`Solver`** — two solvers:
   - *Counting backtracker*: randomized order, early-exits at 2 solutions.
     Used for generation (uniqueness) and to store the solution for checking.
-  - *Technique solver*: applies human techniques in escalating order — naked
-    single, hidden single, naked/hidden pair, pointing pair/box-line. Used
-    only for rating; records the hardest technique needed.
+  - *Technique solver*: applies human techniques cheapest-first — naked
+    single, hidden single, pointing/box-line, naked pair, naked triple,
+    hidden pair, hidden triple, X-wing. Used for rating, and for M3's hints;
+    records both the hardest technique needed and how often each was needed.
 - **`Generator`** — fill an empty grid with the randomized backtracker; dig
-  cell pairs (rotational symmetry) while the counting solver confirms
-  uniqueness; stop at a target clue range.
-- **`Rater`** — difficulty from the technique solver:
-  - **Easy**: solvable with singles only, ≥ 36 clues
-  - **Medium**: requires pairs/pointing, 28–35 clues
-  - **Hard**: technique solver stalls (needs search), 24–30 clues
-  - Generate-and-test: dig, rate, retry until the requested tier matches
-    (a few hundred ms per attempt on the Cortex-A7 is fine; a "generating…"
-    splash covers the pause).
+  cell pairs (rotational symmetry) as deep as uniqueness allows, then walk
+  that chain of boards from the shallow end and keep the first one whose
+  score lands in the requested band. Clue count is a **guard rail, not a
+  target** (22–45); the score decides where to stop. Real attempt cap, and
+  the closest board found if none matches.
+- **`Rater`** — one score per puzzle, from two measurements in series: the
+  weighted count of human techniques needed, plus 120 per guess still
+  required on the board the techniques could not finish. The tier is the
+  harder of the score's band and the floor its hardest technique implies.
+  - **Easy**: score ≤ 130 — singles only, generously clued (44–45 clues)
+  - **Medium**: 131–230 — more filling in, or one eliminator needed (31–41)
+  - **Hard**: 231+ — a lot of filling in, or guessing beyond our eight
+    rules (26–32)
+  - Measured 12/12 hit rate per tier at 56/87/153 ms on the build host.
+  - Bands are **calibrated against measurement, not borrowed**, and are
+    derived from two ordered lists so that going to five levels is a table
+    edit plus a recalibration.
+  - **Why not clue count, search cost, or the technique alone — and what our
+    "hard" honestly means — is recorded in
+    [`docs/design/difficulty-rating.md`](docs/design/difficulty-rating.md).**
+    Read it before changing any constant in `Rater`; several of these numbers
+    are counter-intuitive and were arrived at by being wrong first.
 - **Mistake checking** — the Check button compares entries against the stored
   solution and marks wrong entries with a small corner ✕ (they stay until
   edited). When the grid is full and correct, the win screen fires
