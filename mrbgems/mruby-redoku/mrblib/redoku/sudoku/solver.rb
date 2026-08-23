@@ -86,28 +86,84 @@ module Redoku
         best_i
       end
 
-      # Writes d at i and removes it from every empty peer that still offered
-      # it, returning just those peers so the undo is exact. cand[i] is left
-      # as it was, because nothing reads a filled cell's mask.
+      # Writes d at i and PROPAGATES: any peer left with a single candidate is
+      # assigned too, and so on until the chain runs out. A peer left with no
+      # candidate at all fails the whole branch immediately.
+      #
+      # Cascading rather than letting `pick` re-find each forced cell is
+      # borrowed from Norvig's solver (and its JS descendant sudoku.js, whose
+      # `_eliminate` does the same). It pays twice over: following the chain
+      # directly costs one peer walk per forced cell instead of a fresh
+      # 81-cell scan, and a contradiction is seen the moment it appears
+      # rather than after the search has committed to more of the branch.
+      # Measured on the generator, not assumed — see the M2 ledger.
+      #
+      # Returns a trail — [assigned_cells, cleared_bits] — for `unassign`, or
+      # nil if the branch is dead. On nil it has ALREADY undone its own
+      # partial work, so a caller that gets nil must not undo anything: the
+      # cascade may have written half a dozen cells before hitting the
+      # contradiction, and leaving those behind would corrupt the search.
       def self.assign(work, cand, i, d)
-        bit = 1 << d
-        touched = []
-        Grid::PEERS[i].each do |j|
-          next unless work[j] == 0
-          next if (cand[j] & bit) == 0
-          cand[j] &= ~bit
-          touched << j
+        cells = []
+        bits = []
+        if cascade(work, cand, i, d, cells, bits)
+          [cells, bits]
+        else
+          undo(work, cand, cells, bits)
+          nil
         end
-        work[i] = d
-        touched
       end
 
-      # The digit is read off the board BEFORE the cell is cleared, which is
-      # the one ordering constraint in here.
-      def self.unassign(work, cand, i, touched)
-        bit = 1 << work[i]
-        touched.each { |j| cand[j] |= bit }
-        work[i] = 0
+      def self.cascade(work, cand, i, d, cells, bits)
+        queue = [i, d]
+        head = 0
+        while head < queue.size
+          ci = queue[head]
+          cd = queue[head + 1]
+          head += 2
+          # The same cell can be queued twice by two different peers. Already
+          # holding the digit we wanted is agreement, not a conflict; holding
+          # a different one is the contradiction.
+          next if work[ci] == cd
+          return false if work[ci] != 0
+          bit = 1 << cd
+          return false if (cand[ci] & bit) == 0
+
+          work[ci] = cd
+          cells << ci
+          Grid::PEERS[ci].each do |j|
+            next unless work[j] == 0
+            next if (cand[j] & bit) == 0
+            cand[j] &= ~bit
+            bits << j
+            bits << bit
+            n = Grid::BIT_COUNT[cand[j]]
+            return false if n == 0 # nothing can go here: branch is dead
+            if n == 1
+              queue << j
+              queue << Grid::BIT_LIST[cand[j]][0]
+            end
+          end
+        end
+        true
+      end
+
+      # Exact reversal, in reverse order of application. The bit list records
+      # WHICH bit was taken from which cell, so a peer that never offered the
+      # digit is never handed one back — restoring by recomputation would let
+      # the grid drift looser on every backtrack.
+      def self.undo(work, cand, cells, bits)
+        k = bits.size - 2
+        while k >= 0
+          cand[bits[k]] |= bits[k + 1]
+          k -= 2
+        end
+        cells.each { |c| work[c] = 0 }
+        self
+      end
+
+      def self.unassign(work, cand, trail)
+        undo(work, cand, trail[0], trail[1])
       end
 
       # Depth-first, in place, restoring the cell on the way out so `work`
@@ -120,9 +176,10 @@ module Redoku
         return false if digits.empty? # dead branch
         digits = rng.shuffle(digits) if rng
         digits.each do |d|
-          touched = assign(work, cand, i, d)
+          trail = assign(work, cand, i, d)
+          next if trail.nil? # propagation found a contradiction; nothing to undo
           return true if search(work, cand, rng)
-          unassign(work, cand, i, touched)
+          unassign(work, cand, trail)
         end
         false
       end
@@ -143,9 +200,10 @@ module Redoku
         digits = rng.shuffle(digits) if rng
         found = 0
         digits.each do |d|
-          touched = assign(work, cand, i, d)
+          trail = assign(work, cand, i, d)
+          next if trail.nil? # a dead branch contributes no solutions
           found += tally(work, cand, limit - found, rng)
-          unassign(work, cand, i, touched)
+          unassign(work, cand, trail)
           return found if found >= limit
         end
         found

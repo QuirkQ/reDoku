@@ -196,25 +196,86 @@ assert('Solver.assign and unassign leave the candidate grid exactly as found') d
   before = cand.dup
   work = values.dup
 
-  touched = s.assign(work, cand, 0, 5)
+  trail = s.assign(work, cand, 0, 5)
+  assert_false trail.nil?
   assert_equal 5, work[0]
-  assert_equal 20, touched.size  # all 20 peers offered the 5
-  assert_false before == cand    # something really did change
-  s.unassign(work, cand, 0, touched)
+  assert_equal [0], trail[0]      # one cell assigned, no cascade on an empty board
+  assert_equal 40, trail[1].size  # 20 peers x (index, bit)
+  assert_false before == cand     # something really did change
+  s.unassign(work, cand, trail)
   assert_equal 0, work[0]
   assert_equal before, cand
 
   # A peer that did NOT offer the digit must not be handed it back, or the
   # grid drifts looser on every backtrack and the solver starts accepting
   # illegal boards. Cell 1 is a peer of cell 0; take the 5 away from it
-  # first, and assigning 5 at cell 0 must leave it out of the undo list.
+  # first, and assigning 5 at cell 0 must leave it out of the trail.
   cand[1] &= ~(1 << 5)
   narrowed = cand.dup
-  touched2 = s.assign(work, cand, 0, 5)
-  assert_equal 19, touched2.size
-  assert_false touched2.include?(1)
-  s.unassign(work, cand, 0, touched2)
+  trail2 = s.assign(work, cand, 0, 5)
+  assert_equal 38, trail2[1].size # 19 peers now
+  # The trail is flat pairs of [cell, bit], so read the cells out rather
+  # than searching the whole thing for a value that might be a bit.
+  cleared = []
+  k = 0
+  while k < trail2[1].size
+    cleared << trail2[1][k]
+    k += 2
+  end
+  assert_false cleared.include?(1)
+  s.unassign(work, cand, trail2)
   assert_equal narrowed, cand
+end
+
+assert('Solver.assign cascades through singletons its own write CREATES') do
+  s = Redoku::Sudoku::Solver
+  # The cascade only follows cells whose mask it just narrowed to one. A cell
+  # that was ALREADY a singleton before the write is never revisited, because
+  # nothing about it changed -- `pick` catches those on the next turn
+  # instead. That distinction is easy to get backwards, so it is pinned in
+  # both directions here.
+  work = Array.new(81, 0)
+  cand = s.build_cand(work)
+  # Cell 1 shares row 0 and box 0 with cell 0. Leave it two candidates, one
+  # of which is the digit about to be placed, so removing that digit forces
+  # it to the other.
+  cand[1] = (1 << 5) | (1 << 6)
+  # Cell 2 is already a singleton and does NOT contain the placed digit, so
+  # the cascade must leave it alone.
+  cand[2] = 1 << 7
+
+  trail = s.assign(work, cand, 0, 5)
+  assert_false trail.nil?
+  assert_equal 5, work[0]
+  assert_equal 6, work[1]         # forced by the write, so filled too
+  assert_equal 0, work[2]         # already a singleton: not the cascade's job
+  assert_equal 2, trail[0].size
+  assert_equal [0, 1], trail[0]
+
+  s.unassign(work, cand, trail)
+  assert_equal Array.new(81, 0), work
+  assert_equal((1 << 5) | (1 << 6), cand[1])
+  assert_equal((1 << 7), cand[2])
+end
+
+assert('Solver.assign undoes its own partial cascade on a contradiction') do
+  s = Redoku::Sudoku::Solver
+  # Cell 1 holds {3,5} and cell 2 holds {5}; both share row 0 and box 0 with
+  # each other and with cell 0. Writing a 3 at cell 0 is legal on its own,
+  # but it forces cell 1 to the 5, and that leaves cell 2 with nothing at
+  # all. assign must report the dead branch AND leave no trace -- a caller
+  # that gets nil is told not to undo anything, so a half-written cascade
+  # would quietly corrupt the search.
+  work = Array.new(81, 0)
+  cand = s.build_cand(work)
+  cand[1] = (1 << 3) | (1 << 5)
+  cand[2] = 1 << 5
+  board_before = work.dup
+  cand_before = cand.dup
+
+  assert_nil s.assign(work, cand, 0, 3)
+  assert_equal board_before, work
+  assert_equal cand_before, cand
 
   # And the same across a whole exhaustive count, which is many assign and
   # unassign pairs deep: a leak shows up as a mismatch here. `tally` is the
