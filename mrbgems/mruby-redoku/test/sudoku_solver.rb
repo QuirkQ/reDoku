@@ -378,8 +378,11 @@ end
 assert('Solver.cost is above 0 once the board forces a guess') do
   s = Redoku::Sudoku::Solver
   # The other half of the 0 semantic: a board that cannot be propagated to a
-  # finish must charge for the guesses. If this ever came back 0 the Rater
-  # would file the emptiest board there is as the easiest puzzle there is.
+  # finish must charge for the guesses. The Rater no longer reads this -- since
+  # the demand rework a board the techniques cannot finish is a REJECT rather
+  # than a scored puzzle, so there is nothing left for a guess price to do --
+  # but the 0/non-0 split is still what tells "propagated to a finish" from
+  # "needed a guess", which is the question `cost` exists to answer.
   #
   # The exact figures are recorded but not asserted. They are stable per
   # build -- the repeat assertions below prove that -- but they are a

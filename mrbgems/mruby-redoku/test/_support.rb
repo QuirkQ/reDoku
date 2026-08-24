@@ -255,6 +255,57 @@ MULTI_81 =
   '.........' \
   '........9'
 
+# --- demand-class fixtures. Mined from real dig chains (the seeds are
+# recorded so each is reproducible) because a board that genuinely REQUIRES an
+# eliminator cannot be written by hand with any confidence. Each is pinned
+# below by the definition of its class -- the weakest DEMAND_SET that finishes
+# it -- and not by Rater.demand_of, so the test can fail the classifier.
+#
+# All three came from the same throwaway script: walk each seed's dig chain
+# from first_usable to the floor, measure every board, and keep the first one
+# of each demand class. The three below are the first :locked, :subset and
+# :xwing boards in seed order, which is why their seeds are so far apart --
+# :xwing is rare.
+
+# Needs pointing / box-line: singles alone stall on it. seed=1..400 walk,
+# seed=3, 28 clues, score 276.
+LOCKED_81 =
+  '....9...8' \
+  '..83...1.' \
+  '.521....4' \
+  '5.9....4.' \
+  '38.....69' \
+  '.4....8.5' \
+  '1....598.' \
+  '.2...64..' \
+  '7...1....'
+
+# Needs a subset rule (a naked or hidden pair or triple): singles plus
+# pointing stall on it. seed=6, 27 clues, score 332.
+PAIR_81 =
+  '.1.38....' \
+  '9...2.7..' \
+  '.8...6..5' \
+  '.4.83....' \
+  '..3.4.8..' \
+  '....91.7.' \
+  '2..4...9.' \
+  '..9.6...2' \
+  '....12.5.'
+
+# Needs an X-wing: every weaker set stalls on it. seed=107, 27 clues,
+# score 559.
+XWING_81 =
+  '.397....5' \
+  '...1..76.' \
+  '.....8..3' \
+  '.76..3.8.' \
+  '....6....' \
+  '.8.9..65.' \
+  '9..4.....' \
+  '.57..6...' \
+  '4....297.'
+
 # An 81-char board string as the engine's values array: 0 for empty.
 def values_of(str)
   out = []

@@ -180,35 +180,20 @@ assert('Generator.tier_distance measures along the tier order') do
   assert_true gen.tier_distance(:nonsense, :easy) > gen.tier_distance(:hard, :easy)
 end
 
-assert('Generator.score_distance is zero inside the band and grows outside') do
+assert('Generator.closer? prefers the tier nearer the one asked for') do
   gen = Redoku::Sudoku::Generator
-  r = Redoku::Sudoku::Rater
-  band = r.band(:medium)
-  assert_equal(0, gen.score_distance(band[0], :medium))
-  assert_equal(0, gen.score_distance(band[1], :medium))
-  assert_equal(5, gen.score_distance(band[0] - 5, :medium))
-  assert_equal(7, gen.score_distance(band[1] + 7, :medium))
-  # The top band is open-ended, so nothing is above it.
-  hardest = r::TIERS[r::TIERS.size - 1]
-  assert_equal(0, gen.score_distance(1_000_000, hardest))
-end
-
-assert('Generator.closer? prefers the right tier, then the nearer score') do
-  gen = Redoku::Sudoku::Generator
-  r = Redoku::Sudoku::Rater
-  band = r.band(:medium)
-  right = { tier: :medium, score: band[0] }
-  wrong = { tier: :easy, score: band[0] - 100 }
-  # Tier distance dominates.
-  assert_true gen.closer?(right, wrong, :medium)
-  assert_false gen.closer?(wrong, right, :medium)
-  # Within the same wrong tier, the nearer score wins.
-  near = { tier: :easy, score: band[0] - 1 }
-  far = { tier: :easy, score: band[0] - 100 }
-  assert_true gen.closer?(near, far, :medium)
-  assert_false gen.closer?(far, near, :medium)
-  # Equal is not closer, so the earliest candidate kept wins ties.
-  assert_false gen.closer?(near, near, :medium)
+  right = { tier: :hard }
+  near = { tier: :medium }
+  far = { tier: :easy }
+  assert_true gen.closer?(right, near, :hard)
+  assert_true gen.closer?(near, far, :hard)
+  assert_false gen.closer?(far, near, :hard)
+  # Equal is not closer, so the first candidate found wins a tie and the
+  # search stays deterministic.
+  assert_false gen.closer?(near, near, :hard)
+  # A reject never wins: it is not a puzzle at all.
+  assert_true gen.closer?(far, { tier: nil }, :hard)
+  assert_false gen.closer?({ tier: nil }, far, :hard)
 end
 
 assert('Generator.generate returns a puzzle, its solution and its measurement') do
@@ -249,22 +234,50 @@ assert('Generator.generate never hands back a board that is barely dug') do
   # shallowest board on any chain is the COMPLETE SOLUTION, which scores zero
   # and sits comfortably inside the easy band. Without MAX_CLUES, an easy
   # request was answered with a finished sudoku.
-  [:easy, :medium, :hard].each do |tier|
-    out = gen.generate(tier, Redoku::Rng.new(50))
+  # Two rungs and an explicit small budget, for cost: the upper rungs are
+  # gated on what a board DEMANDS now, so a :hard request pays its whole
+  # attempt cap on most chains rather than settling early, and this test is
+  # about MAX_CLUES rather than about reaching a tier.
+  [:easy, :medium].each do |tier|
+    out = gen.generate(tier, Redoku::Rng.new(50), 6)
     assert_true out[:clues] <= gen::MAX_CLUES
     assert_true out[:clues] < 81
     assert_true out[:clues] >= gen::MIN_CLUES
   end
 end
 
-assert('Generator.generate hits every tier it is asked for') do
+assert('Generator.generate hits the two rungs the bottom of the ladder offers') do
   gen = Redoku::Sudoku::Generator
   s = Redoku::Sudoku::Solver
-  # All three must be reachable, which is not a given: an earlier design made
-  # :medium nearly unreachable, and the one before that collapsed two tiers
-  # into one. A few seeds each, since the point is that the tier comes out
-  # right rather than that one particular board does.
-  [:easy, :medium, :hard].each do |tier|
+  # EASY and MEDIUM only, and that is not timidity: measured over 500 chains,
+  # EASY is available on 500 of them and MEDIUM on 446 at EDGE 140, while HARD
+  # is on 70, EXPERT on 43 and MASTER on 10. Asserting the upper rungs here
+  # would mean paying their attempt caps -- MASTER is host p50 4.7 s / p90
+  # 16.0 s -- inside `make test`. Their reachability is established once, by
+  # the measurement script in this plan's Task 3, not by the suite.
+  #
+  # WHY MEDIUM IS SAFE TO ASSERT, and READ THE FIRST LINE OF THIS BEFORE
+  # BELIEVING THE REST. The 89%-of-chains figure at EDGE 140 was measured under
+  # the DEEP walk, which is Task 3's code and does not exist yet -- this task
+  # still walks every rung from the shallow end. So the figure is NOT direct
+  # evidence for what this assertion does here, and treating it as such is the
+  # mistake this comment exists to stop.
+  #
+  # What carries it instead is an ARGUMENT, and it is worth checking rather than
+  # trusting: reachability is a property of the CHAIN, not of the direction it
+  # is walked. MEASURE_BUDGET (12 here, 16 after Task 3) exceeds the measured
+  # 8-to-12-board window between MAX_CLUES and the uniqueness floor, so both
+  # walks classify the whole window and find a MEDIUM board on exactly the same
+  # chains -- they differ only in WHICH one they hand back. On top of that,
+  # `generate` draws a FRESH solution per attempt, so DEFAULT_ATTEMPTS is six
+  # independent chains and the miss probability is 0.11^6, about two in a
+  # million per seed.
+  #
+  # The argument is why this assertion survives Task 3 unchanged. The
+  # MEASUREMENT under the shipped code lands in Task 3 Step 5, whose script
+  # prints a per-rung hit rate and whose output goes into that commit message.
+  # Until then, this is reasoning, not data.
+  [:easy, :medium].each do |tier|
     3.times do |n|
       out = gen.generate(tier, Redoku::Rng.new(200 + (n * 7)))
       assert_equal(tier, out[:tier])
@@ -283,31 +296,36 @@ assert('Generator.generate is reproducible from its seed') do
   assert_equal(a[:score], b[:score])
 end
 
-assert('Generator.generate always returns a playable puzzle, tier or not') do
+assert('Generator.generate answers a playable puzzle or nothing, never a lie') do
   gen = Redoku::Sudoku::Generator
   s = Redoku::Sudoku::Solver
-  # With a budget of one attempt the generator may fail to hit the requested
-  # tier -- one solution in four produces no hard board anywhere along its
-  # chain. It must still hand back a real puzzle rather than nil, because the
-  # game has a board to draw either way, and report the tier it actually
-  # achieved rather than the one that was asked for.
+  # One attempt, so the requested tier may well be missed -- and under the new
+  # ladder a single attempt may also come back with NOTHING, which is the
+  # contract change: `generate` is nil when no attempt found a single board our
+  # rules can finish. Not observed in 500 chains, and this test does not assert
+  # it either way; what it pins is that a NON-nil reply is a real puzzle with a
+  # real tier. `if out` rather than an unconditional dereference is the whole
+  # edit.
   out = gen.generate(:hard, Redoku::Rng.new(4), 1)
-  assert_false out.nil?
-  assert_true s.unique?(out[:grid].values)
-  assert_true Redoku::Sudoku::Rater::TIERS.include?(out[:tier])
-  assert_true out[:clues] <= gen::MAX_CLUES
+  if out
+    assert_true s.unique?(out[:grid].values)
+    assert_true Redoku::Sudoku::Rater::TIERS.include?(out[:tier])
+    assert_false out[:tier].nil?
+    assert_true out[:clues] <= gen::MAX_CLUES
+  end
 end
 
 assert('Generator.generate reports the measurement of the board it returns') do
   gen = Redoku::Sudoku::Generator
   r = Redoku::Sudoku::Rater
-  # The reply must describe the board in it. A generator that reported the
-  # tier it was ASKED for rather than the one it achieved would be lying, and
-  # the header on screen would be lying with it.
+  # The reply must describe the board in it. A generator that reported the tier
+  # it was ASKED for rather than the one it achieved would be lying, and the
+  # header on screen would be lying with it.
   out = gen.generate(:hard, Redoku::Rng.new(61), 1)
+  assert_false out.nil?
   m = r.measure(out[:grid].values)
   assert_equal(m[:tier], out[:tier])
+  assert_equal(m[:demand], out[:demand])
   assert_equal(m[:score], out[:score])
-  assert_equal(m[:guesses], out[:guesses])
   assert_equal(m[:hardest], out[:hardest])
 end

@@ -250,30 +250,93 @@ end
 # both halves of that matter. Fixed is what lets a test say "New produced a
 # DIFFERENT puzzle" at all — a clock-seeded App could deal two identical
 # boards on some unlucky run — and it also pins the suite's generation cost
-# instead of re-rolling it every time, because the dig is a search and a hard
-# request measured anywhere from 90 to 600 ms on this host depending on the
-# seed. 11 was chosen by timing the sequences these tests actually drive
-# (medium+hard+easy for the two three-press Level tests, easy+easy for New)
-# across a dozen candidate seeds and keeping one of the two fastest.
+# instead of re-rolling it every time, because the dig is a search and a
+# :medium request measured anywhere from 90 to 600 ms on this host depending on
+# the seed. 11 was chosen by timing the sequences these tests drove at the
+# time — medium+hard+easy for the two three-press Level tests, easy+easy for
+# New — across a dozen candidate seeds and keeping one of the two fastest.
+# Those two Level tests no longer dig for real (see below), so that
+# measurement now stands behind the six tests that still do.
 #
 # The production default — App's own `rng:` keyword, which reads the clock —
 # is covered by one test of its own rather than incidentally by all of these:
 # see 'an App given no rng seeds itself from the clock'.
+#
+# Every App built through `new_app` now takes a FakeGenerator, so this seed no
+# longer prices the suite's digging — only the six tests that construct an App
+# directly generate for real, five of them at `:easy` and two of them (the
+# New-and-Level acknowledgement sweep, and the refused Level flash) at
+# `:medium`.
 GEN_SEED = 11
 
-def new_app(batches = [], rng: Redoku::Rng.new(GEN_SEED))
+# Stands in for Sudoku::Generator. Deals a real, uniquely-solvable board from
+# the shared fixtures -- so every assertion about "the App holds a puzzle"
+# still means something -- and lets a test say what should happen instead:
+# a tier miss, nil, or a raise.
+#
+# It does NOT call the progress block unless asked to (progress: true), so the
+# update-count assertions in this file keep counting what they counted before.
+# Task 5's bar tests opt in.
+class FakeGenerator
+  attr_reader :calls, :tiers_asked
+
+  def initialize(tier: nil, fail_with: nil, answer_nil: false,
+                 progress: false, attempts: 4)
+    @tier = tier            # nil means "answer the tier that was asked for"
+    @fail_with = fail_with  # a String: raise RuntimeError with it, every call
+    @answer_nil = answer_nil
+    @progress = progress
+    @attempts = attempts
+    @calls = 0
+    @tiers_asked = []
+  end
+
+  # Two fixtures alternating, so 'New deals a DIFFERENT puzzle' has something
+  # to see. Both are uniquely solvable (test/sudoku_solver.rb pins that).
+  BOARDS = [EASY_81, UNIQUE_81].freeze
+
+  def generate(tier, _rng, attempts = nil)
+    @calls += 1
+    @tiers_asked << tier
+    total = attempts || @attempts
+    if block_given?
+      i = 0
+      while i < total && @progress
+        i += 1
+        yield(i, total)
+      end
+    end
+    raise RuntimeError, @fail_with if @fail_with
+    return nil if @answer_nil
+    board = BOARDS[(@calls - 1) % BOARDS.size]
+    {
+      grid: Redoku::Sudoku::Grid.parse(board),
+      solution: solved_values,
+      tier: @tier.nil? ? tier : @tier,
+      demand: :singles, score: 6, hardest: :naked_single,
+      counts: { naked_single: 2 },
+      clues: Redoku::Sudoku::Rater.clue_count(values_of(board)),
+      attempts: 1
+    }
+  end
+end
+
+def new_app(batches = [], rng: Redoku::Rng.new(GEN_SEED),
+            generator: FakeGenerator.new)
   d = TestDisplay.new
   input = FakeInput.new(batches)
   signals = FakeSignals.new
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
-                        FakeWaiter.new([input]), signals, rng: rng)
+                        FakeWaiter.new([input]), signals, rng: rng,
+                        generator: generator)
   [app, d, input, signals]
 end
 
 # An App with a touchscreen as well as a pen, and a clock under the test's
 # control.
 def new_touch_app(pen_batches = [], touch_batches = [],
-                  rng: Redoku::Rng.new(GEN_SEED))
+                  rng: Redoku::Rng.new(GEN_SEED),
+                  generator: FakeGenerator.new)
   d = TestDisplay.new
   pen = FakeInput.new(pen_batches)
   finger = FakeInput.new(touch_batches)
@@ -281,7 +344,7 @@ def new_touch_app(pen_batches = [], touch_batches = [],
   waiter = FakeWaiter.new([pen, finger])
   app = Redoku::App.new(d, [pen], Redoku::Renderer.new(d), waiter,
                         FakeSignals.new, touch_sources: [finger],
-                        clock: clock, rng: rng)
+                        clock: clock, rng: rng, generator: generator)
   [app, d, clock, waiter, pen, finger]
 end
 
@@ -756,7 +819,8 @@ assert('the acknowledgement runs each action exactly once') do
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
     # One step per tap: a press that ran cycle_difficulty twice would skip a
     # difficulty, and one that dropped it would stay put.
-    assert_equal Redoku::Sudoku::Rater::TIERS[(i + 1) % 3], app.difficulty
+    list = Redoku::Sudoku::Rater::TIERS
+    assert_equal(list[(i + 1) % list.size], app.difficulty)
     # Exactly one header flush per tap, exactly as before. What changed is how
     # it is counted: Level now digs a puzzle as well as renaming the tier, and
     # new_puzzle's two board flushes are GL16 chrome too, so counting GL16
@@ -906,7 +970,8 @@ assert('a tap on Level cycles the difficulty and repaints the header') do
     d.clear_calls
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
-    expected = Redoku::Sudoku::Rater::TIERS[(i + 1) % 3]
+    list = Redoku::Sudoku::Rater::TIERS
+    expected = list[(i + 1) % list.size]
     assert_equal expected, app.difficulty
     # press flash, header, splash, puzzle, release flash. Was three before
     # M2, when Level only renamed the tier; the two extra are the board the

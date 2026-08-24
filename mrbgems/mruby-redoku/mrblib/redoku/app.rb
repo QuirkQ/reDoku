@@ -79,9 +79,16 @@ module Redoku
     # puzzle; Ruby evaluates a keyword default only when the argument is
     # omitted, so a test that passes its own fixed-seed Rng never touches
     # Time.now and generates the same boards every run.
+    #
+    # `generator:` is the same kind of seam as `waiter`, `signals`, `clock` and
+    # `rng`: the thing this loop cannot afford to run for real in a test. The
+    # retry behaviour in fill_board is a control structure -- one path bounded,
+    # one deliberately not -- and a control structure needs a collaborator that
+    # can be told to fail. It also keeps the suite off the real search, which
+    # for :expert is measured in seconds.
     def initialize(display, sources, renderer, waiter = RM2::Input,
                    signals = RM2, touch_sources: [], clock: RM2,
-                   rng: Rng.from_clock)
+                   rng: Rng.from_clock, generator: Sudoku::Generator)
       @d = display
       @sources = sources
       @touch = touch_sources
@@ -90,6 +97,7 @@ module Redoku
       @signals = signals
       @clock = clock
       @rng = rng
+      @generator = generator
       @difficulty = Sudoku::Rater::TIERS[0]
       # No puzzle until something asks for one. Generation is a search of tens
       # of milliseconds here and PLAN.md §7 budgets a few hundred on the
@@ -752,17 +760,19 @@ module Redoku
     # M3 owns whether to surface it (a parenthetical in the header, a
     # re-request, a menu), and it has the value to do so.
     def fill_board
-      puzzle = Sudoku::Generator.generate(@difficulty, @rng)
-      # Guarded rather than trusted. Today `generate` cannot return nil: an
-      # invariant spread across dig/generate in generator.rb guarantees the
-      # walk always has a board to hand back, however far it is from the
-      # requested tier. That invariant is about to be given up on purpose by
-      # the difficulty rework (five technique-gated tiers, PLAN.md §10's
-      # follow-on), so this checks for the nil that rewrite is expected to
-      # introduce rather than waiting to find out from a crash. On a nil
-      # result the puzzle already on the board is kept as-is — an unchanged
-      # board beats a wiped one — and the caller's splash is left showing,
-      # which is honest: nothing new was actually dug.
+      puzzle = @generator.generate(@difficulty, @rng)
+      # Guarded, and the nil it guards for now really happens. `generate`
+      # answers nil when no attempt found a single board our eight rules can
+      # finish — under the no-guessing rule such a board is a REJECT rather
+      # than a hard puzzle, so there is nothing to hand back. This guard was
+      # written one commit ahead of that change, against the invariant the
+      # difficulty rework was expected to give up; the rework has now given it
+      # up. On a nil result the puzzle already on the board is kept as-is — an
+      # unchanged board beats a wiped one — and the caller's splash is left
+      # showing, which is honest: nothing new was actually dug.
+      #
+      # What it does NOT do yet is retry, or tell the player. That is Task 5's
+      # question and is deliberately not answered here.
       return self if puzzle.nil?
       @grid = puzzle[:grid]
       # Kept, not used. M3's Check needs the answer and the generator has

@@ -1,21 +1,39 @@
 module Redoku
   module Sudoku
-    # Difficulty, measured as HOW MUCH WORK OF WHAT KIND a board demands of a
-    # person. One number, from two measurements composed in series:
+    # Difficulty, measured as WHAT KIND OF THINKING a board demands and HOW
+    # MUCH OF IT. Two signals, and which one decides is the whole design:
     #
-    #   1. Run the human technique solver. Every rule it applies costs points,
-    #      weighted by how hard that rule is to spot and to know.
-    #   2. Whatever it could not finish, measure with the search solver. Those
-    #      are the guesses no human technique in our repertoire can avoid, and
-    #      they cost a lot each.
+    #   1. DEMAND -- the weakest set of human techniques that finishes the
+    #      board (see DEMAND_SETS). A property of the puzzle's logic, not of
+    #      its length, and it picks the rung.
+    #   2. SCORE -- the weighted sum over every rule application the solver
+    #      needed. Volume, not cleverness, and it may only separate rungs
+    #      INSIDE a demand class -- which today means only the bottom two.
     #
-    # THE COMPOSITION IS THE POINT. Cost is measured on the RESIDUAL board --
-    # the position the technique solver stalled in -- not on the puzzle as
-    # dealt. So the second number means "guessing still required after human
-    # technique is exhausted" rather than "guessing a machine needs from
-    # scratch", and the two measurements describe different work instead of
-    # overlapping. A board the techniques finish scores no guess points at
-    # all, because there is nothing left to guess about.
+    # WHY DEMAND DECIDES AND NOT THE SCORE, which is what this class did
+    # before and what was rejected on the device. A score is a SUM, so enough
+    # trivial steps add up to a hard rating without the puzzle ever requiring
+    # a hard technique -- and measured, that is exactly what happened: 22 of
+    # 40 boards the old rater called :hard were solvable by naked and hidden
+    # singles alone, and all 40 of its :medium boards were; 94% of a
+    # 4852-board dig-chain corpus was singles-only. The old TECHNIQUE_FLOOR
+    # could only ever RAISE a tier, so it could not stop volume buying a
+    # label. A demand class sets a CEILING as well as a floor, and that is
+    # the fix.
+    #
+    # WHERE THE SCORE STILL SPEAKS, because the owner's playtest was clear
+    # that "long, not clever" is genuinely fun at the easy end: it separates
+    # :easy from :medium inside the singles class, and nothing else. That is
+    # the axis moved to the BOTTOM of the ladder, where it is fun, rather than
+    # left at the top, where it was wrong.
+    #
+    # WHY THERE IS NO GUESS TERM ANY MORE. This class used to add search cost
+    # for whatever the techniques could not finish, priced at GUESS points a
+    # decision. Under the no-guessing rule a board our eight rules cannot
+    # finish is a REJECT -- `measure` answers tier: nil -- rather than a hard
+    # puzzle, so there is nothing left for that term to price. Solver.cost
+    # survives as a diagnostic with tests of its own; it is simply not called
+    # from the rating path.
     #
     # WHY NOT PURE SEARCH COST, which is what this class did before: because
     # it is the worst-performing family of metrics that has been measured.
@@ -45,11 +63,6 @@ module Redoku
     # what HoDoKu does in production, where the score is the plain sum over
     # every step taken.
     class Rater
-      # Ordered easiest to hardest. Everything here is derived from this list
-      # rather than hard-coded, so adding levels is a change to LEVELS and a
-      # recalibration, not a change to any logic.
-      TIERS = [:easy, :medium, :hard].freeze
-
       # PER-TECHNIQUE WEIGHTS, taken from HoDoKu's production rater
       # (`Options.java`, verified across three forks) because it is the only
       # published table whose scores are meant to be SUMMED, which is what we
@@ -88,16 +101,6 @@ module Redoku
       # catch a difficulty that quietly stopped counting.
       UNKNOWN_WEIGHT = 140
 
-      # What one forced guess costs. Guessing is not a technique, it is the
-      # absence of one: the player is reduced to trying a digit and unwinding
-      # if it fails, which is why HoDoKu prices its own last resort
-      # ("Brute Force") at 10000 against 140 for an X-wing. This is far less
-      # brutal than that, because our repertoire is deliberately small -- a
-      # board we cannot finish may well be solvable by a technique a good
-      # player knows and we simply have not implemented, so calling every such
-      # board unplayable would be wrong.
-      GUESS = 120
-
       # The novelty premium: a technique costs full price the first time and
       # less per repeat, expressed as a fraction. Sudoku Of The Day is the one
       # published table that prices first use separately from repeats, and it
@@ -113,118 +116,154 @@ module Redoku
       REPEAT_NUM = 2
       REPEAT_DEN = 3
 
-      # THE FLOOR A TECHNIQUE PUTS UNDER A BOARD. A puzzle that genuinely
-      # needed this rule cannot be rated easier than this, whatever its score
-      # adds up to.
+      # FIVE RUNGS, easiest first. Single upper-case words on purpose: Font's
+      # glyph table holds A-Z 0-9 space - : . and nothing else, and Font.draw
+      # silently draws NOTHING for a missing glyph while still advancing the
+      # cursor -- so :very_hard would render as "VERY", a gap, "HARD", with no
+      # error anywhere. Renderer#draw_header prints difficulty.to_s.upcase, so
+      # the SYMBOL is the label.
       #
-      # This is the other half of the composition, and it is not decoration --
-      # without it the rating is nearly worthless, which was measured rather
-      # than reasoned. The summed score is DOMINATED BY SINGLES: a 27-clue
-      # board measured here scored 260, of which all 260 came from 36 naked
-      # singles and 17 hidden singles, because a board with more holes needs
-      # proportionally more singles to fill them. One pointing pair at 50
-      # points simply disappears into that, so a score-only rating is close to
-      # a clue-count rating wearing a disguise -- the exact thing the research
-      # says not to build.
+      # The header survives five names without a layout change: EXPERT and
+      # MASTER are 6 characters, exactly as MEDIUM already is -- 175 px at
+      # Layout::LABEL_SCALE 5, right-aligned to x = 1332, so starting at
+      # x = 1157, against REDOKU ending at x = 352 at TITLE_SCALE 8.
       #
-      # HoDoKu solves it the same way and it is worth stating its rule
-      # exactly, since ours is that rule: the puzzle's level "cannot be lower
-      # than" the level of its hardest step, but a large enough score can push
-      # it higher. So the two signals answer different questions -- the
-      # hardest technique asks "what did this demand you KNOW?", the score
-      # asks "how much of it was there?" -- and the tier is the harder answer.
+      # This is the ONLY tier list. Renderer::DIFFICULTIES used to hold a
+      # second copy and was deleted in 75eb7cf for being exactly that; app.rb
+      # and test/app.rb read TIERS directly. Do not reintroduce one.
+      TIERS = [:easy, :medium, :hard, :expert, :master].freeze
+
+      # THE RULE SETS THAT DEFINE THE LADDER, weakest first, each a superset of
+      # the last. A board's DEMAND is the weakest of these that finishes it,
+      # or nil -- a reject -- if even the strongest cannot.
       #
-      # The assignments follow PLAN.md §7, which drew the same three lines
-      # before any of this was measured: easy is "singles only", medium
-      # "requires pairs/pointing", hard is where the technique solver gives up.
-      # The two rules our repertoire gained last are placed above that: a
-      # hidden triple and an X-wing are not what §7 meant by "pairs/pointing",
-      # and HoDoKu prices them at 100 and 140 against locked candidates at 50.
+      # DEFINED BY MEMBERSHIP, NOT BY ORDER POSITION. ORDER lists naked_triple
+      # AHEAD of hidden_pair (a readability choice recorded in techniques.rb),
+      # so a ladder with one rung per ORDER position would let that cosmetic
+      # ordering decide a tier -- and it measured badly: the per-rule prefix
+      # ladder found 0 X-wing boards in 1467 where these four sets find 10 in
+      # 4852, because it filed them under "pair". Getting that wrong does not
+      # fail loudly; it silently makes the top rung unreachable.
       #
-      # Singles are absent on purpose. They put no floor under anything --
-      # they are what every board needs, so a board needing nothing else is
-      # free to be easy.
-      TECHNIQUE_FLOOR = {
-        pointing: :medium,
-        naked_pair: :medium,
-        hidden_pair: :medium,
-        naked_triple: :medium,
-        hidden_triple: :hard,
-        x_wing: :hard
+      # BUT NOTE WHAT IS ALSO TRUE, because demand_of's early break leans on
+      # it: each of these four sets happens to be a CONTIGUOUS PREFIX of ORDER
+      # taken as a set -- ORDER[0..1], [0..2], [0..6], [0..7]. The level
+      # boundaries fall either side of the naked_triple / hidden_pair swap, not
+      # through it. That is what licenses breaking out of the downward walk
+      # (see demand_of), and it is an accident of where the boundaries landed,
+      # so test/sudoku_rater.rb pins it explicitly. Moving a name across a
+      # boundary, or re-ordering ORDER, breaks the soundness argument without
+      # breaking any other test.
+      #
+      # TRIPLES SIT WITH THE PAIRS and are not a rung. Boards that genuinely
+      # require a naked or hidden triple turned up on 1 chain in 500; boards
+      # requiring an X-wing on 10 in 500, ten times more common. The subset
+      # rules all narrow toward the same candidate fixed point, so a triple
+      # rarely deduces anything the pairs did not (difficulty-rating.md
+      # records hidden_triple never firing at all); X-wing reasons across two
+      # units and is the only rule in our repertoire that adds a genuinely
+      # different kind of inference.
+      #
+      # The strongest set is Techniques::ORDER, SPELLED OUT rather than
+      # referenced: mrblib loads in sorted-path order, so rater.rb loads
+      # BEFORE techniques.rb and naming Techniques::ORDER here would raise
+      # NameError at load and take the whole gem down. test/sudoku_rater.rb
+      # pins this copy against ORDER, and that test is the only thing keeping
+      # the two in step -- the copy is forced by the load order, so it cannot
+      # be removed the way Renderer::DIFFICULTIES was.
+      DEMAND_SETS = [
+        [:naked_single, :hidden_single].freeze,
+        [:naked_single, :hidden_single, :pointing].freeze,
+        [:naked_single, :hidden_single, :pointing, :naked_pair, :hidden_pair,
+         :naked_triple, :hidden_triple].freeze,
+        [:naked_single, :hidden_single, :pointing, :naked_pair, :hidden_pair,
+         :naked_triple, :hidden_triple, :x_wing].freeze
+      ].freeze
+
+      # The name of each set, in the same order.
+      DEMANDS = [:singles, :locked, :subset, :xwing].freeze
+
+      # Which rungs a demand class may occupy, as [first, last] indices into
+      # TIERS. THIS IS THE FIX. The old TECHNIQUE_FLOOR could only ever RAISE
+      # a tier, so a big enough score promoted a singles-only board to the top
+      # -- measured, 22 of 40 :hard boards (55%) were solvable by naked and
+      # hidden singles alone, and every one of 40 :medium boards was. Here the
+      # class sets a CEILING as well as a floor, so volume can no longer buy
+      # cleverness.
+      DEMAND_RANGE = {
+        singles: [0, 1].freeze,   # easy or medium, by score
+        locked:  [2, 2].freeze,
+        subset:  [3, 3].freeze,
+        xwing:   [4, 4].freeze
       }.freeze
 
-      # Band ceilings, easiest first, paired with TIERS. The last is nil,
-      # meaning open-ended -- there is no score too high to be hard.
+      # Score edges INSIDE a class's range: exactly one fewer than the range is
+      # wide, so only :singles has any. This is all that is left of the old
+      # CEILING, and it is the one place the owner's "long, not clever is more
+      # fun" axis lives -- deliberately at the BOTTOM of the ladder, where the
+      # owner finds it fun, rather than at the top, where it was wrong.
       #
-      # CALIBRATED, not borrowed. HoDoKu's own thresholds (800 / 1000 / 1600 /
-      # 1800) cannot transfer, and the reason generalises: a cost metric and
-      # the propagation strength it is measured against are ONE UNIT. HoDoKu
-      # scores against roughly forty techniques and we score against eight, so
-      # our sums are smaller and land differently. super-sudoku learned this
-      # the expensive way and left the evidence in its source -- its AC3 loop
-      # is disabled at solverAC3.ts:119-126 under the comment "I initially
-      # didn't count the ac3 iterations as proposed by the paper. But using
-      # them now falsifies the tests", because strengthening propagation moved
-      # every iteration count off its committed reference numbers. The same
-      # trap is why these edges were set AFTER the technique solver gained its
-      # triples and X-wing, not before.
+      # 140 MEASURED, not chosen for roundness. EASY boards (44-45 clues)
+      # score 97-117 over 500 chains, so any edge above 117 keeps them easy;
+      # the deepest singles-only board on a chain scores p50 203. The edge
+      # trades MEDIUM's reachability against how long a MEDIUM has to be:
+      # 120 -> reachable on 99% of chains, 140 -> 89%, 160 -> 75%, 180 -> 66%,
+      # 200 -> 51%, 230 -> 29%. 140 keeps a clear gap above EASY's worst case
+      # and leaves MEDIUM reachable on nine chains in ten.
       #
-      # Measured on the build host along real dig chains, which is the
-      # distribution the Generator actually draws from: scores run 97 to about
-      # 137 over the shallow two-thirds of a chain, reach 170 to 275 near the
-      # uniqueness floor, and jump into the thousands on the minority of boards
-      # where the technique solver gives up and guessing takes over. The edges
-      # are set so all three tiers are reachable from that distribution rather
-      # than at round numbers: at [140, 300] the middle band was measured to be
-      # nearly unreachable, because a chain tends to step from the 130s
-      # straight past 300 once a stall starts costing guess points.
-      CEILING = [130, 230, nil].freeze
+      # Those percentages are PER-CHAIN reachability measured under the DEEP
+      # walk. They are not a hit rate for a request, and they are not evidence
+      # about the shallow walk -- a request draws a fresh chain per attempt, so
+      # the hit rate at a cap of 12 is far higher than 89%. Do not quote 89% as
+      # "MEDIUM works nine times in ten".
+      DEMAND_EDGES = { singles: [140].freeze }.freeze
 
-      # ACCEPTANCE TOLERANCE, and the answer to "we need a margin of error".
-      # A board whose score sits within this much of a band is accepted AS
-      # that band by the generator, even though `tier_for` would name it its
-      # neighbour. Overlapping bands rather than exact edges is the documented
-      # practice: Sudoku Of The Day publishes deliberately overlapping bands
-      # and says why -- it "allows the generator an extra bit of leeway as it
-      # works to create a puzzle that's still within an acceptable range".
-      #
-      # TWO FORMS, EITHER OF WHICH SUFFICES, which is stolen wholesale from
-      # super-sudoku (generate.ts:211-288: `rateIterationsRelative(cost) <
-      # RELATIVE_DRIFT || rateCostsAbsolute(cost) < ABSOLUTE_DRIFT`). Its
-      # comment explains why both are needed, and the reasoning transfers
-      # exactly: a percentage is meaningless at the easy end of a metric that
-      # spans two orders of magnitude, and a fixed number of points is
-      # meaningless at the hard end. Our scores run from about 97 to well over
-      # 10000, so the same pairing applies.
-      #
-      # No published grader states a tolerance figure -- these are ours, set
-      # from the measured spread within a single clue count.
-      TOLERANCE_POINTS = 25
-      TOLERANCE_PERCENT = 15
+      # Rule -> the index of the WEAKEST demand class that contains it. Built
+      # from DEMAND_SETS walking strongest to weakest so the weakest
+      # assignment wins, because the sets are nested.
+      def self.build_rule_level
+        table = {}
+        i = DEMAND_SETS.size - 1
+        while i >= 0
+          DEMAND_SETS[i].each { |name| table.store(name, i) }
+          i -= 1
+        end
+        table
+      end
+      RULE_LEVEL = build_rule_level.freeze
 
-      # Everything known about a board in one pass, because the two solvers
-      # are the expensive part and no caller should pay for them twice.
+      # Everything known about a board in one pass.
       #
-      #   score    the difficulty number
-      #   tier     which band that score falls in
-      #   guesses  decisions left after the techniques gave up (0 if solved)
+      #   tier     which rung, or NIL for a reject -- see below
+      #   demand   the weakest rule set that finishes it, or nil
+      #   score    the weighted technique sum, or nil for a reject
       #   counts   how many times each technique was needed
-      #   hardest  the hardest single technique needed, or nil
-      #   solved   whether human techniques alone finished it
+      #   hardest  the hardest single technique that fired, or nil
+      #   solved   whether the eight rules finished it
+      #
+      # tier: nil means REJECT: our rules cannot finish this board, so it is
+      # not a puzzle we may ship under the no-guessing rule. CALLERS MUST
+      # HANDLE NIL -- this is a contract change, today's measure always named a
+      # tier.
+      #
+      # Solver.cost and the GUESS weight have LEFT the rating path entirely. A
+      # scored board is by construction one the techniques finished, so the
+      # guess term was always zero on every board that still gets a score.
+      # Solver.cost stays as a diagnostic (its own tests pin it) and is simply
+      # not called from here. Measured saving: p50 1.2 ms, max 11.4 ms per
+      # stalled board -- small, and worth saying so rather than claiming a win.
+      # The expensive half of a stalled board is Techniques.solve itself, at
+      # 8.6-28.1 ms, because hidden_triple and x_wing are dear to DECLINE.
       def self.measure(values)
         result = Techniques.solve(values)
-        guesses = result[:solved] ? 0 : Solver.cost(result[:values])
-        technique_points = points(result[:counts])
-        total = technique_points + (guesses * GUESS)
-        {
-          score: total,
-          tier: tier_for(total, result[:hardest], !result[:solved]),
-          guesses: guesses,
-          technique_points: technique_points,
-          counts: result[:counts],
-          hardest: result[:hardest],
-          solved: result[:solved]
-        }
+        unless result[:solved]
+          return { tier: nil, demand: nil, score: nil, counts: result[:counts],
+                   hardest: result[:hardest], solved: false }
+        end
+        score = points(result[:counts])
+        demand = demand_of(values, result[:counts])
+        { tier: tier_for(demand, score), demand: demand, score: score,
+          counts: result[:counts], hardest: result[:hardest], solved: true }
       end
 
       # The weighted sum over a technique log, novelty premium included.
@@ -239,113 +278,129 @@ module Redoku
         total
       end
 
-      # The tier a stalled board cannot be rated below -- and deliberately NOT
-      # the hardest tier, for the same reason this class no longer rates by
-      # technique alone: "our eight rules ran out" is a fact about our
-      # repertoire, not about the puzzle. A competent player knows XY-wing,
-      # swordfish and simple colouring, none of which we implement, so a board
-      # we stall on may well be one they would finish without ever guessing.
-      # Calling every such board hard would be claiming our blind spot as the
-      # puzzle's difficulty.
+      # The weakest DEMAND_SET that finishes this board.
       #
-      # What does the rest of the work is the `guesses` term in the score: a
-      # board that really does need trial and error pays 120 points per
-      # decision and climbs past the top band on its own. This floor only
-      # stops such a board being called EASY, which it certainly is not.
+      # `counts` gives an exact upper bound for FREE (see upper_bound), and the
+      # solve that produced it is one the caller needed anyway to know the
+      # board is not a reject. From there, walk DOWN the ladder confirming with
+      # one solve each until a set fails; the last set that succeeded is the
+      # demand. Only a board where a strong rule actually fired pays for any
+      # confirming solve at all.
       #
-      # Also the right shape for five levels later, where flooring every stall
-      # at the top would collapse the two hardest levels into one.
-      STALL_FLOOR = :medium
-
-      # The tier of a board, composed from both signals. `score` sets the
-      # band; `hardest` and `stalled` can only ever raise it, never lower it.
+      # WHY CONFIRM AT ALL, when a rule fired: because firing is not the same
+      # as being needed. The eliminators are confluent -- over 120 boards no
+      # eliminator was ever INDIVIDUALLY indispensable, because whenever one
+      # was used another rule reached the same fixed point. Measured: x_wing
+      # fired on 17 of ~3400 boards and on all 17 it really was needed; the
+      # confirming solve is kept anyway, because 17/17 is an observation about
+      # a corpus and not a theorem, and the cost of being wrong is a
+      # mislabelled tier.
       #
-      # Disjoint by construction, so a board has exactly one tier -- the
-      # tolerated overlap lives in `accepts?`, not here, because a puzzle must
-      # be LABELLED with one answer even though it may be ACCEPTABLE as two.
-      def self.tier_for(score, hardest = nil, stalled = false)
-        tier = band_for(score)
-        tier = harder_tier(tier, STALL_FLOOR) if stalled
-        floor = TECHNIQUE_FLOOR[hardest]
-        tier = harder_tier(tier, floor) unless floor.nil?
-        tier
-      end
-
-      # The first tier whose ceiling the score does not exceed, and the
-      # hardest tier if it exceeds them all.
-      def self.band_for(score)
-        i = 0
-        while i < TIERS.size
-          ceiling = CEILING[i]
-          return TIERS[i] if ceiling.nil? || score <= ceiling
-          i += 1
+      # WHY DOWNWARD AND NOT A CASCADE OF PER-RULE TESTS: a cascade that
+      # branches on "did a subset rule fire?" after confirming the subset set
+      # can return :locked without ever testing whether LOCKED solves the
+      # board -- the rules that fire in a RESTRICTED run are not the rules that
+      # fired in the full one. Walking down tests every set it claims.
+      #
+      # WHY THE BREAK IS SOUND, spelled out because it is subtler than it
+      # looks and nothing else in this file says it. The loop stops at the
+      # first failure and reports the set below it, which needs
+      #
+      #     DEMAND_SETS[k-1] fails to solve  =>  DEMAND_SETS[k-2] fails too
+      #
+      # and THAT DOES NOT FOLLOW FROM NESTING. A superset can contain a rule
+      # that sits EARLIER in ORDER than the one the smaller run took, pre-empt
+      # it, and walk a different path -- so "more rules cannot hurt" needs an
+      # argument, not an appeal to obviousness.
+      #
+      # The argument is the one upper_bound uses, run backwards. At each state
+      # the solver takes the FIRST rule in ORDER that fires, so no rule ahead
+      # of it fired at that state, member of the set or not. So if F is the set
+      # of rules that fired in a successful run, EVERY T with
+      # F subset T subset ORDER takes the same rule at every state and solves.
+      # When the sets are contiguous ORDER PREFIXES, S subset T gives
+      # F subset S subset T, so T solves whenever S does -- and the
+      # contrapositive is exactly the implication the break needs.
+      #
+      # So the break is sound BECAUSE the four sets are ORDER prefixes, which
+      # they are today by where the boundaries happen to land. That is pinned
+      # by 'every demand set is a contiguous prefix of ORDER' in
+      # test/sudoku_rater.rb. If that test is ever deleted or a boundary moves,
+      # delete the `break` and walk the whole ladder instead: it costs at most
+      # three extra solves on the rare board that got past upper_bound, and it
+      # needs no property of ORDER at all.
+      #
+      # (A confluence argument would give the same conclusion for ANY nested
+      # sets -- these eight rules are all sound and monotone, so their closure
+      # should not depend on the order they are tried in. That is a stronger
+      # claim about how eight rules interact and nothing in this repository has
+      # measured it, so it is not what the code leans on.)
+      #
+      # Measured cost over 500 chains: 1 solve per board at p50, mean 7 per
+      # chain including the neighbourhood work, max 40.
+      def self.demand_of(values, counts)
+        k = upper_bound(counts)
+        while k > 0
+          break unless Techniques.solves?(values, DEMAND_SETS[k - 1])
+          k -= 1
         end
-        TIERS[TIERS.size - 1]
+        DEMANDS[k]
       end
 
-      # The harder of two tier names, by position in TIERS. An unknown name
-      # loses, so a typo cannot silently promote a board to hard.
-      def self.harder_tier(a, b)
-        ia = TIERS.index(a)
-        ib = TIERS.index(b)
-        return a if ib.nil?
-        return b if ia.nil?
-        ia >= ib ? a : b
-      end
-
-      # The score range a tier owns, as [floor, ceiling]; ceiling is nil for
-      # the open-ended top tier. The floor is the previous tier's ceiling plus
-      # one, so the bands tile the whole range with no gap.
-      def self.band(tier)
-        i = TIERS.index(tier)
-        return nil if i.nil?
-        # `i == 0` rather than `i.zero?`: Integer#zero? comes from
-        # mruby-numeric-ext, which this gem does not declare, so it would pass
-        # on the device (the binary links the whole default gembox) and crash
-        # under `make test`. That asymmetry has bitten this repo before.
-        floor = i == 0 ? 0 : CEILING[i - 1] + 1
-        [floor, CEILING[i]]
-      end
-
-      # Would this score do, as this tier? The generator's accept test, and
-      # the margin of error: TOLERANCE points of slack at each end, so a board
-      # just over an edge is still usable rather than thrown away and
-      # regenerated. `tier_for` remains the honest label -- this only decides
-      # whether to keep looking.
-      # Strictly inside the band, no indulgence. This is the test that DRIVES
-      # a search: while there may still be a board that genuinely belongs in
-      # the requested tier, a near miss is not good enough.
-      def self.in_band?(tier, score)
-        range = band(tier)
-        return false if range.nil?
-        return false if score < range[0]
-        range[1].nil? || score <= range[1]
-      end
-
-      # Inside the band, or near enough. This is the test that GATES a result:
-      # once a search has looked at everything available and found nothing
-      # squarely inside, a near miss beats regenerating from scratch.
+      # The strongest class any rule that FIRED belongs to -- an exact upper
+      # bound on the demand, at no cost.
       #
-      # The split matters, and getting it wrong was measured: with only this
-      # tolerant test driving the walk, a :medium request accepted boards
-      # scoring 108 against a band starting at 131, because the slack at the
-      # low edge let through the tier below -- 12 requests for medium returned
-      # 12 easy boards. The tolerance is there to forgive a board for
-      # OVERSHOOTING what was asked, not to excuse the search from looking.
-      def self.accepts?(tier, score)
-        range = band(tier)
-        return false if range.nil?
-        return true if in_band?(tier, score)
-        return slack(range[0]) >= range[0] - score if score < range[0]
-        slack(range[1]) >= score - range[1]
+      # Sound because the solve is deterministic and tries rules in a fixed
+      # order: a rule that declined at every step of the all-rules run
+      # declines at every step of a run without it, since the two runs visit
+      # exactly the same states. So the set of rules that fired is enough to
+      # finish the board, and the weakest DEMAND_SET containing all of them is
+      # therefore enough too. Note this needs NOTHING about prefixes -- any
+      # superset of the fired rules will do, which is why the upper bound is
+      # safe even if ORDER is re-ordered. demand_of's BREAK is the part that
+      # is not; see there.
+      def self.upper_bound(counts)
+        k = 0
+        counts.each_key do |name|
+          level = RULE_LEVEL[name]
+          # A rule added to Techniques::ORDER and forgotten in DEMAND_SETS is
+          # treated as the STRONGEST class, for UNKNOWN_WEIGHT's reason: the
+          # safety net firing should make a board look harder than it is, never
+          # silently free.
+          level = DEMANDS.size - 1 if level.nil?
+          k = level if level > k
+        end
+        k
       end
 
-      # The slack allowed at a band edge: a flat number of points, or a
-      # percentage of the edge, whichever is the more generous. See
-      # TOLERANCE_POINTS for why it has to be both.
-      def self.slack(edge)
-        by_percent = (edge * TOLERANCE_PERCENT) / 100
-        by_percent > TOLERANCE_POINTS ? by_percent : TOLERANCE_POINTS
+      # The rung a board sits on: its demand class picks the run of tiers, and
+      # the score picks within that run -- which only :singles is wide enough
+      # to allow. An unknown demand has no tier rather than a wrong one.
+      def self.tier_for(demand, score)
+        range = DEMAND_RANGE[demand]
+        return nil if range.nil?
+        i = range[0]
+        edges = DEMAND_EDGES[demand]
+        if edges
+          j = 0
+          while j < edges.size && score > edges[j]
+            i += 1
+            j += 1
+          end
+        end
+        # Cannot happen while every class has width-1 edges (a test pins that),
+        # but a table typo must not index off the end of TIERS.
+        i = range[1] if i > range[1]
+        TIERS[i]
+      end
+
+      # Where a tier sits on the ladder. A reject (nil) and an unknown name
+      # both rank BELOW every real tier, so neither can win an "is this hard
+      # enough?" comparison by accident -- which is what Generator's monotone
+      # dismissal leans on.
+      def self.rank(tier)
+        i = TIERS.index(tier)
+        i.nil? ? -1 : i
       end
 
       def self.rate(values)

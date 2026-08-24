@@ -48,186 +48,254 @@ assert('Rater weights rank locked candidates below the pairs') do
   end
 end
 
-assert('Rater bands tile the whole score range with no gap or overlap') do
+assert('Rater has five rungs, named so the font can print them') do
   r = Redoku::Sudoku::Rater
-  # The tier table is meant to be data-driven so that adding levels is a
-  # change to CEILING and TIERS alone. This pins the derivation rather than
-  # the current three values: every band starts exactly one point above the
-  # previous band's ceiling, the first starts at zero, and the last is open.
-  assert_equal(r::TIERS.size, r::CEILING.size)
-  assert_equal(0, r.band(r::TIERS[0])[0])
+  assert_equal([:easy, :medium, :hard, :expert, :master], r::TIERS)
+  # Font::GLYPHS holds A-Z 0-9 space - : . and NOTHING else, and Font.draw
+  # silently draws nothing for a missing glyph while still advancing the
+  # cursor -- so :very_hard would print as "VERY", a gap, "HARD", with no
+  # error anywhere and no test to catch it. Every rung name is checked against
+  # the real glyph table, which is the only thing that can settle it.
+  r::TIERS.each do |tier|
+    tier.to_s.upcase.each_char do |ch|
+      assert_true Redoku::Font::GLYPHS.has_key?(ch)
+    end
+  end
+end
+
+assert('Rater demand classes tile the tier ladder with no gap or overlap') do
+  r = Redoku::Sudoku::Rater
+  # The ladder is meant to be data: adding a rung is an edit to TIERS,
+  # DEMAND_RANGE and DEMAND_EDGES and nothing else. This pins the DERIVATION
+  # rather than today's five values.
+  assert_equal(r::DEMAND_SETS.size, r::DEMANDS.size)
+  assert_equal(r::DEMANDS.size, r::DEMAND_RANGE.size)
+
+  # Each class owns a contiguous run of tiers; the runs abut, start at 0 and
+  # finish at the top rung. A gap would make a tier unreachable; an overlap
+  # would make a board's tier ambiguous.
+  expected_first = 0
+  r::DEMANDS.each do |demand|
+    range = r::DEMAND_RANGE[demand]
+    assert_false range.nil?
+    assert_equal(expected_first, range[0])
+    assert_true range[1] >= range[0]
+    expected_first = range[1] + 1
+  end
+  assert_equal(r::TIERS.size, expected_first)
+
+  # A class of width w needs exactly w-1 score edges: one boundary fewer than
+  # the rungs it spans. Absent means none, which is what every class but
+  # :singles has.
+  r::DEMANDS.each do |demand|
+    range = r::DEMAND_RANGE[demand]
+    edges = r::DEMAND_EDGES[demand] || []
+    assert_equal(range[1] - range[0], edges.size)
+    i = 1
+    while i < edges.size
+      assert_true edges[i] > edges[i - 1]
+      i += 1
+    end
+  end
+
+  # Only :singles is allowed to consult the score at all. That is the whole
+  # fix: today's TECHNIQUE_FLOOR could only ever RAISE a tier, so a big enough
+  # score promoted a singles-only board to the top -- measured, 55% of :hard
+  # boards. A class whose range is one tier wide cannot be promoted by volume.
+  assert_equal([140], r::DEMAND_EDGES[:singles])
+  assert_equal(1, r::DEMAND_RANGE[:singles][1] - r::DEMAND_RANGE[:singles][0])
+end
+
+assert('Rater demand sets are nested and cover exactly ORDER') do
+  r = Redoku::Sudoku::Rater
+  t = Redoku::Sudoku::Techniques
+  # DEFINED BY MEMBERSHIP, NOT BY INDEX, and this test is the guard rail on
+  # that. ORDER puts naked_triple AHEAD of hidden_pair for readability, so a
+  # ladder keyed on ORDER POSITIONS -- one rung per rule -- would let that
+  # cosmetic choice decide a tier, and it measured badly: the per-rule prefix
+  # ladder found 0 X-wing boards in 1467 where these four sets find 10 in 4852,
+  # because it filed them under "pair".
   i = 1
-  while i < r::TIERS.size
-    assert_equal(r::CEILING[i - 1] + 1, r.band(r::TIERS[i])[0])
+  while i < r::DEMAND_SETS.size
+    r::DEMAND_SETS[i - 1].each do |name|
+      assert_true r::DEMAND_SETS[i].include?(name)
+    end
+    assert_true r::DEMAND_SETS[i].size > r::DEMAND_SETS[i - 1].size
     i += 1
   end
-  assert_nil r.band(r::TIERS[r::TIERS.size - 1])[1]
-  # Ceilings ascend, or the bands would not be ordered by difficulty at all.
-  i = 1
-  while i < r::CEILING.size - 1
-    assert_true r::CEILING[i] > r::CEILING[i - 1]
-    i += 1
+
+  # The strongest set is ORDER, spelled out rather than referenced: rater.rb
+  # loads BEFORE techniques.rb (mrblib sorts full paths), so naming
+  # Techniques::ORDER in a constant expression would take the gem down at
+  # load. This assertion is what keeps the copy honest.
+  top = r::DEMAND_SETS[r::DEMAND_SETS.size - 1]
+  assert_equal(t::ORDER.size, top.size)
+  t::ORDER.each { |name| assert_true top.include?(name) }
+
+  # Every rule knows which class it belongs to, and it is the WEAKEST class
+  # that contains it.
+  t::ORDER.each do |name|
+    level = r::RULE_LEVEL[name]
+    assert_false level.nil?
+    assert_true r::DEMAND_SETS[level].include?(name)
+    assert_false r::DEMAND_SETS[level - 1].include?(name) if level > 0
   end
-  # An unknown tier has no band rather than a wrong one.
-  assert_nil r.band(:nonexistent)
+  # Triples sit with the PAIRS and are not a rung of their own. Boards that
+  # genuinely require a triple turned up on 1 chain in 500; boards requiring an
+  # X-wing on 10 in 500, ten times more common, because the subset rules all
+  # narrow toward the same fixed point while X-wing reasons across two units.
+  assert_equal(r::RULE_LEVEL[:naked_pair], r::RULE_LEVEL[:naked_triple])
+  assert_equal(r::RULE_LEVEL[:naked_pair], r::RULE_LEVEL[:hidden_triple])
+  assert_true r::RULE_LEVEL[:x_wing] > r::RULE_LEVEL[:hidden_triple]
 end
 
-assert('Rater.band_for places a score in exactly one band') do
+assert('every demand set is a contiguous prefix of ORDER, which is what makes demand_of sound') do
   r = Redoku::Sudoku::Rater
-  easy = r::TIERS[0]
-  hardest = r::TIERS[r::TIERS.size - 1]
-  assert_equal(easy, r.band_for(0))
-  assert_equal(easy, r.band_for(r::CEILING[0]))
-  # One point over the edge is the next band up -- the edges are exact here,
-  # and the tolerance lives in accepts? instead.
-  assert_equal(r::TIERS[1], r.band_for(r::CEILING[0] + 1))
-  # Nothing is too hard for the top band.
-  assert_equal(hardest, r.band_for(1_000_000))
-end
-
-assert('Rater.harder_tier takes the harder of two, and unknowns lose') do
-  r = Redoku::Sudoku::Rater
-  assert_equal(:hard, r.harder_tier(:easy, :hard))
-  assert_equal(:hard, r.harder_tier(:hard, :easy))
-  assert_equal(:medium, r.harder_tier(:medium, :medium))
-  # A typo must not silently promote a board.
-  assert_equal(:easy, r.harder_tier(:easy, :typo))
-  assert_equal(:easy, r.harder_tier(:typo, :easy))
-end
-
-assert('Rater.tier_for lets a technique raise the tier but never lower it') do
-  r = Redoku::Sudoku::Rater
-  # This is the composition that makes the rating worth having. The score
-  # alone is dominated by singles -- a board with more holes needs more of
-  # them -- so without a floor from the hardest technique, one X-wing
-  # disappears into forty naked singles and the rating is a clue count in
-  # disguise. HoDoKu's rule, which this is: the level cannot be lower than
-  # that of the hardest step, but a big enough score can push it higher.
-  easy_score = 0
-
-  # Nothing but singles: the score decides, and singles put no floor under
-  # anything because every board needs them.
-  assert_equal(r::TIERS[0], r.tier_for(easy_score))
-  assert_equal(r::TIERS[0], r.tier_for(easy_score, :naked_single))
-  assert_equal(r::TIERS[0], r.tier_for(easy_score, :hidden_single))
-
-  # An eliminator raises a trivially-scoring board off the bottom.
-  assert_equal(:medium, r.tier_for(easy_score, :pointing))
-  assert_equal(:medium, r.tier_for(easy_score, :naked_pair))
-  assert_equal(:hard, r.tier_for(easy_score, :x_wing))
-  assert_equal(:hard, r.tier_for(easy_score, :hidden_triple))
-
-  # But a floor never DROPS a board that scored its way up. A huge score with
-  # only an easy technique needed is still hard.
-  assert_equal(:hard, r.tier_for(1_000_000, :pointing))
-  assert_equal(:hard, r.tier_for(1_000_000, :naked_single))
-  assert_equal(:hard, r.tier_for(1_000_000))
-
-  # Every floor in the table is a real tier, or a board could be floored to
-  # nothing at all.
-  r::TECHNIQUE_FLOOR.each_key do |name|
-    assert_true r::TIERS.include?(r::TECHNIQUE_FLOOR[name])
+  t = Redoku::Sudoku::Techniques
+  # THE LOAD-BEARING ACCIDENT, PINNED. demand_of walks DOWN the ladder and
+  # BREAKS the moment a set fails to solve the board -- which needs
+  # "DEMAND_SETS[k-1] fails => DEMAND_SETS[k-2] fails", and that does NOT
+  # follow from nesting alone. Adding a rule that sits EARLIER in ORDER can
+  # pre-empt the rule the weaker run relied on and send the solve down a
+  # different path, so "a bigger set still solves it" is not free in general.
+  #
+  # It IS free when every set is a contiguous prefix of ORDER, and here is the
+  # argument, which is the one upper_bound already uses run backwards. Let F be
+  # the rules that fired in a successful run with set S. At every state the
+  # solver takes the FIRST rule in ORDER that fires, so no rule ahead of the
+  # one it took fired at that state -- membership or not. Therefore any T with
+  # F subset T subset ORDER takes exactly the same rule at every state, visits
+  # exactly the same states, and solves. If S is a prefix and T is a longer
+  # prefix then F subset S subset T, so T solves whenever S does; contrapose it
+  # and the downward break is sound.
+  #
+  # Nothing else pins this. ORDER's own comment says its ordering is a
+  # READABILITY choice and invites re-ordering, and today's boundaries happen
+  # to fall at positions 2 and 7 -- either side of the naked_triple /
+  # hidden_pair swap, not through it. Move one name across a boundary and the
+  # break silently starts mis-classifying boards, with no other test failing.
+  # So: this assertion, or delete the break from demand_of. Not neither.
+  r::DEMAND_SETS.each do |set|
+    set.each { |name| assert_true t::ORDER.include?(name) }
+    # A prefix of length n as a SET: every one of ORDER's first n names is in
+    # it, and nothing after them is. Order WITHIN the array is irrelevant --
+    # mask_of ORs bits -- which is why this asks about membership, not indices.
+    n = set.size
+    i = 0
+    while i < t::ORDER.size
+      assert_equal(i < n, set.include?(t::ORDER[i]))
+      i += 1
+    end
   end
-  # And singles are deliberately absent from it.
-  assert_false r::TECHNIQUE_FLOOR.has_key?(:naked_single)
-  assert_false r::TECHNIQUE_FLOOR.has_key?(:hidden_single)
 end
 
-assert('Rater.tier_for floors a stalled board short of the hardest tier') do
+assert('Rater.rank orders the tiers and puts a reject below all of them') do
   r = Redoku::Sudoku::Rater
-  # A stall says our eight rules ran out, which is a fact about our
-  # repertoire: a competent player knows XY-wing, swordfish and colouring and
-  # we implement none of them. So a stall may not be called hard on its own --
-  # it is the guess points in the score that do that. What the floor does
-  # guarantee is that such a board is never called EASY.
-  assert_equal(r::STALL_FLOOR, r.tier_for(0, nil, true))
-  assert_false r.tier_for(0, nil, true) == r::TIERS[0]
-  assert_false r.tier_for(0, nil, true) == r::TIERS[r::TIERS.size - 1]
-  # And a stall still cannot lower a board that scored higher.
-  assert_equal(:hard, r.tier_for(1_000_000, nil, true))
+  assert_equal(0, r.rank(:easy))
+  assert_equal(4, r.rank(:master))
+  assert_true r.rank(:expert) > r.rank(:hard)
+  # A reject and a typo both rank below every real tier, so neither can win a
+  # "is this hard enough?" comparison by accident.
+  assert_equal(-1, r.rank(nil))
+  assert_equal(-1, r.rank(:not_a_tier))
 end
 
-assert('Rater.in_band? is strict and accepts? forgives, in that order') do
+assert('Rater.tier_for lets the score speak only inside :singles') do
   r = Redoku::Sudoku::Rater
-  medium = r::TIERS[1]
-  range = r.band(medium)
-  lo = range[0]
-  hi = range[1]
+  edge = r::DEMAND_EDGES[:singles][0]
+  # The owner's "long, not clever" axis, and it is deliberately the BOTTOM of
+  # the ladder rather than the top: a singles-only board is easy when short and
+  # medium when long, and can be neither hard nor anything above it however
+  # many singles it takes.
+  assert_equal(:easy, r.tier_for(:singles, 0))
+  assert_equal(:easy, r.tier_for(:singles, edge))
+  assert_equal(:medium, r.tier_for(:singles, edge + 1))
+  assert_equal(:medium, r.tier_for(:singles, 1_000_000))
 
-  # Strict: the band and nothing but the band.
-  assert_true r.in_band?(medium, lo)
-  assert_true r.in_band?(medium, hi)
-  assert_false r.in_band?(medium, lo - 1)
-  assert_false r.in_band?(medium, hi + 1)
+  # Above :singles the score has nothing to say: a chain yields at most one or
+  # two boards of any given non-singles class, so a per-tier edge there would
+  # be a threshold that never fires.
+  assert_equal(:hard, r.tier_for(:locked, 0))
+  assert_equal(:hard, r.tier_for(:locked, 1_000_000))
+  assert_equal(:expert, r.tier_for(:subset, 0))
+  assert_equal(:expert, r.tier_for(:subset, 1_000_000))
+  assert_equal(:master, r.tier_for(:xwing, 0))
+  assert_equal(:master, r.tier_for(:xwing, 1_000_000))
 
-  # Tolerant: a near miss on either side is still acceptable.
-  assert_true r.accepts?(medium, lo - 1)
-  assert_true r.accepts?(medium, hi + 1)
-  # But not an arbitrary distance. This is the case that was actually wrong:
-  # driving the generator's walk with the tolerant test made a :medium request
-  # accept boards scoring 108 against a band starting at 131, and twelve
-  # requests for medium returned twelve easy boards.
-  assert_false r.accepts?(medium, lo - r.slack(lo) - 1)
-  assert_false r.accepts?(medium, hi + r.slack(hi) + 1)
-  # Which is only meaningful if the slack is smaller than the band it guards.
-  assert_true r.slack(lo) < hi - lo
-
-  # The open-ended top band forgives nothing above it, because there is no
-  # above it.
-  hardest = r::TIERS[r::TIERS.size - 1]
-  assert_true r.in_band?(hardest, 1_000_000)
-  assert_true r.accepts?(hardest, 1_000_000)
-  # An unknown tier accepts nothing.
-  assert_false r.accepts?(:nonexistent, 100)
-  assert_false r.in_band?(:nonexistent, 100)
+  # An unknown demand has no tier rather than a wrong one.
+  assert_nil r.tier_for(:not_a_demand, 100)
 end
 
-assert('Rater.slack is the more generous of a flat and a proportional margin') do
+assert('Rater.upper_bound reads the demand ceiling straight off the counts') do
   r = Redoku::Sudoku::Rater
-  # Both forms are needed because the metric spans two orders of magnitude: a
-  # percentage is meaningless at the easy end and a flat number of points is
-  # meaningless at the hard end. Stolen from super-sudoku, whose accept test
-  # is `relative < 20% || absolute < 3` for exactly this reason.
-  assert_equal(r::TOLERANCE_POINTS, r.slack(0))       # flat form wins small
-  assert_true r.slack(100_000) > r::TOLERANCE_POINTS  # proportional wins big
-  assert_equal((100_000 * r::TOLERANCE_PERCENT) / 100, r.slack(100_000))
-  # Monotone: a higher edge never gets less slack.
-  assert_true r.slack(1000) >= r.slack(100)
+  # FREE, and this is why the classifier costs about one solve. The solve is
+  # deterministic and tries rules in a fixed order, so a rule that DECLINED at
+  # every step of the all-rules run declines at every step of a run without it
+  # -- the two runs visit the same states. So the board is finished by the
+  # weakest DEMAND_SET containing every rule that fired, and that is a table
+  # lookup over `counts`.
+  assert_equal(0, r.upper_bound({}))
+  assert_equal(0, r.upper_bound({ naked_single: 30, hidden_single: 4 }))
+  assert_equal(1, r.upper_bound({ naked_single: 30, pointing: 1 }))
+  assert_equal(2, r.upper_bound({ pointing: 2, naked_triple: 1 }))
+  assert_equal(3, r.upper_bound({ naked_single: 1, x_wing: 1 }))
+  # A rule added to Techniques::ORDER and forgotten in RULE_LEVEL must make a
+  # board look HARDER, never free -- the UNKNOWN_WEIGHT convention.
+  assert_equal(r::DEMANDS.size - 1, r.upper_bound({ some_future_rule: 1 }))
+end
+
+assert('Rater.demand_of confirms the weakest set, because firing is not needing') do
+  r = Redoku::Sudoku::Rater
+  # The leave-one-out result that decides the whole design: over 120 generated
+  # boards, the only rule ever INDIVIDUALLY indispensable was hidden_single
+  # (3 boards). Pointing, both pairs, both triples and X-wing were never
+  # necessary on their own, because the eliminators are confluent -- whenever
+  # one was used, some other rule reached the same fixed point. So "which rule
+  # fired" cannot be the tier, and demand_of has to confirm by re-solving with
+  # the weaker set.
+  easy = values_of(EASY_81)
+  assert_equal(:singles, r.demand_of(easy, { naked_single: 2 }))
+  # Hand it counts CLAIMING an X-wing fired on a board singles can finish: the
+  # upper bound says :xwing, the confirming solves walk it all the way back
+  # down to :singles. This is the assertion that pins "set inclusion, then
+  # confirm" rather than "the hardest rule that fired".
+  assert_equal(:singles, r.demand_of(easy, { x_wing: 1 }))
+  assert_equal(:singles, r.demand_of(easy, { pointing: 3, naked_pair: 1 }))
 end
 
 assert('Rater.measure reports a finished board as needing nothing') do
   r = Redoku::Sudoku::Rater
   m = r.measure(solved_values)
   assert_equal(0, m[:score])
-  assert_equal(0, m[:guesses])
-  assert_equal(0, m[:technique_points])
   assert_equal({}, m[:counts])
   assert_nil m[:hardest]
   assert_true m[:solved]
-  assert_equal(r::TIERS[0], m[:tier])
+  assert_equal(:singles, m[:demand])
+  assert_equal(:easy, m[:tier])
 end
 
-assert('Rater.measure adds guess points only for what techniques cannot finish') do
+assert('Rater.measure answers tier nil for a board our rules cannot finish') do
   r = Redoku::Sudoku::Rater
-  # The two measurements compose in series: cost is taken on the RESIDUAL
-  # board the technique solver stalled in, so it means "guessing still needed
-  # after human technique is exhausted" rather than "guessing a machine needs
-  # from scratch". A board the techniques finish therefore scores no guess
-  # points at all, however much a search would have flailed on it.
-  easy = r.measure(values_of(EASY_81))
-  assert_true easy[:solved]
-  assert_equal(0, easy[:guesses])
-  assert_equal(easy[:technique_points], easy[:score])
+  # A CONTRACT CHANGE, and the reason every caller has to be read: today's
+  # measure always named a tier, flooring a stall at :medium and letting guess
+  # points push it up. Under the no-guessing rule a board the eight rules
+  # cannot finish is a REJECT -- not a hard puzzle, not a puzzle at all -- and
+  # nil is how it says so. 199 of 4852 chain boards (4%) are rejects, and
+  # because they crowd the chain floor, 109 of 500 chain FLOORS (22%) are.
+  m = r.measure(values_of(MULTI_81))
+  assert_nil m[:tier]
+  assert_nil m[:demand]
+  assert_nil m[:score]
+  assert_false m[:solved]
+  # The counts of the partial solve still come back: they are what the caller
+  # would log, and throwing them away would make a reject undiagnosable.
+  assert_false m[:counts].nil?
 
-  # MULTI_81 has three givens: no technique can force anything, so it stalls
-  # immediately and the whole board is guesswork.
-  multi = r.measure(values_of(MULTI_81))
-  assert_false multi[:solved]
-  assert_true multi[:guesses] > 0
-  assert_equal(multi[:technique_points] + (multi[:guesses] * r::GUESS),
-               multi[:score])
-  # And it is not rated easy.
-  assert_false multi[:tier] == r::TIERS[0]
+  # rate and score answer nil for the same board, so no caller can turn a
+  # reject into arithmetic by accident.
+  assert_nil r.rate(values_of(MULTI_81))
+  assert_nil r.score(values_of(MULTI_81))
+  assert_nil r.rate(Array.new(81, 0))
 end
 
 assert('Rater.measure scores a board with more holes above one with fewer') do
@@ -248,11 +316,10 @@ assert('Rater.rate and Rater.score agree with measure') do
   m = r.measure(values)
   assert_equal(m[:tier], r.rate(values))
   assert_equal(m[:score], r.score(values))
-  # Every board gets a real tier; rate never answers nil.
-  [SOLVED_81, EASY_81, UNIQUE_81, MULTI_81].each do |board|
+  # Every board our rules FINISH gets a real rung.
+  [SOLVED_81, EASY_81, UNIQUE_81].each do |board|
     assert_true r::TIERS.include?(r.rate(values_of(board)))
   end
-  assert_true r::TIERS.include?(r.rate(Array.new(81, 0)))
 end
 
 assert('Rater is deterministic and does not mutate the board it rates') do
@@ -277,11 +344,33 @@ assert('Rater.clue_count counts the filled cells') do
   assert_equal(0, r.clue_count(Array.new(81, 0)))
 end
 
-assert('Rater tiers are ordered easiest first') do
+assert('Rater classifies real boards by the weakest rule set that finishes them') do
   r = Redoku::Sudoku::Rater
-  assert_equal([:easy, :medium, :hard], r::TIERS)
-  # Nothing may assume there are exactly three: the owner wants five levels
-  # later, and everything here is derived from TIERS and CEILING so that
-  # adding them is a change to those two lists plus a recalibration.
-  assert_true r::TIERS.size >= 2
+  t = Redoku::Sudoku::Techniques
+
+  # Each fixture's class is asserted from the DEFINITION first -- the weakest
+  # DEMAND_SET that solves it -- so this test can fail demand_of rather than
+  # agreeing with it by construction.
+  locked = values_of(LOCKED_81)
+  assert_false t.solves?(locked, r::DEMAND_SETS[0])
+  assert_true t.solves?(locked, r::DEMAND_SETS[1])
+  assert_equal(:locked, r.measure(locked)[:demand])
+  assert_equal(:hard, r.measure(locked)[:tier])
+
+  subset = values_of(PAIR_81)
+  assert_false t.solves?(subset, r::DEMAND_SETS[1])
+  assert_true t.solves?(subset, r::DEMAND_SETS[2])
+  assert_equal(:subset, r.measure(subset)[:demand])
+  assert_equal(:expert, r.measure(subset)[:tier])
+
+  xwing = values_of(XWING_81)
+  assert_false t.solves?(xwing, r::DEMAND_SETS[2])
+  assert_true t.solves?(xwing, r::DEMAND_SETS[3])
+  assert_equal(:xwing, r.measure(xwing)[:demand])
+  assert_equal(:master, r.measure(xwing)[:tier])
+
+  # And the ceiling really is a ceiling: however long these boards are, none
+  # of them can be promoted past its class, and no singles-only board can
+  # reach any of their rungs.
+  assert_equal(:medium, r.tier_for(:singles, 10_000))
 end

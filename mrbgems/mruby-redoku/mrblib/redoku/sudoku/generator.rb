@@ -27,19 +27,21 @@ module Redoku
     # search assumes what that dip disproves.
     #
     # Walking from the SHALLOW end is what makes this affordable rather than
-    # merely correct. The first acceptable board is returned, so an easy
-    # request usually costs one rating and only a hard request pays for the
-    # whole window -- and the board it returns has the most clues of any that
-    # would have done, which is the one that looks most like the puzzle it
-    # claims to be.
+    # merely correct. The first board OF THE REQUESTED TIER is returned, so an
+    # easy request usually costs one rating and only a request for an upper
+    # rung pays for the whole window -- and the board it returns has the most
+    # clues of any that would have done, which is the one that looks most like
+    # the puzzle it claims to be.
     #
     # CLUE COUNT IS A GUARD RAIL, NOT A TARGET, which is a change from how
     # this worked before. Earlier versions sampled a clue count per tier and
     # dug to it, and the difficulty was whatever fell out; that fails because
     # clue count is a weak predictor -- measured here, 26-clue boards ran from
     # needing no guesses at all to needing more than most people want. Now the
-    # SCORE decides when to stop and the clue count is only a floor nothing
-    # may dig past. In practice the floor is never the binding constraint:
+    # TIER decides when to stop -- which since the demand rework means what the
+    # board logically DEMANDS, with the score separating only the bottom two
+    # rungs -- and the clue count is only a floor nothing may dig past. In
+    # practice the floor is never the binding constraint:
     # uniqueness under 180-degree symmetry stops the dig at 25 to 29 clues on
     # its own, measured over 20 boards, and a second and fourth pass over the
     # blocked pairs removed nothing further.
@@ -166,13 +168,21 @@ module Redoku
         puzzle
       end
 
-      # Walk the chain from the shallow end and return the first board the
-      # requested tier accepts, as [puzzle, measurement].
+      # Walk the chain from the shallow end and return the first board whose
+      # tier IS the requested one, as [puzzle, measurement].
       #
-      # If nothing on this chain is acceptable -- and that happens, one
-      # measured solution in four produced no board harder than easy anywhere
-      # along its whole chain -- the nearest miss comes back instead, and
-      # `generate` decides whether to spend another attempt on a fresh board.
+      # If nothing on this chain is that tier -- and that happens often, more
+      # often now that the upper rungs are gated on what a board demands
+      # rather than on how long it is -- the nearest REAL tier comes back
+      # instead, and `generate` decides whether to spend another attempt on a
+      # fresh board.
+      #
+      # [nil, nil] IS A POSSIBLE ANSWER, which it was not before: if every
+      # board in the window is a reject (our rules cannot finish it), there is
+      # no candidate to settle for. Rejects crowd the chain floor -- measured,
+      # 109 of 500 chain FLOORS are rejects against 199 of 4852 boards overall
+      # -- so this is a real case rather than a defensive one, and `generate`
+      # skips such an attempt.
       def self.dig(solution, tier, rng)
         chain = dig_chain(solution, rng)
         removals = chain[0]
@@ -183,69 +193,65 @@ module Redoku
         budget = MEASURE_BUDGET
         best = nil
         best_board = nil
-        near = nil
-        near_board = nil
 
         while k <= last && budget > 0
           board = board_at(solution, removals, k)
           m = Rater.measure(board)
           budget -= 1
 
-          # Squarely in the requested band: done, and this is the shallowest
-          # such board because the walk started shallow.
-          return [board, m] if Rater.in_band?(tier, m[:score])
+          # EXACT TIER MATCH, not a score band. With a discrete class deciding
+          # the tier there is no near miss to forgive, so the two-tier
+          # strict/tolerant accept that CEILING needed is gone: it was solving
+          # a problem that only exists when a continuous score decides a
+          # discrete tier.
+          return [board, m] if m[:tier] == tier
 
-          # Near enough to settle for, if nothing better turns up. Held back
-          # rather than returned, because a board further down the chain may
-          # still land in the band properly -- see Rater.accepts? for what
-          # went wrong when the tolerant test drove the walk directly.
-          if Rater.accepts?(tier, m[:score]) && (near.nil? || closer?(m, near, tier))
-            near = m
-            near_board = board
-          end
-
-          if best.nil? || closer?(m, best, tier)
+          # A reject is not a candidate for anything. It is not a hard puzzle,
+          # it is not a puzzle: our rules cannot finish it, so a player would
+          # have to guess.
+          if !m[:tier].nil? && (best.nil? || closer?(m, best, tier))
             best = m
             best_board = board
           end
           k += 1
         end
 
-        return [near_board, near] unless near.nil?
         [best_board, best]
       end
 
-      # Is `a` a better answer than `b` for this request? Tier distance first,
-      # then score distance from the band, so two candidates in the same wrong
-      # tier are separated by which is nearer to being right.
+      # Is `a` a better answer than `b` for this request? Tier distance alone
+      # now: the score cannot separate two candidates in different demand
+      # classes in any way that means anything (a chain yields at most one or
+      # two boards of any non-singles class), and inside :singles the tier
+      # already carries the score's one distinction. Equal is not closer, so
+      # the first candidate found wins a tie and the search stays
+      # deterministic.
       def self.closer?(a, b, tier)
-        da = tier_distance(a[:tier], tier)
-        db = tier_distance(b[:tier], tier)
-        return true if da < db
-        return false if da > db
-        score_distance(a[:score], tier) < score_distance(b[:score], tier)
+        tier_distance(a[:tier], tier) < tier_distance(b[:tier], tier)
       end
 
+      # How many rungs apart two tiers are. A reject or an unknown name is
+      # further away than any real tier, so it never wins.
       def self.tier_distance(got, wanted)
-        gi = Rater::TIERS.index(got)
-        wi = Rater::TIERS.index(wanted)
-        return Rater::TIERS.size if gi.nil? || wi.nil?
+        gi = Rater.rank(got)
+        wi = Rater.rank(wanted)
+        return Rater::TIERS.size if gi < 0 || wi < 0
         gi >= wi ? gi - wi : wi - gi
       end
 
-      # How far a score sits outside a tier's band; 0 when inside.
-      def self.score_distance(score, tier)
-        range = Rater.band(tier)
-        return 0 if range.nil?
-        return range[0] - score if score < range[0]
-        return 0 if range[1].nil? || score <= range[1]
-        score - range[1]
-      end
-
-      # Try until a board is accepted, then stop. If none is inside the budget,
-      # keep the attempt that came CLOSEST rather than returning nil: the game
-      # always has a board to draw, and an honest `tier:` in the reply beats a
-      # lie or a crash. The header then says what the player actually got.
+      # Try until a board of the requested tier is found, then stop. If none is
+      # inside the budget, keep the attempt that came CLOSEST rather than
+      # inventing one: an honest `tier:` in the reply beats a lie or a crash,
+      # and the caller decides what to do about the miss.
+      #
+      # NIL IS NOW POSSIBLE, and that is a deliberate contract change rather
+      # than a hole. It means no attempt found a single board our eight rules
+      # can finish, so there is nothing to hand back that a player could solve
+      # without guessing -- and under the no-guessing rule a board we cannot
+      # finish is a REJECT, not a hard puzzle. App#fill_board already guards
+      # for it (an unchanged board beats a wiped one); Task 4's progress bar
+      # and Task 5's retry semantics are what turn it into something the player
+      # sees.
       #
       # A real attempt cap, and this is worth stating because every one of the
       # five reference implementations read for this design got it wrong --
@@ -268,18 +274,16 @@ module Redoku
             grid: Grid.new(puzzle),
             solution: solution,
             tier: m[:tier],
+            demand: m[:demand],
             score: m[:score],
-            guesses: m[:guesses],
             hardest: m[:hardest],
             counts: m[:counts],
             clues: Rater.clue_count(puzzle)
           }
           # Strict here too, and for the same reason it is strict inside `dig`:
-          # while attempts remain, a fresh board is worth more than settling.
-          # The tolerance still decides the outcome, just at the end -- a
-          # tolerated board beats every other near miss on `closer?`, so if the
-          # attempts run out that is what comes back.
-          return candidate if Rater.in_band?(tier, m[:score])
+          # while attempts remain, a fresh board is worth more than settling
+          # for the nearest rung this chain happened to offer.
+          return candidate if m[:tier] == tier
           best = candidate if best.nil? || closer?(candidate, best, tier)
         end
         best
