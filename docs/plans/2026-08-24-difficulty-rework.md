@@ -1032,6 +1032,12 @@ deleted:
       # 120 -> reachable on 99% of chains, 140 -> 89%, 160 -> 75%, 180 -> 66%,
       # 200 -> 51%, 230 -> 29%. 140 keeps a clear gap above EASY's worst case
       # and leaves MEDIUM reachable on nine chains in ten.
+      #
+      # Those percentages are PER-CHAIN reachability measured under the DEEP
+      # walk. They are not a hit rate for a request, and they are not evidence
+      # about the shallow walk -- a request draws a fresh chain per attempt, so
+      # the hit rate at a cap of 12 is far higher than 89%. Do not quote 89% as
+      # "MEDIUM works nine times in ten".
       DEMAND_EDGES = { singles: [140].freeze }.freeze
 
       # Rule -> the index of the WEAKEST demand class that contains it. Built
@@ -1532,14 +1538,27 @@ assert('Generator.generate hits the two rungs the bottom of the ladder offers') 
   # 16.0 s -- inside `make test`. Their reachability is established once, by
   # the measurement script in this plan's Task 3, not by the suite.
   #
-  # WHY MEDIUM IS SAFE TO ASSERT at 89% per chain: `generate` draws a FRESH
-  # solution per attempt, so the six attempts of DEFAULT_ATTEMPTS are six
+  # WHY MEDIUM IS SAFE TO ASSERT, and READ THE FIRST LINE OF THIS BEFORE
+  # BELIEVING THE REST. The 89%-of-chains figure at EDGE 140 was measured under
+  # the DEEP walk, which is Task 3's code and does not exist yet -- this task
+  # still walks every rung from the shallow end. So the figure is NOT direct
+  # evidence for what this assertion does here, and treating it as such is the
+  # mistake this comment exists to stop.
+  #
+  # What carries it instead is an ARGUMENT, and it is worth checking rather than
+  # trusting: reachability is a property of the CHAIN, not of the direction it
+  # is walked. MEASURE_BUDGET (12 here, 16 after Task 3) exceeds the measured
+  # 8-to-12-board window between MAX_CLUES and the uniqueness floor, so both
+  # walks classify the whole window and find a MEDIUM board on exactly the same
+  # chains -- they differ only in WHICH one they hand back. On top of that,
+  # `generate` draws a FRESH solution per attempt, so DEFAULT_ATTEMPTS is six
   # independent chains and the miss probability is 0.11^6, about two in a
-  # million per seed. Reachability is also a property of the CHAIN and not of
-  # the walk direction -- MEASURE_BUDGET (12 here, 16 after Task 3) covers the
-  # whole measured 8-to-12-board window, so a shallow walk and a deep walk find
-  # a MEDIUM board on exactly the same chains and differ only in which one they
-  # return. That is why this assertion survives Task 3 unchanged.
+  # million per seed.
+  #
+  # The argument is why this assertion survives Task 3 unchanged. The
+  # MEASUREMENT under the shipped code lands in Task 3 Step 5, whose script
+  # prints a per-rung hit rate and whose output goes into that commit message.
+  # Until then, this is reasoning, not data.
   [:easy, :medium].each do |tier|
     3.times do |n|
       out = gen.generate(tier, Redoku::Rng.new(200 + (n * 7)))
@@ -1553,8 +1572,9 @@ end
 If a `:medium` seed here does miss, **do not weaken the assertion to
 `TIERS.include?`** — that would delete the only end-to-end evidence that the
 second rung is reachable at all. Swap the seed, and record in the commit
-message that the 89% figure came out lower than the design measured, because
-that is a finding about `DEMAND_EDGES[:singles]` and not about the test.
+message that `:medium` came out less reachable than the design's deep-walk
+measurement suggested, because that is a finding about
+`DEMAND_EDGES[:singles] = [140]` and not about the test.
 
 **Rewrite** `'Generator.generate always returns a playable puzzle, tier or
 not'` (`:286`). It is the one assertion in the file that encodes the exact
@@ -1591,23 +1611,36 @@ body skippable, and only because Task 3 Step 1's `'an impossible request comes
 back honest rather than empty'` asserts the non-nil case unconditionally on a
 seed chosen for it. If Task 3 is ever dropped, this one has to lose the guard.
 
-In `'Generator.generate never hands back a board that is barely dug'`
-(`:245`), change the tier list from `[:easy, :medium, :hard]` to
-`[:easy, :medium]` and pass an explicit small budget
-(`gen.generate(tier, Redoku::Rng.new(50), 6)`) for the same cost reason.
+**One edit, in one test:** in `'Generator.generate never hands back a board
+that is barely dug'` (`:245`) — and *only* there — change the tier list from
+`[:easy, :medium, :hard]` to `[:easy, :medium]` and pass an explicit small
+budget (`gen.generate(tier, Redoku::Rng.new(50), 6)`), for the cost reason in
+Global Constraint 6.
 
-**Leave `'Generator.dig walks from the shallow end, so easy keeps its clues'`
-(`:153`) alone in this task.** The earlier draft of this plan told you to
-"change its tier list", and it has no tier list — it calls `gen.dig` twice,
-once for `:easy` and once for `:hard`, on one chain, which is a single walk
-each and costs nothing. Task 2 does not change the walk direction, so its two
-assertions (`easy_clues >= hard_clues`, `easy_score <= hard_score`) should
-still hold: `:easy` still returns the shallowest match and a `:hard` request
-that cannot be met now settles for the nearest *tier*, which is the deepest
-board it looked at. **If it does fail, delete it** rather than repairing it —
-Task 3 Step 1 replaces it with `'only easy walks the shallow end of the
-chain'`, which asks the question properly, and Task 3 Step 4 deletes it in any
-case.
+**`'Generator.dig walks from the shallow end, so easy keeps its clues'`
+(`:153`) is NOT that test, and an earlier draft of this step named both.**
+Neither half of the instruction above applies to it:
+
+- **It has no tier list.** It calls `gen.dig` twice by hand, once for `:easy`
+  and once for `:hard`, on one chain. There is nothing to shorten.
+- **It cannot take a budget.** `dig(solution, tier, rng)` has no `attempts`
+  parameter — attempts are `generate`'s, and `dig` is one chain walk. There is
+  nothing to pass.
+
+An implementer following the old wording literally would have searched a
+25-line test for a list that is not in it and then improvised, which is how a
+plan turns into a guess. **So: leave `:153` alone in this task.** It costs
+nothing (two walks, no attempt loop), and Task 2 does not change the walk
+direction, so its two assertions (`easy_clues >= hard_clues`,
+`easy[1][:score] <= hard[1][:score]`) should still hold — `:easy` still returns
+the shallowest match, and a `:hard` request that cannot be met now settles for
+the nearest *tier*, which is the deepest board it looked at. Note the second of
+those is the shakier one: the score is **not** monotone along a chain
+(`generator.rb`'s own header records a chain running 223, 188, 274), so it holds
+because the fallback is deeper rather than by any guarantee. **If it fails,
+delete it** rather than repairing it — Task 3 Step 1 replaces it with `'only
+easy walks the shallow end of the chain'`, which asks the question properly on
+the named helpers, and Task 3 Step 4 deletes it in any case.
 
 - [ ] **Step 9: Run to GREEN**
 
@@ -3262,15 +3295,28 @@ from nowhere a second later.
 asserts `assert_equal 2, d.updates.size`. It now sees three: the splash flush,
 the bar's one DU repaint from inside the search, and the finished board.
 
-*(One, not several: `:easy` hits on its first attempt on every measured chain,
-so the block fires once, `progress_fill(1, 1 + 6)` is 87 px, and 87 ≥
-`PROGRESS_STEP_PX` — so exactly one paint. That arithmetic is what makes every
-count in Step 5 predictable, and it is worth re-deriving if any of `ATTEMPTS`,
-`PROGRESS_STEP_PX` or `PROGRESS_W` changes.)*
+*(One, not several: `:easy` hits on its first attempt on every one of 500
+measured chains, so the block fires once, `progress_fill(1, 1 + 6)` is 87 px,
+and 87 ≥ `PROGRESS_STEP_PX` — so exactly one paint. That is a property of the
+CONSTANTS, not of `GEN_SEED`, which is why this test and the one in Step 4a
+item 1 may keep exact counts where the two `:medium` tests may not. The
+`assert_true` below is what makes the dependency fail loudly instead of
+arithmetically.)*
 
 Update it, keeping its claim intact:
 
 ```ruby
+  # THE EXACT COUNTS BELOW ASSUME EXACTLY ONE BAR PAINT, and this line is the
+  # assumption rather than a comment about it. EASY hits on its first attempt
+  # on 500 of 500 measured chains, so the hook fires once; one paint follows iff
+  # that single step clears the throttle. Raise ATTEMPTS[:easy] to 60 and it
+  # does not (614/61 = 10 px), the bar paints ZERO times, and every count below
+  # is off by one for a reason nobody would find from the failure. So it fails
+  # here, with a reason.
+  assert_true Redoku::Renderer.progress_fill(
+    1, 1 + Redoku::Sudoku::Generator::ATTEMPTS[:easy]
+  ) >= Redoku::App::PROGRESS_STEP_PX
+
   # Exactly one update had reached the panel when the generator took its first
   # draw, and that update is the splash. Nought would mean the splash flush had
   # moved after the dig; more would mean something else is flushing in between
@@ -3323,7 +3369,18 @@ looser one". The `:easy` test keeps its exact count, because for `:easy` the
 arithmetic above pins it.
 
 1. **`'the action runs while the button is held down, not after it comes up'`
-   (`:720`).** Press New with a `TimelineWaiter`, `:easy`, so exact counts hold.
+   (`:720`).** Press New with a `TimelineWaiter`, `:easy`, so exact counts hold
+   — and this one *must* stay exact rather than counting by region, because its
+   whole subject is that the action happens **inside** the 200 ms hold.
+   `waiter.updates_at` is a positional fact about the sequence, and no region
+   count can express "this many updates had landed by the time the hold began".
+   - Open it with the same one-paint guard as Step 4, so the exactness has a
+     stated premise:
+     ```ruby
+       assert_true Redoku::Renderer.progress_fill(
+         1, 1 + Redoku::Sudoku::Generator::ATTEMPTS[:easy]
+       ) >= Redoku::App::PROGRESS_STEP_PX
+     ```
    - `assert_equal [3], waiter.updates_at` → `assert_equal [4], waiter.updates_at`
    - `d.updates[1]` and `[2]` were both the board rect; now `[1]` is the
      splash, `[2]` is the **bar** and `[3]` is the finished board. Assert the
@@ -3381,15 +3438,30 @@ arithmetic above pins it.
    between them", and keep the point it is actually making: the refused button
    flash still costs the player nothing.
 
-`'every button acknowledges its press, at the button, for the same 200 ms'`
-(`:657`) digs for real too, but every assertion in it indexes `d.updates[0]`,
-`d.rects[0]`, `d.rects[1]` and `waiter.calls` — all of which are the press
-flash's, and all of which come before any bar. **It should stay green. If it
-goes red, that is a real bug**: something is painting or flushing before
-`show_press`.
+**The audit for the other three, so that nothing is left exact by accident.**
+The rule applied: an exact count is allowed only where the number of bar paints
+follows from the *constants*, never from the seed or the attempt count.
 
-`'an App given no rng seeds itself from the clock'` (`:1508`) asserts only that
-a grid arrived, so the bar cannot touch it.
+- **`'every button acknowledges its press, at the button, for the same 200 ms'`
+  (`:657`)** — digs `:easy` for New and `:medium` for Level, so its paint count
+  genuinely varies. It carries **no** attempt-dependent assertion: every one
+  indexes `d.updates[0]`, `d.rects[0]`, `d.rects[1]` or `waiter.calls`, all of
+  which are the press flash's and all of which land before the first yield.
+  Nothing to change. **It should stay green. If it goes red, that is a real
+  bug** — something is painting or flushing before `show_press`.
+- **`'an App given no rng seeds itself from the clock'` (`:1508`)** — asserts
+  only that a grid arrived and is uniquely solvable. Bar-independent. Nothing to
+  change.
+- **`'the splash reaches the panel before generation starts'` (`:1450`)** —
+  `:easy`, so exact, and Step 4 gives it the one-paint guard. Same reasoning as
+  item 1: `spy.updates_at_first_draw` is positional by nature.
+
+So of the six real-generator tests: two need nothing, two keep exact counts
+behind a stated one-paint premise (both `:easy`, both positional by subject),
+and two count by region (both touching `:medium`, whose paint count varies with
+attempts). **If a future change makes `:easy` take more than one attempt, the
+guard line fails first and these turn into region counts too** — that is the
+intended failure, not a regression to patch by bumping a number.
 
 - [ ] **Step 5: Run to GREEN**
 
