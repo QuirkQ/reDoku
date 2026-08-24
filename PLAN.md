@@ -383,7 +383,19 @@ Pure Ruby, zero device dependencies (fully unit-testable on host).
   - **Medium**: 131–230 — more filling in, or one eliminator needed (31–41)
   - **Hard**: 231+ — a lot of filling in, or guessing beyond our eight
     rules (26–32)
-  - Measured 12/12 hit rate per tier at 56/87/153 ms on the build host.
+  - Measured 12/12 hit rate per tier at 56/87/153 ms on the build host — but
+    both halves of that sentence need a qualifier before anyone reads them as
+    "medium and hard are proven fine." 153 ms is the HARD tier's **median**,
+    not its typical case: across 13 seeds a hard dig on the same host ran
+    from 90 ms to 596 ms (§10), and it is that tail, not the median, that the
+    "few hundred ms" budget above has to survive. And "12/12 hit rate" means
+    only that the Rater agreed with its own bands 12 times out of 12 — an
+    internal self-consistency check, not evidence that a player would call
+    those boards easy, medium or hard. The owner's device playtest (§10)
+    tested the claim the numbers invite and contradicted it in the only
+    sense that matters: medium and hard both played far too easy, which is
+    why M2 closed with a follow-on milestone to rework difficulty into five
+    technique-gated tiers rather than shipping these three bands as final.
   - Bands are **calibrated against measurement, not borrowed**, and are
     derived from two ordered lists so that going to five levels is a table
     edit plus a recalibration.
@@ -420,7 +432,11 @@ Portrait, full screen 1404×1872:
 - **Font pipeline:** public-domain BDF bitmap fonts (Spleen family) packed at
   build time by `tools/fontpack.rb` into Ruby data tables; digits rendered at
   ~96 px via integer upscale of the largest face. Crisp-enough v1; swappable
-  later without touching the renderer.
+  later without touching the renderer. **Deferred as of M2** — `tools/` does
+  not exist in the tree. Digits ship instead as a 14× upscale of the
+  built-in 5×7 UI font, hitting this section's SIZE but not its METHOD; see
+  `font.rb`'s header comment, `renderer.rb`'s `DIGIT_SCALE`, and §10's M2
+  entry for the on-the-record deferral.
 - Givens black; user entries dark gray (visually distinct); check-marks and
   reject-flash use inversion.
 - Waveform discipline as in §3; a full GC16 refresh on screen transitions
@@ -556,6 +572,20 @@ tier the player **asked** for, not the tier the generator achieved, which can
 differ; the achieved tier is recorded on the App (`achieved_tier`) and M3 owns
 whether to surface it. See `App#fill_board` for why the read-out follows the
 button rather than the rating.
+
+**Difficulty was rejected on playtest, the same day.** M2's gate above is
+about mechanism — a board generates, rates and renders — and it was met.
+Difficulty was not. Playing on the device after M2 landed, the owner's own
+words: *"the amount of pre-filled in numbers for medium and hard make the
+sudoku's very easy."* That is device evidence, from the one test that
+actually matters for a difficulty label. A host-side measurement taken
+afterward does not merely echo the complaint, it sharpens it: 40 out of 40
+generated `:medium` boards solve by naked and hidden singles alone — the
+same techniques `:easy` is supposed to be limited to, so the two tiers are
+not reliably distinguishable by the only thing a player experiences. The
+next milestone reworks difficulty into five technique-gated tiers rather
+than patching these three bands; its own plan document is being written
+separately and is not restated here.
 
 **M3 — the game.** Recognizer + templates + `--record`; entries, erase
 gesture, Check, difficulty menu, win screen, state persistence. This is the

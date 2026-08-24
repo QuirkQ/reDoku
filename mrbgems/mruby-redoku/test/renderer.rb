@@ -241,9 +241,10 @@ assert('Renderer draws a splash the font can actually print') do
   # an unknown character and just advances the cursor, so a lowercase or
   # ellipsis character would render as blank space with no error at all.
   # Checking Renderer::SPLASH_TEXT itself, not a literal copied into this
-  # test, is what makes this a real guard: draw_splash's `text` parameter
-  # lets a caller pass anything, so a literal here would only ever cover
-  # itself, not the string draw_splash's default actually ships.
+  # test, is what makes this a real guard: draw_splash has no parameter any
+  # more (it draws SPLASH_TEXT and nothing else), but a literal here would
+  # still only ever cover itself, not the constant draw_splash actually
+  # ships, if the two were ever allowed to drift apart.
   text.each_char { |ch| assert_true !Redoku::Font::GLYPHS[ch].nil? }
 
   r.draw_splash
@@ -252,6 +253,24 @@ assert('Renderer draws a splash the font can actually print') do
   assert_true sw < bw
   # The splash lands inside the board area, so flush_board covers it.
   assert_true d.painted_within?(bx, by, bw, bh)
+end
+
+# draw_header prints `difficulty.to_s.upcase` (renderer.rb) with no glyph
+# check of its own — the same Font.draw-silently-draws-nothing hazard
+# SPLASH_TEXT is guarded against above, applied here to the tier list
+# instead. It costs nothing to check while the font only ever needs to print
+# :easy/:medium/:hard, but it stops mattering the moment it is skipped: the
+# owner has already decided to go to five tiers, and a name like
+# :very_hard would print as "VERY", a silent gap for the underscore, then
+# "HARD", with no error anywhere to catch it.
+assert('every Rater tier name has a glyph for each of its characters') do
+  Redoku::Sudoku::Rater::TIERS.each do |tier|
+    label = tier.to_s.upcase
+    label.each_char do |ch|
+      assert_true !Redoku::Font::GLYPHS[ch].nil?,
+                  "no glyph for #{ch.inspect} in tier label #{label.inspect}"
+    end
+  end
 end
 
 # SPLASH_SCALE is not handed to us the way DIGIT_SCALE is — Task 5a chose it,

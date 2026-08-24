@@ -6,7 +6,6 @@ module Redoku
   class Renderer
     WHITE = 255
     BLACK = 0
-    DIFFICULTIES = [:easy, :medium, :hard].freeze
     BUTTON_BORDER = 3
 
     # Givens print darker than the player's own entries (PLAN.md §8), so a
@@ -37,6 +36,17 @@ module Redoku
     # on layout.rb sorting before renderer.rb in mrblib's alphabetical load
     # order — true today ('l' < 'r'), and worth knowing if that ever stops
     # being true.
+    #
+    # The direction that would actually bite is the other one: mrblib's
+    # sudoku/ subdirectory sorts AFTER renderer.rb ('r' < 's'), so
+    # Sudoku::Grid is NOT loaded yet while this file's class body is
+    # executing. draw_digit and draw_puzzle reach Sudoku::Grid.col_of/row_of
+    # and Sudoku::Grid::CELLS below safely only because those references sit
+    # inside method bodies, which run on first call rather than at load —
+    # by then every mrblib file has loaded. Hoist one of those into a
+    # class-body constant the way SPLASH_SCALE hoists Layout::TITLE_SCALE
+    # right here, and it raises `NameError: uninitialized constant
+    # Redoku::Sudoku` at load, not at some later call.
     SPLASH_SCALE = Layout::TITLE_SCALE
 
     # The exact status text shown while the generator digs. A constant
@@ -105,9 +115,8 @@ module Redoku
       row = Sudoku::Grid.row_of(index)
       x, y, w, h = Layout.cell_rect(col, row)
       text = digit.to_s
-      gw = Font.width(text, DIGIT_SCALE)
-      gh = Font::HEIGHT * DIGIT_SCALE
-      Font.draw(@d, text, x + (w - gw) / 2, y + (h - gh) / 2, DIGIT_SCALE, gray)
+      tx, ty = centered_origin(text, DIGIT_SCALE, x, y, w, h)
+      Font.draw(@d, text, tx, ty, DIGIT_SCALE, gray)
       self
     end
 
@@ -133,19 +142,28 @@ module Redoku
     # rather than a wider area, is also what lets the caller's existing
     # flush_board cover exactly the region this dirties — a second flush
     # region would be a second way to do the one thing flush_board does.
-    # `text` defaults to SPLASH_TEXT rather than requiring every caller to
-    # pass it, so the only string that ever reaches here is the one already
-    # proven to have a glyph for every character. Note for anyone tempted to
-    # "fix" the result: board_rect's white fill leaves the 2 px frame
-    # overhang (see flush_board) untouched, so a thin dark hairline stays
-    # visible around the splash — that is the SAME invariant flush_board
-    # already relies on (the overhang never receives white), not a bug.
-    def draw_splash(text = SPLASH_TEXT)
+    # No parameter. An earlier version took `text = SPLASH_TEXT`, which
+    # closed the default path but not the method: a caller could still write
+    # `draw_splash('Generating...')` and paint a blank board under a fully
+    # green suite, because Font.draw silently draws NOTHING for a character
+    # it has no glyph for (lowercase, a real ellipsis). No caller ever passed
+    # one, so the parameter was pure liability with no offsetting use — a
+    # glyph-check inside the method would have closed the same hole but kept
+    # the liability alive for the next caller to trip over. Removing it means
+    # the only string this method can ever draw is SPLASH_TEXT, which is
+    # already pinned and glyph-asserted once (test/renderer.rb) rather than
+    # trusted anew at every call site.
+    #
+    # Note for anyone tempted to "fix" the result: board_rect's white fill
+    # leaves the 2 px frame overhang (see flush_board) untouched, so a thin
+    # dark hairline stays visible around the splash — that is the SAME
+    # invariant flush_board already relies on (the overhang never receives
+    # white), not a bug.
+    def draw_splash
       x, y, w, h = Layout.board_rect
       @d.fill_rect(x, y, w, h, WHITE)
-      tw = Font.width(text, SPLASH_SCALE)
-      th = Font::HEIGHT * SPLASH_SCALE
-      Font.draw(@d, text, x + (w - tw) / 2, y + (h - th) / 2, SPLASH_SCALE, BLACK)
+      tx, ty = centered_origin(SPLASH_TEXT, SPLASH_SCALE, x, y, w, h)
+      Font.draw(@d, SPLASH_TEXT, tx, ty, SPLASH_SCALE, BLACK)
       self
     end
 
@@ -223,10 +241,20 @@ module Redoku
 
       label = name.to_s.upcase
       scale = Layout::BUTTON_LABEL_SCALE
-      Font.draw(@d, label,
-                x + (w - Font.width(label, scale)) / 2,
-                y + (h - Font::HEIGHT * scale) / 2,
-                scale, ink)
+      lx, ly = centered_origin(label, scale, x, y, w, h)
+      Font.draw(@d, label, lx, ly, scale, ink)
+    end
+
+    # Where to put `text` at `scale` so it lands centred inside the rect
+    # (x, y, w, h). One formula, one place: draw_digit, draw_splash and
+    # draw_button each used to recompute
+    # `x + (w - Font.width(t, s)) / 2, y + (h - Font::HEIGHT * s) / 2` by
+    # hand, which is three chances for the rounding to quietly drift apart
+    # rather than one.
+    def centered_origin(text, scale, x, y, w, h)
+      tw = Font.width(text, scale)
+      th = Font::HEIGHT * scale
+      [x + (w - tw) / 2, y + (h - th) / 2]
     end
   end
 end

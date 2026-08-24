@@ -86,7 +86,7 @@ module Redoku
       @signals = signals
       @clock = clock
       @rng = rng
-      @difficulty = Renderer::DIFFICULTIES[0]
+      @difficulty = Sudoku::Rater::TIERS[0]
       # No puzzle until something asks for one. Generation is a search of tens
       # of milliseconds here and PLAN.md §7 budgets a few hundred on the
       # device, so it does not belong in a constructor that every test — and
@@ -602,7 +602,7 @@ module Redoku
     # expensive half. Doing it the other way round would leave the old tier's
     # name over the new tier's board for the whole search.
     def cycle_difficulty
-      list = Renderer::DIFFICULTIES
+      list = Sudoku::Rater::TIERS
       @difficulty = list[(list.index(@difficulty) + 1) % list.size]
       @renderer.draw_header(@difficulty)
       @renderer.flush_header
@@ -639,6 +639,17 @@ module Redoku
     # re-request, a menu), and it has the value to do so.
     def fill_board
       puzzle = Sudoku::Generator.generate(@difficulty, @rng)
+      # Guarded rather than trusted. Today `generate` cannot return nil: an
+      # invariant spread across dig/generate in generator.rb guarantees the
+      # walk always has a board to hand back, however far it is from the
+      # requested tier. That invariant is about to be given up on purpose by
+      # the difficulty rework (five technique-gated tiers, PLAN.md §10's
+      # follow-on), so this checks for the nil that rewrite is expected to
+      # introduce rather than waiting to find out from a crash. On a nil
+      # result the puzzle already on the board is kept as-is — an unchanged
+      # board beats a wiped one — and the caller's splash is left showing,
+      # which is honest: nothing new was actually dug.
+      return self if puzzle.nil?
       @grid = puzzle[:grid]
       # Kept, not used. M3's Check needs the answer and the generator has
       # already paid for computing it, so throwing it away would mean digging

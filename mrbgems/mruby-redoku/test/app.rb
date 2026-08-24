@@ -504,7 +504,7 @@ assert('the acknowledgement runs each action exactly once') do
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
     # One step per tap: a press that ran cycle_difficulty twice would skip a
     # difficulty, and one that dropped it would stay put.
-    assert_equal Redoku::Renderer::DIFFICULTIES[(i + 1) % 3], app.difficulty
+    assert_equal Redoku::Sudoku::Rater::TIERS[(i + 1) % 3], app.difficulty
     # Exactly one header flush per tap, exactly as before. What changed is how
     # it is counted: Level now digs a puzzle as well as renaming the tier, and
     # new_puzzle's two board flushes are GL16 chrome too, so counting GL16
@@ -654,7 +654,7 @@ assert('a tap on Level cycles the difficulty and repaints the header') do
     d.clear_calls
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
-    expected = Redoku::Renderer::DIFFICULTIES[(i + 1) % 3]
+    expected = Redoku::Sudoku::Rater::TIERS[(i + 1) % 3]
     assert_equal expected, app.difficulty
     # press flash, header, splash, puzzle, release flash. Was three before
     # M2, when Level only renamed the tier; the two extra are the board the
@@ -1158,13 +1158,6 @@ def press_pen_button(app, name)
   app.handle_sample(pen_sample(x + w / 2, y + h / 2, true))
   app.handle_sample(pen_sample(x + w / 2, y + h / 2, false))
   app
-end
-
-assert('Rater tiers and Renderer difficulties are the same list') do
-  # Pinned because they are consumed as interchangeable: App cycles the
-  # renderer's list and hands the result to the generator as a tier. If they
-  # ever diverge, this fails here instead of silently drawing a wrong label.
-  assert_equal Redoku::Sudoku::Rater::TIERS, Redoku::Renderer::DIFFICULTIES
 end
 
 assert('App holds a generated puzzle once it has one') do
