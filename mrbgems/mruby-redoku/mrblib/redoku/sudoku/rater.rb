@@ -254,6 +254,16 @@ module Redoku
       # stalled board -- small, and worth saying so rather than claiming a win.
       # The expensive half of a stalled board is Techniques.solve itself, at
       # 8.6-28.1 ms, because hidden_triple and x_wing are dear to DECLINE.
+      #
+      # And it is NOT why `make test` got faster in the commit that made this
+      # change. MEASURED, by running the new rating code with the real
+      # generator still behind test/app.rb's `new_app` and then with the
+      # FakeGenerator: 8.93 s against 5.41 s, where the OLD rating code with
+      # the real generator was 7.01 s. So the demand ladder is about 1.9 s
+      # DEARER per suite (+27%) even with Solver.cost already removed, and the
+      # whole observed speedup is the FakeGenerator switch, which more than
+      # covers it. demand_of buys accuracy with up to three extra solves per
+      # board; do not cite this paragraph as evidence that it is cheaper.
       def self.measure(values)
         result = Techniques.solve(values)
         unless result[:solved]
@@ -279,6 +289,26 @@ module Redoku
       end
 
       # The weakest DEMAND_SET that finishes this board.
+      #
+      # PRECONDITION, AND IT IS NOT CHECKED: `counts` must come from a
+      # FULL-REPERTOIRE solve of THESE SAME `values` -- that is,
+      # `Techniques.solve(values)[:counts]` with no rule mask. `measure` is the
+      # only production caller and satisfies it by construction; anything else
+      # has to as well.
+      #
+      # What goes wrong otherwise is silent and one-directional. `counts` is
+      # only ever read by upper_bound, so counts that CLAIM a rule the board
+      # did not need cost nothing but time: the downward walk re-solves and
+      # corrects them all the way back down (the test
+      # 'Rater.demand_of confirms the weakest set' pins exactly that, handing
+      # it a fabricated x_wing on an easy board). Counts that OMIT a rule the
+      # board really did need are the hazard, because nothing re-solves
+      # upward: the bound starts too low, the walk can only go down from
+      # there, and the answer is a demand class too weak for the board. Pass
+      # XWING_81 with `{ naked_single: 1 }` and it answers :singles -- a wrong
+      # tier, with no error anywhere and no assertion to catch it. Task 3 adds
+      # callers, which is why this is written down rather than left as a
+      # property of the one call site.
       #
       # `counts` gives an exact upper bound for FREE (see upper_bound), and the
       # solve that produced it is one the caller needed anyway to know the

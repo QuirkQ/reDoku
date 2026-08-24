@@ -234,10 +234,16 @@ assert('Generator.generate never hands back a board that is barely dug') do
   # shallowest board on any chain is the COMPLETE SOLUTION, which scores zero
   # and sits comfortably inside the easy band. Without MAX_CLUES, an easy
   # request was answered with a finished sudoku.
-  # Two rungs and an explicit small budget, for cost: the upper rungs are
-  # gated on what a board DEMANDS now, so a :hard request pays its whole
-  # attempt cap on most chains rather than settling early, and this test is
-  # about MAX_CLUES rather than about reaching a tier.
+  # Two rungs rather than three, for cost: the upper rungs are gated on what a
+  # board DEMANDS now, so a :hard request pays its whole attempt cap on most
+  # chains rather than settling early, and this test is about MAX_CLUES rather
+  # than about reaching a tier.
+  #
+  # The explicit 6 is DEFAULT_ATTEMPTS today, so it changes nothing right now
+  # -- it is not a reduced budget and must not be read as one. It pins the cost
+  # of this test against a future rise in DEFAULT_ATTEMPTS, which Task 3 is
+  # going to make: a test whose subject is a clue-count guard rail has no
+  # reason to pay for a bigger search than it does today.
   [:easy, :medium].each do |tier|
     out = gen.generate(tier, Redoku::Rng.new(50), 6)
     assert_true out[:clues] <= gen::MAX_CLUES
