@@ -108,6 +108,16 @@ module Redoku
         i % 9
       end
 
+      # The inverse of row_of/col_of. It lives here, next to them, because the
+      # index layout (`row * 9 + col`) is Grid's rule: the input path has a
+      # (col, row) from Layout.cell_at and needs the flat index the renderer
+      # and this class both speak, and open-coding the multiplication at that
+      # call site would be a second copy of this rule in a file with no other
+      # reason to know it.
+      def self.index_of(col, row)
+        row * 9 + col
+      end
+
       def self.box_of(i)
         (i / 27) * 3 + (i % 9) / 3
       end

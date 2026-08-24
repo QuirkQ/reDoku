@@ -88,9 +88,7 @@ module Redoku
       bx, by, bw, bh = Layout.board_rect
       @d.fill_rect(bx, by, bw, bh, WHITE)
       10.times do |i|
-        # `== 0`, not `.zero?`: Integer#zero? is mruby-numeric-ext, which this
-        # gem does not depend on, so it is absent from its mrbtest state.
-        weight = i % 3 == 0 ? Layout::BLOCK_LINE : Layout::CELL_LINE
+        weight = boundary_weight(i)
         offset = weight / 2
         pos = i * Layout::CELL
         @d.fill_rect(bx + pos - offset, by - offset, weight, bh + weight, BLACK)
@@ -129,6 +127,48 @@ module Redoku
         next if grid.empty?(i)
         gray = grid.given?(i) ? GIVEN_GRAY : ENTRY_GRAY
         draw_digit(i, grid.value_at(i), gray)
+      end
+      self
+    end
+
+    # One cell, repainted from the model: white paper, the grid lines that
+    # touch it, and its digit if `grid` has one. This is what ERASING means
+    # here. Ink is drawn straight into the shared framebuffer (App#ink_to →
+    # Display#draw_line), so there is no ink buffer to undo and nothing to
+    # "unpaint" — the only way back is to paint the cell as it should look.
+    #
+    # `index` is a flat 0..80 cell index, Grid's own currency and draw_digit's
+    # too. `grid` may be nil: that is the board that has not been dug yet (an
+    # App holds no Grid until run or a New press asks for one, because
+    # generation is a search), and a cell with no model behind it still has to
+    # come clean — there is simply no digit to put back.
+    #
+    # Deliberately cell-at-a-time rather than pixel-accurate: a rub-out that
+    # cleared only the pixels the eraser passed over would need an ink journal
+    # or a per-cell backing store, and the game thinks in cells anyway. Touch
+    # the eraser anywhere in a cell and the cell clears.
+    #
+    # THE LIMIT WORTH KNOWING, since it follows from this being cell-exact:
+    # the brush is INK_WIDTH (4) px and stamped biased up-left (2 px up and
+    # left, 1 px down and right — see rm2_stamp), so ink written hard against
+    # a cell's LEFT or TOP edge lands up to 2 px inside the previous cell,
+    # where repainting this one cannot reach it. At a block boundary the 4 px
+    # line swallows all of that; at a 1 px cell boundary up to 2 px of it can
+    # survive as a hairline in the neighbour until the neighbour is erased
+    # too (or New repaints the board). The right and bottom edges have no such
+    # hole — 1 px of overshoot always lands on the next cell's own line.
+    # Widening the repaint into the neighbours would trade that hairline for
+    # something worse: shaving pixels off ink the player wrote in a cell they
+    # never touched.
+    def redraw_cell(index, grid)
+      col = Sudoku::Grid.col_of(index)
+      row = Sudoku::Grid.row_of(index)
+      x, y, w, h = Layout.cell_rect(col, row)
+      @d.fill_rect(x, y, w, h, WHITE)
+      redraw_cell_lines(col, row, x, y, w, h)
+      if grid && !grid.empty?(index)
+        gray = grid.given?(index) ? GIVEN_GRAY : ENTRY_GRAY
+        draw_digit(index, grid.value_at(index), gray)
       end
       self
     end
@@ -222,6 +262,54 @@ module Redoku
       x, y, w, h = Layout.button_rect(name)
       draw_button(name, x, y, w, h, ink, paper)
       @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
+    end
+
+    # The weight draw_board gives boundary `i` (0..9): every third boundary is
+    # a 3x3 block edge and gets the heavy line. One definition, two callers —
+    # draw_board and the per-cell restoration below — because a second copy of
+    # this rule could disagree with the board it is supposed to be restoring.
+    #
+    # `== 0`, not `.zero?`: Integer#zero? is mruby-numeric-ext, which this gem
+    # does not depend on, so it is absent from its mrbtest state.
+    def boundary_weight(i)
+      i % 3 == 0 ? Layout::BLOCK_LINE : Layout::CELL_LINE
+    end
+
+    # The four grid boundaries this cell touches, put back over the white fill
+    # — and CLIPPED to the cell, which is the whole subtlety here. draw_board
+    # centres each line ON its boundary (`offset = weight / 2`), so a line's
+    # band straddles two cells: the half of it inside this cell is what the
+    # white fill just ate and what has to come back, while the half in the
+    # neighbour was never touched. Painting the full weight instead would be
+    # black over black everywhere except at the board's outer edge, where it
+    # would put 2 px of new frame onto the white margin (see draw_splash's
+    # note on that overhang).
+    def redraw_cell_lines(col, row, x, y, w, h)
+      left = leading_band(col)
+      top = leading_band(row)
+      right = trailing_band(col + 1)
+      bottom = trailing_band(row + 1)
+      @d.fill_rect(x, y, left, h, BLACK) if left > 0
+      @d.fill_rect(x, y, w, top, BLACK) if top > 0
+      @d.fill_rect(x + w - right, y, right, h, BLACK) if right > 0
+      @d.fill_rect(x, y + h - bottom, w, bottom, BLACK) if bottom > 0
+    end
+
+    # How much of boundary `i`'s line falls inside the cell that STARTS there:
+    # the line is drawn from `weight / 2` px before the boundary, so the cell
+    # after it keeps the rest — 2 px of a block line, 1 px of a cell line.
+    def leading_band(i)
+      weight = boundary_weight(i)
+      weight - weight / 2
+    end
+
+    # ...and how much falls inside the cell that ENDS there: exactly the
+    # offset, so a block line contributes 2 px and a 1 px cell line
+    # contributes nothing at all — it sits wholly in the next cell, which is
+    # why that cell's last column and row are plain interior and come back
+    # white.
+    def trailing_band(i)
+      boundary_weight(i) / 2
     end
 
     def header_rect

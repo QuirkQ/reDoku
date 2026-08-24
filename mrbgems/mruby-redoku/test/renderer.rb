@@ -277,6 +277,165 @@ end
 # so its arithmetic gets its own assertion rather than trust. Picked to match
 # Layout::TITLE_SCALE (the header's scale) for visual consistency between the
 # two full-board-width texts the renderer prints.
+# --- redraw_cell: one cell repainted from the model, which is what erasing
+# with the pen's eraser end means (there is no ink buffer to undo; ink goes
+# straight into the shared framebuffer, so "erase" is "paint the cell as it
+# should look").
+#
+# An empty Grid, not nil, in the identity tests: the reference board carries
+# no digits either, so a grid with any given in the cell under test would make
+# the comparison fail for the right reason at the wrong time. nil gets its own
+# test below.
+def blank_grid
+  grid_of('.' * Redoku::Sudoku::Grid::CELLS)
+end
+
+assert('Renderer#redraw_cell restores a cell to exactly what draw_board drew') do
+  # The tightest statement of correctness available: after a redraw, every
+  # pixel of the cell AND of a 4 px margin around it is the colour a freshly
+  # drawn board has there. That is what catches the hazard a naive white fill
+  # of cell_rect walks into — draw_board centres each line ON its boundary,
+  # so a line's band straddles two cells and a full-cell white fill eats the
+  # half of it that lies inside this cell, leaving a 140 px gap in a grid line
+  # that no assertion about the cell's interior would ever notice.
+  #
+  # It also catches the opposite mistake: painting the restored line at full
+  # weight would put 2 px of new black on the white margin outside the board
+  # at cell 0, which the margin in this comparison covers.
+  #
+  # Cells 0 and 20 between them exercise both kinds of boundary on all four
+  # sides: cell 0 has block lines (4 px, offset 2) on its left and top and
+  # thin ones (1 px, offset 0) on its right and bottom, and cell 20 (col 2,
+  # row 2) has exactly the reverse.
+  [0, 20].each do |index|
+    ref = TestDisplay.new
+    Redoku::Renderer.new(ref).draw_board
+    d = TestDisplay.new
+    r = Redoku::Renderer.new(d)
+    r.draw_board
+    r.redraw_cell(index, blank_grid)
+
+    x, y, w, h = Redoku::Layout.cell_rect(Redoku::Sudoku::Grid.col_of(index),
+                                          Redoku::Sudoku::Grid.row_of(index))
+    pad = Redoku::Layout::BLOCK_LINE
+    bad = nil
+    py = y - pad
+    while bad.nil? && py < y + h + pad
+      px = x - pad
+      while bad.nil? && px < x + w + pad
+        got = d.gray_at(px, py)
+        want = ref.gray_at(px, py)
+        bad = [px, py, got, want] if got != want
+        px += 1
+      end
+      py += 1
+    end
+    assert_nil bad, "cell #{index}: [x, y, got, want] = #{bad.inspect}"
+  end
+end
+
+assert('Renderer#redraw_cell repaints the grid lines it painted over itself') do
+  # The identity test above compares against a board draw_board painted, so a
+  # redraw_cell that painted NOTHING at all would pass it. These pixels are
+  # therefore checked with draw_board's own rects discarded first: black here
+  # can only have come from redraw_cell.
+  #
+  # Bands, per side, from draw_board's `offset = weight / 2`: the cell that
+  # STARTS at a boundary keeps `weight - weight / 2` px of it (2 for a block
+  # line, 1 for a cell line) and the cell that ENDS there keeps `weight / 2`
+  # (2 for a block line, and none at all for a cell line, which sits wholly
+  # in the next cell).
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  r.draw_board
+  d.clear_calls
+  r.redraw_cell(0, blank_grid) # block left and top, thin right and bottom
+  x, y, w, h = Redoku::Layout.cell_rect(0, 0)
+  assert_equal 0, d.gray_at(x, y + h / 2)         # left block band, 2 px...
+  assert_equal 0, d.gray_at(x + 1, y + h / 2)
+  assert_equal 255, d.gray_at(x + 2, y + h / 2)   # ...and no wider
+  assert_equal 0, d.gray_at(x + w / 2, y)         # top block band, 2 px
+  assert_equal 0, d.gray_at(x + w / 2, y + 1)
+  assert_equal 255, d.gray_at(x + w / 2, y + 2)
+  # The thin lines on the far sides live in the NEXT cell, so this cell's own
+  # last row and column are interior and must come back white.
+  assert_equal 255, d.gray_at(x + w - 1, y + h / 2)
+  assert_equal 255, d.gray_at(x + w / 2, y + h - 1)
+
+  d.clear_calls
+  r.redraw_cell(20, blank_grid) # thin left and top, block right and bottom
+  x, y, w, h = Redoku::Layout.cell_rect(2, 2)
+  assert_equal 0, d.gray_at(x, y + h / 2)         # thin left band, 1 px...
+  assert_equal 255, d.gray_at(x + 1, y + h / 2)   # ...and no wider
+  assert_equal 0, d.gray_at(x + w / 2, y)         # thin top band, 1 px
+  assert_equal 255, d.gray_at(x + w / 2, y + 1)
+  assert_equal 0, d.gray_at(x + w - 1, y + h / 2) # right block band, 2 px...
+  assert_equal 0, d.gray_at(x + w - 2, y + h / 2)
+  assert_equal 255, d.gray_at(x + w - 3, y + h / 2) # ...and no wider
+  assert_equal 0, d.gray_at(x + w / 2, y + h - 1)   # bottom block band, 2 px
+  assert_equal 0, d.gray_at(x + w / 2, y + h - 2)
+  assert_equal 255, d.gray_at(x + w / 2, y + h - 3)
+end
+
+assert('Renderer#redraw_cell paints nothing outside the cell it was given') do
+  # Erasing is a one-cell operation: the flush region App picks is the cell's,
+  # so a rect painted outside it would be a pixel changed in the buffer that
+  # the panel is never told about — invisible on the device until some later
+  # full refresh, and invisible to a host test that only counts updates.
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  r.draw_board
+  d.clear_calls
+  r.redraw_cell(20, blank_grid)
+  x, y, w, h = Redoku::Layout.cell_rect(2, 2)
+  assert_nil d.gray_at(x - 1, y + h / 2)
+  assert_nil d.gray_at(x + w, y + h / 2)
+  assert_nil d.gray_at(x + w / 2, y - 1)
+  assert_nil d.gray_at(x + w / 2, y + h)
+  # ...and every black rect it did paint is inside the cell (painted_within?
+  # is an every-ink-rect check, not an any-ink-rect one).
+  assert_true d.painted_within?(x, y, w, h)
+end
+
+assert('Renderer#redraw_cell puts the model digit back in its own ink') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  grid = grid_of(EASY_81)
+  grid.set_entry(0, 1) # cell 0 is blank in EASY_81, so it can hold an entry
+  r.draw_board
+  d.clear_calls
+  r.redraw_cell(0, grid)
+  # The same two pixels the draw_puzzle test pins, for the same reason: cell
+  # 0's '1' has glyph row 0 '..#..', so column 2 of its 5-wide, 14x-scaled
+  # glyph is lit, and the glyph starts at x 107, y 221.
+  assert_equal Redoku::Renderer::ENTRY_GRAY, d.gray_at(140, 225)
+  assert_true d.glyph_in_cell?(0)
+
+  d.clear_calls
+  r.redraw_cell(1, grid) # cell 1's given is '2'
+  assert_equal Redoku::Renderer::GIVEN_GRAY, d.gray_at(265, 225)
+  assert_true d.glyph_in_cell?(1)
+end
+
+assert('Renderer#redraw_cell draws no digit for an empty cell or no board') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  grid = grid_of(EASY_81) # cell 80 is blank in EASY_81
+  r.draw_board
+  d.clear_calls
+  r.redraw_cell(80, grid)
+  assert_false d.glyph_in_cell?(80)
+
+  # nil is the board that has not been dug yet. An App is constructed without
+  # one (generation is a search, so it waits for run or a New press), and the
+  # cell still has to come clean — there is simply no digit to put back.
+  d.clear_calls
+  r.redraw_cell(80, nil)
+  assert_false d.glyph_in_cell?(80)
+  x, y, w, h = Redoku::Layout.cell_rect(8, 8)
+  assert_equal 255, d.gray_at(x + w / 2, y + h / 2)
+end
+
 assert('SPLASH_SCALE matches the header scale and fits the board') do
   scale = Redoku::Renderer::SPLASH_SCALE
   assert_equal Redoku::Layout::TITLE_SCALE, scale

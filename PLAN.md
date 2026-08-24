@@ -176,6 +176,14 @@ identified **by name**, never by eventN:
 | Touch | `pt_mt` | ABS_MT_POSITION_X 0..1403, _Y 0..1871, slots 0..31 |
 | Power | `snvs-powerkey` | KEY_POWER |
 
+`BTN_TOOL_RUBBER` in that first row was an inherited capability claim (from the
+driver and rm2fb's uinput clone) until 2026-08-24, when an evdev trace on the
+device made it a **measurement**: the eraser end reports `0141 0001` as it
+approaches and `0141 0000` as it withdraws, with `014a` (`BTN_TOUCH`) framing
+the contact in between — i.e. tool identity and contact arrive on separate
+bits, and 0x141 is `BTN_TOOL_RUBBER` (0x14f, the number to avoid, is
+`BTN_TOOL_QUADTAP`). That is what §6's erase is built on.
+
 Pen→screen transform: `sx = ABS_Y * 1404/15725`, `sy = 1872 − ABS_X * 1872/20967`.
 Touch→screen: `sx = X`, `sy = 1871 − Y` (1871, not 1872: row 1872 does not
 exist, and every mapped point has to be a real panel pixel — `Redoku::Touch`).
@@ -345,11 +353,51 @@ it prompts "write 1 … write 9" a few rounds, saves clouds to
 `/home/root/redoku/templates.local`, which the game loads on top of the
 shipped set — so the recognizer tunes itself to *your* handwriting cheaply.
 
-**Erase gesture: scribble-out.** A stroke set over a non-given, filled cell
-is an erase (not an entry) when its total path length exceeds ~4× the cell
-diagonal **and** it has ≥ 4 direction reversals. Recognized before digit
-matching. Given (clue) cells never erase. Misclassification risk is low
-because digit strokes are short; thresholds tuned in M3.
+**Erase: the pen's own eraser end** (shipped 2026-08-24, after M2). The
+Marker Plus's back end is a distinct evdev tool — `BTN_TOOL_RUBBER` (0x141,
+**not** 0x14f, which is `BTN_TOOL_QUADTAP`) → `RM2::Input::RUBBER` — reported
+on proximity entry exactly as `BTN_TOOL_PEN` is, with contact still arriving
+separately on `BTN_TOUCH`, so an eraser press differs from a tip press in that
+one bit. Confirmed on the owner's device by raw evdev trace: `0141 0001` as the
+eraser approaches, `014a 0001`/`014a 0000` for the contact, `0141 0000` as it
+withdraws.
+
+`App#handle_sample` reads that bit and hands it to `begin_stroke`, which
+**latches** it: `@mode` becomes `:erase` beside `:ink`, so a stroke can no more
+change ends halfway than it can change regions, and the digitizer latches the
+tool the same way (it cannot switch codes while the tool is in range). Each
+cell the eraser passes over is then repainted from the model by
+`Renderer#redraw_cell` — paper, that cell's share of the grid lines, and its
+digit if the Grid has one — because ink goes straight into the shared
+framebuffer with no journal behind it, so there is nothing to *undraw*.
+Consequences worth stating: a given repaints as a given, so a clue survives an
+eraser stroke; erasing is **cell-at-a-time**, since pixel-accurate rub-out
+would need an ink journal or a per-cell backing store and the game thinks in
+cells; and the eraser still presses buttons, because the chrome is not a
+writing surface and a tap is a tap. The flush is `DU` + `FAST_DRAW`, the pen
+echo's own waveform — undrawing has to feel like drawing — which also caps what
+this path may repaint: see `App#flush_ink` on why an `ENTRY_GRAY` digit needs
+`GL16` when M3 arrives.
+
+**Rejected alternative — the scribble-out gesture.** What this section
+specified until 2026-08-24, kept because the reasoning matters: *a stroke set
+over a non-given, filled cell is an erase (not an entry) when its total path
+length exceeds ~4× the cell diagonal **and** it has ≥ 4 direction reversals.
+Recognized before digit matching. Given (clue) cells never erase.
+Misclassification risk is low because digit strokes are short; thresholds
+tuned in M3.* It lost on three counts. It is not the gesture the hardware
+already offers — flipping the pen is what every reMarkable user does, and the
+owner's ask ("not always draw but also undraw") was for that affordance. It is
+far more expensive: a stroke buffer, path-length and direction-reversal
+metrics, threshold tuning on the device and a training corpus of its own (§9
+budgeted one), against a one-bit latch at pen-down. And it carries a
+misclassification risk the paragraph above concedes — a scribble and a hastily
+written digit live in the same feature space, where a tool bit lives in
+neither. The cost of choosing the eraser is recorded too: **a plain Marker,
+with no eraser end, then has no way to erase.** If that ever matters (a second
+player, a lost Marker Plus) the cheap answer is an Erase button in the existing
+button row — the row, the tap discipline, the acknowledgement flash and the
+finger path all exist already — and not the gesture.
 
 **Pre-classification guards:** strokes fully inside a cell's bounds only;
 tiny dots (< 8 px path) are discarded as accidental touches.
@@ -466,7 +514,9 @@ Portrait, full screen 1404×1872:
 1. **Unit (host, fast)**: sudoku engine, recognizer math, stroke
    classification, layout hit-testing — pure Ruby, no shim. Recognizer gets a
    corpus test: recorded strokes (captured once via `--record` during M3) must
-   classify ≥ threshold accuracy; erase-gesture corpus likewise.
+   classify ≥ threshold accuracy. (No erase-gesture corpus any more — §6's
+   scribble detector was dropped for the pen's eraser end, which needs no
+   training data.)
 2. **Protocol (Docker)**: a fake rm2fb server written in C inside
    `mruby-rm2/test/` using mrbtest's `mrb_<gem>_gem_test` scaffolding hook
    (the same pattern mruby-io uses to test its socket code). It forks a
@@ -478,6 +528,22 @@ Portrait, full screen 1404×1872:
    recorded "write 5 in cell (3,4)" stroke sequence, pull a screenshot,
    assert the printed 5 appears in the right cell region. Semi-automated:
    run from the Mac, eyeball + a couple of pixel-region asserts.
+
+**A permanent hole in that coverage: erasing can never be tested
+automatically.** This is a stated constraint of the test strategy, not a
+footnote. The injection rig in (3) drives rm2fb's `sendPen`
+(`libs/rm2fb/InputDevice.cpp`), which writes **only** `BTN_TOOL_PEN` — even
+though the uinput clone it builds advertises `BTN_TOOL_RUBBER` — so no
+sequence of injected strokes can produce an eraser event at all, and no
+screenshot assertion downstream of one can exist. Layer (1) covers the Ruby
+side completely and cheaply (an eraser sample is a pen sample with one array
+element changed: `test/app.rb`'s `eraser_sample`), and that is where every
+erase assertion in the suite lives. Everything below Ruby — that this
+digitizer really reports the tool, that the shim decodes it on the device,
+that a `DU` cell repaint reads as an erase on the panel — is **manual verify
+by flipping the pen on hardware, permanently**, unless someone patches
+rM2-stuff's `Input` message and `sendPen` to carry a tool flag. Treat any
+change to erase behaviour as unverified until that has been done by hand.
 
 **Device install (`device/install.sh`)** — as built, after on-device
 discovery of 3.27.3.0 (2026-08-21):
@@ -587,9 +653,25 @@ next milestone reworks difficulty into five technique-gated tiers rather
 than patching these three bands; its own plan document is being written
 separately and is not restated here.
 
-**M3 — the game.** Recognizer + templates + `--record`; entries, erase
-gesture, Check, difficulty menu, win screen, state persistence. This is the
-"playable via SSH" release.
+**M3 — the game.** Recognizer + templates + `--record`; entries, Check,
+difficulty menu, win screen, state persistence. This is the "playable via SSH"
+release.
+
+**Erase is off that list, and was M3's before it.** The pen's own eraser end
+landed on main on 2026-08-24, between M2 and M3, and supersedes the
+scribble-out gesture M3 was going to have to detect and tune (§6 keeps the
+gesture on the record as a rejected alternative, with what killed it). Three
+consequences for M3 itself. Its recogniser gets *simpler*: with no erase
+gesture to spot, every stroke set in a cell is a digit attempt, and the
+misclassification risk between a scribble and a hurried digit never arises. Its
+budget loses the erase-gesture corpus (§9). And it inherits the primitive it
+was going to need anyway — `Renderer#redraw_cell`, "this cell, repainted from
+the model" — which is exactly the step that replaces a cell's raw ink with a
+printed digit. The one thing M3 must not inherit blindly is the waveform: the
+eraser flushes `DU`, which is two-level, so the first repaint that puts a
+player's `ENTRY_GRAY` entry back on the glass needs `GL16` for that region
+(`App#flush_ink` says so at the point of choice). Erase behaviour on the device
+is manual-verify only, permanently — see §9.
 
 **M4 — the hijack.** Decoy document (`tools/mkdecoy.rb` generates the PDF +
 `{uuid}.metadata`/`.content`, installed by script, one xochitl restart to

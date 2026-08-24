@@ -182,6 +182,46 @@ def pen_away_sample(sx, sy)
   [s[0], s[1], 0, 0]
 end
 
+# The same packet with the pen's OTHER END in proximity: BTN_TOOL_RUBBER
+# where pen_sample has BTN_TOOL_PEN. The digitizer latches one tool code or
+# the other when the tool enters range and reports contact separately on
+# BTN_TOUCH, so an eraser press differs from a tip press in exactly this one
+# bit (mrbgems/mruby-rm2/src/input.c, and the device trace recorded in
+# .superpowers/sdd/2026-08-23-m2-sudoku-engine/design-pen-eraser.md).
+#
+# Everything below this line is the only coverage eraser behaviour can ever
+# have: PLAN.md §9's TCP injection rig writes BTN_TOOL_PEN and nothing else
+# (rm2fb's sendPen), so the device path is manual-verify only.
+def eraser_sample(sx, sy, down)
+  s = pen_sample(sx, sy, down)
+  [s[0], s[1], s[2], RM2::Input::RUBBER | (down ? RM2::Input::TOUCH : 0)]
+end
+
+# The flat 0..80 cell index a sample lands in — derived from the point the
+# transform actually produces, not the one the test asked for, because both
+# directions of Pen.to_screen round.
+def cell_index_of(sample)
+  x, y = screen_of(sample)
+  col, row = Redoku::Layout.cell_at(x, y)
+  Redoku::Sudoku::Grid.index_of(col, row)
+end
+
+# The white fill a cell repaint starts with, as TestDisplay records it. Asking
+# whether this rect is in d.rects is "that cell was repainted from the model",
+# without depending on anything else the repaint drew.
+def cell_fill(index)
+  x, y, w, h = Redoku::Layout.cell_rect(Redoku::Sudoku::Grid.col_of(index),
+                                        Redoku::Sudoku::Grid.row_of(index))
+  [x, y, w, h, 255]
+end
+
+def count_fills(display, index)
+  want = cell_fill(index)
+  n = 0
+  display.rects.each { |rect| n += 1 if rect == want }
+  n
+end
+
 # A touchscreen sample, built the same way from the screen point it should
 # land on. The pt_mt node reports no pressure and no BTN_TOOL/BTN_TOUCH:
 # RM2::Input::FINGER, set from the multitouch tracking id, is the whole of
@@ -347,6 +387,179 @@ assert('App inks the closing segment when the pen lifts in mid-motion') do
   assert_equal 1, d.lines.size
   assert_equal [p1[0], p1[1], p2[0], p2[1], Redoku::App::INK_WIDTH,
                 Redoku::App::INK_GRAY], d.lines[0]
+end
+
+# --- the eraser end. BTN_TOOL_RUBBER instead of BTN_TOOL_PEN, latched at
+# pen-down like every other stroke decision, and clearing whole cells rather
+# than pixels.
+
+assert('the eraser end clears the cell it touched instead of inking') do
+  app, d, = new_app
+  s = eraser_sample(300, 400, true)
+  index = cell_index_of(s)
+  app.handle_sample(s)
+  # No ink: ink_to only draws for @mode == :ink, and this stroke is :erase.
+  assert_equal [], d.lines
+  # ...and the cell was repainted from the model instead. The white fill is
+  # the first thing redraw_cell does, so it is also the first rect recorded.
+  #
+  # A white fill over the cell rect is the strongest thing a host test can say
+  # here, and the reason is the mock, not the assertion: ink is a draw_line
+  # and gray_at replays fill_rect calls, so no host test can watch a pixel of
+  # ink disappear (the same limit the 'tap on New clears the ink' test
+  # records). What the fill establishes is that every pixel of the cell was
+  # painted over; that the ink was under it is geometry, not observation.
+  assert_equal cell_fill(index), d.rects[0]
+end
+
+assert('the eraser puts the cell back the way the model has it') do
+  app, d, = new_app
+  app.new_puzzle
+  # The first given of the board App just dug, so the erased cell has a digit
+  # to come back. Bounded, not `while !given?`: an unbounded walk would spin
+  # off the end of a hypothetical zero-clue grid instead of failing.
+  given = nil
+  Redoku::Sudoku::Grid::CELLS.times do |i|
+    given = i if given.nil? && app.grid.given?(i)
+  end
+  assert_false given.nil?
+  col = Redoku::Sudoku::Grid.col_of(given)
+  row = Redoku::Sudoku::Grid.row_of(given)
+  x, y, w, h = Redoku::Layout.cell_rect(col, row)
+  d.clear_calls
+  app.handle_sample(eraser_sample(x + w / 2, y + h / 2, true))
+  assert_equal cell_fill(given), d.rects[0]
+  # The given is printed again, in given ink, inside its own cell — which the
+  # white fill above proves was cleared first.
+  assert_true d.glyph_in_cell?(given)
+  assert_true d.inked_grays.include?(Redoku::Renderer::GIVEN_GRAY)
+end
+
+assert('the eraser flushes the cell it cleared in the ink waveform') do
+  app, d, = new_app
+  s = eraser_sample(300, 400, true)
+  index = cell_index_of(s)
+  app.handle_sample(s)
+  assert_equal [], d.updates # nothing flushed while the stroke is open
+  app.flush_ink
+  x, y, w, h = Redoku::Layout.cell_rect(Redoku::Sudoku::Grid.col_of(index),
+                                        Redoku::Sudoku::Grid.row_of(index))
+  pad = Redoku::App::INK_WIDTH
+  # DU + FAST_DRAW, the pen echo's own waveform: erasing has to feel as
+  # immediate as drawing, and everything a repaint puts back on an M2 board is
+  # black on white, which is all a two-level waveform can carry anyway. The
+  # region is the cell, padded exactly as ink damage is (mark_dirty).
+  assert_equal 1, d.updates.size
+  assert_equal [x - pad, y - pad, w + 2 * pad, h + 2 * pad,
+                RM2::DU, RM2::FAST_DRAW], d.updates[0]
+end
+
+assert('an eraser drag clears every cell it crosses') do
+  app, d, = new_app
+  s1 = eraser_sample(300, 400, true)
+  s2 = eraser_sample(450, 400, true) # the next cell to the right
+  i1 = cell_index_of(s1)
+  i2 = cell_index_of(s2)
+  assert_false i1 == i2
+  app.handle_sample(s1)
+  app.handle_sample(s2)
+  assert_equal 1, count_fills(d, i1)
+  assert_equal 1, count_fills(d, i2)
+  # One flush for both, because erasing shares the pen's once-per-turn damage
+  # rect: the union covers the two cells.
+  app.flush_ink
+  assert_equal 1, d.updates.size
+end
+
+assert('the eraser repaints a cell once however many samples land in it') do
+  app, d, = new_app
+  s1 = eraser_sample(300, 400, true)
+  index = cell_index_of(s1)
+  app.handle_sample(s1)
+  app.handle_sample(eraser_sample(310, 410, true))
+  app.handle_sample(eraser_sample(320, 420, true))
+  app.handle_sample(eraser_sample(320, 420, false)) # lift, same cell
+  # A cell that has just been cleared cannot acquire new ink while the eraser
+  # is down, so repainting it again per sample would be ~100 pointless cell
+  # repaints a second on the Cortex-A7.
+  assert_equal 1, count_fills(d, index)
+end
+
+assert('a stroke that went down on the tip inks even if the eraser bit turns up') do
+  app, d, = new_app
+  s1 = pen_sample(300, 400, true)
+  s2 = eraser_sample(340, 440, true)
+  p1 = screen_of(s1)
+  p2 = screen_of(s2)
+  app.handle_sample(s1)
+  app.handle_sample(s2)
+  # The tool is latched at pen-down, the way every other stroke decision is,
+  # so a stroke can never change what it means halfway through. It mirrors the
+  # digitizer, which latches the tool code on proximity entry and cannot
+  # switch it while the tool is in range.
+  assert_equal 1, d.lines.size
+  assert_equal [p1[0], p1[1], p2[0], p2[1], Redoku::App::INK_WIDTH,
+                Redoku::App::INK_GRAY], d.lines[0]
+  assert_equal 0, count_fills(d, cell_index_of(s2))
+end
+
+assert('a stroke that went down on the eraser never inks, tip bit or not') do
+  app, d, = new_app
+  app.handle_sample(eraser_sample(300, 400, true))
+  app.handle_sample(pen_sample(340, 440, true))
+  app.handle_sample(pen_sample(340, 440, false))
+  assert_equal [], d.lines
+end
+
+assert('an eraser stroke that began off the board clears nothing') do
+  app, d, = new_app
+  app.handle_sample(eraser_sample(700, 1600, true)) # down on the Level button
+  d.clear_calls
+  s = eraser_sample(300, 400, true)                 # dragged onto the board
+  app.handle_sample(s)
+  # Same rule as ink: what a stroke does is decided where it went down, so
+  # dragging onto the board cannot start erasing.
+  assert_equal 0, count_fills(d, cell_index_of(s))
+end
+
+assert('the eraser end presses a button, exactly as the tip does') do
+  app, = new_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  app.handle_sample(eraser_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_sample(eraser_sample(qx + qw / 2, qy + qh / 2, false))
+  # A deliberate decision, not an oversight: the chrome is not a writing
+  # surface, so there is nothing there for an eraser to mean, and it is still
+  # the same pen in the same hand — a tap is a tap. tap? asks only about
+  # @mode == :button, which a stroke that went down off the board gets
+  # whichever end of the pen it was.
+  assert_false app.running?
+end
+
+assert('the eraser end suppresses touch the way the tip does') do
+  app, _d, clock = new_touch_app
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  # RUBBER in proximity, not touching anything: note_pen_proximity reads
+  # PEN | RUBBER, because either end near the glass means a hand is over it.
+  app.handle_sample(eraser_sample(300, 400, false))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_true app.running?
+  # And it keeps suppressing for the cooldown after it leaves, like the tip.
+  app.handle_sample(pen_away_sample(300, 400))
+  clock.ms += Redoku::App::TOUCH_COOLDOWN_MS - 1
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, true))
+  app.handle_touch_sample(touch_sample(qx + qw / 2, qy + qh / 2, false))
+  assert_true app.running?
+end
+
+assert('the eraser clears a cell on a board that has not been dug yet') do
+  # An App holds no Grid until run or a New press digs one, and every test
+  # above erases on exactly such an App. The ink still has to go.
+  app, d, = new_app
+  assert_nil app.grid
+  s = eraser_sample(300, 400, true)
+  app.handle_sample(s)
+  assert_equal cell_fill(cell_index_of(s)), d.rects[0]
 end
 
 assert('a tap on Quit stops the loop') do

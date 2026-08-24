@@ -17,6 +17,24 @@ assert('Grid geometry maps indices to rows, columns and boxes') do
   assert_equal 8, g.box_of(60)  # row 6, col 6
 end
 
+assert('Grid.index_of inverts col_of and row_of for every cell') do
+  g = Redoku::Sudoku::Grid
+  # The inverse exists because the input path needs it: Layout.cell_at answers
+  # a (col, row) and the renderer and the Grid both want a flat index, so
+  # without this the conversion would be an open-coded `row * 9 + col` sitting
+  # in app.rb — a second copy of Grid's indexing rule, in a file that has no
+  # other business knowing it.
+  assert_equal 0, g.index_of(0, 0)
+  assert_equal 80, g.index_of(8, 8)
+  # Off the diagonal, where a col/row swap would otherwise cancel out: cell 2
+  # is col 2, row 0, and cell 18 is col 0, row 2.
+  assert_equal 2, g.index_of(2, 0)
+  assert_equal 18, g.index_of(0, 2)
+  g::CELLS.times do |i|
+    assert_equal i, g.index_of(g.col_of(i), g.row_of(i))
+  end
+end
+
 assert('Grid units are 27 nine-cell groups covering every cell three times') do
   g = Redoku::Sudoku::Grid
   assert_equal 9, g::ROWS.size

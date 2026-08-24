@@ -1,9 +1,12 @@
 module Redoku
   # The event loop. One stroke at a time: what a stroke does is decided
-  # where the pen went down (ink on the board, a tap on a button, nothing
-  # anywhere else), so dragging out of a region can never surprise the user.
+  # where the pen went down and WITH WHICH END (ink on the board from the tip,
+  # a cleared cell from the eraser, a tap on a button, nothing anywhere else),
+  # so dragging out of a region — or flipping the pen mid-stroke — can never
+  # surprise the user.
   #
-  # The pen writes and presses buttons; a finger can only press buttons.
+  # The pen writes with one end and erases with the other, and presses
+  # buttons with either; a finger can only press buttons.
   # That split is the owner's: the board is a writing surface, so ink is
   # pen-exclusive, and the two devices are handled by separate code paths
   # here because they are separate devices — different transforms, different
@@ -60,10 +63,11 @@ module Redoku
     # putting the pen down and reaching for a button does not feel laggy.
     TOUCH_COOLDOWN_MS = 500
 
-    # ink_dirty is the pending ink damage as INCLUSIVE corners
-    # [x1, y1, x2, y2] — the one rect in this codebase that is not
-    # [x, y, w, h] with exclusive edges, because it grows corner by corner as
-    # segments arrive and is converted only on its way out, in flush_ink.
+    # ink_dirty is the pending pen damage — ink laid down, or a cell repainted
+    # to take ink away — as INCLUSIVE corners [x1, y1, x2, y2]: the one rect
+    # in this codebase that is not [x, y, w, h] with exclusive edges, because
+    # it grows corner by corner as segments arrive and is converted only on
+    # its way out, in flush_ink.
     #
     # `grid` is the puzzle on the board (nil until the first dig), `solution`
     # its answer and `achieved_tier` the tier the generator actually reached —
@@ -95,11 +99,12 @@ module Redoku
       @solution = nil
       @achieved_tier = nil
       @running = true
-      @mode = nil       # :ink, :button, :none, or nil for no stroke open
+      @mode = nil       # :ink, :erase, :button, :none, or nil: no stroke open
       @last = nil       # previous point of this stroke
       @button = nil     # the button this stroke went down on, if any
       @travel = 0       # distance travelled so far, for tap detection
       @ink_dirty = nil  # pending ink damage, inclusive corners
+      @erased = nil     # last cell this erase stroke cleared (see erase_at)
 
       # The touch stroke is tracked separately from the pen's, so that a
       # finger landing on the glass can never cut a stroke short or steal
@@ -172,14 +177,23 @@ module Redoku
       self
     end
 
+    # RM2::Input::TOUCH is the tool pressed against the glass and says nothing
+    # about WHICH end is pressed; RUBBER is the tool identity, set while the
+    # eraser end is in proximity (PEN while the tip is — the digitizer latches
+    # one or the other on proximity entry and never both). So the two bits are
+    # read together here: contact from TOUCH, meaning from RUBBER, and the
+    # meaning is handed to begin_stroke and latched there for the whole
+    # stroke. Re-reading it per sample would let a stroke change identity
+    # halfway, which no other stroke decision in this loop can do.
     def handle_sample(sample)
       raw_x, raw_y, _pressure, tools = sample
       note_pen_proximity(tools)
       x, y = Pen.to_screen(raw_x, raw_y)
       down = (tools & RM2::Input::TOUCH) != 0
+      erasing = (tools & RM2::Input::RUBBER) != 0
 
       if down && @mode.nil?
-        begin_stroke(x, y)
+        begin_stroke(x, y, erasing)
       elsif down
         continue_stroke(x, y)
       elsif @mode
@@ -211,9 +225,25 @@ module Redoku
       self
     end
 
-    # Pushes pending ink to the panel with the fast waveform. Ink is drawn
-    # into the shared buffer as it arrives but flushed at most once per loop
-    # turn: fewer round trips, and the pen still keeps up.
+    # Pushes pending pen damage to the panel with the fast waveform. Ink is
+    # drawn into the shared buffer as it arrives but flushed at most once per
+    # loop turn: fewer round trips, and the pen still keeps up.
+    #
+    # Erasing shares this channel rather than flushing per cell, and the
+    # waveform is the reason. RM2::DU + FAST_DRAW is the cheap two-level
+    # waveform the pen echo and the button flash already use — about a tenth of
+    # a GL16 chrome refresh — and undrawing has to feel as immediate as
+    # drawing, or the eraser reads as broken. Everything a cell repaint puts
+    # back on an M2 board is black on white (grid lines, a given digit in
+    # GIVEN_GRAY, white paper), which is all two levels can carry, so nothing
+    # is lost by sending it this way.
+    #
+    # WHERE THAT STOPS BEING TRUE, for M3: DU is two-level, so an
+    # ENTRY_GRAY (96) digit flushed through here would be thresholded to black
+    # or white rather than printed in its own tone — the very distinction
+    # PLAN.md §8 wants between a clue and a guess. Nothing in M2 can hit that
+    # (there are no entries yet), but the first repaint that puts a player's
+    # entry back on the glass needs GL16 for that region, not this.
     def flush_ink
       return self unless @ink_dirty
       x1, y1, x2, y2 = @ink_dirty
@@ -442,12 +472,20 @@ module Redoku
     # stroke too, or TAP_MAX_PATH would never bite and any drag ending on
     # Quit would quit. @button remembers what was pressed, so the release
     # can be checked against it without asking Layout twice.
-    def begin_stroke(x, y)
+    #
+    # `erasing` is the eraser end of the pen, and it only means anything on the
+    # board: off the board a stroke is a button press or nothing, whichever end
+    # of the pen made it. That is a decision rather than an oversight — the
+    # chrome is not a writing surface, so there is nothing there for an eraser
+    # to mean, and it is the same pen in the same hand, where a tap is a tap.
+    def begin_stroke(x, y, erasing = false)
       @last = [x, y]
       @travel = 0
+      @erased = nil
       if Layout.cell_at(x, y)
         @button = nil
-        @mode = :ink
+        @mode = erasing ? :erase : :ink
+        erase_at(x, y)
       else
         @button = Layout.button_at(x, y)
         @mode = @button ? :button : :none
@@ -457,6 +495,7 @@ module Redoku
     def continue_stroke(x, y)
       @travel += (x - @last[0]).abs + (y - @last[1]).abs
       ink_to(x, y)
+      erase_at(x, y)
       @last = [x, y]
     end
 
@@ -469,11 +508,13 @@ module Redoku
     def end_stroke(x, y)
       @travel += (x - @last[0]).abs + (y - @last[1]).abs
       ink_to(x, y)
+      erase_at(x, y)
       press(@button) if tap?(x, y)
       @mode = nil
       @last = nil
       @button = nil
       @travel = 0
+      @erased = nil
     end
 
     # The board is the writing surface and the chrome is not, so a segment is
@@ -489,6 +530,43 @@ module Redoku
       return unless Layout.cell_at(@last[0], @last[1]) && Layout.cell_at(x, y)
       @d.draw_line(@last[0], @last[1], x, y, INK_WIDTH, INK_GRAY)
       mark_dirty(@last[0], @last[1], x, y)
+    end
+
+    # The eraser's counterpart to ink_to, in the same shape: @mode is checked
+    # first, so a tip stroke or a button stroke costs no geometry at all, and
+    # a point off the board does nothing.
+    #
+    # There is nothing to UNdraw. Ink goes straight into the shared
+    # framebuffer, one draw_line per segment, with no journal and no per-cell
+    # backing store, so the only way back is to repaint the cell as the model
+    # says it should look — which is Renderer#redraw_cell, and is also exactly
+    # the primitive M3's recogniser needs when it replaces a cell's raw ink
+    # with a printed digit.
+    #
+    # @grid may still be nil, on an App that has not dug a board yet;
+    # redraw_cell reads that as "no digit to put back" and clears the cell all
+    # the same, because the ink is on the glass either way.
+    #
+    # @erased is a ONE-cell latch, not a set of every cell this stroke has
+    # cleared. A cell cannot acquire new ink while the eraser is down (ink_to
+    # refuses for @mode == :erase), so repainting the cell under every sample
+    # would be some 100 identical cell repaints a second on the Cortex-A7 for
+    # no visible change. Dragging out of a cell and back into it erases it a
+    # second time, which is idempotent and cheaper to allow than to remember.
+    #
+    # Damage goes into the pen's own pending rect as INCLUSIVE corners, so
+    # flush_ink pushes it — one flush per loop turn however many cells a drag
+    # crossed, in the same waveform as the ink it removes (see flush_ink).
+    def erase_at(x, y)
+      return unless @mode == :erase
+      cell = Layout.cell_at(x, y)
+      return unless cell
+      index = Sudoku::Grid.index_of(cell[0], cell[1])
+      return if index == @erased
+      @erased = index
+      @renderer.redraw_cell(index, @grid)
+      cx, cy, cw, ch = Layout.cell_rect(cell[0], cell[1])
+      mark_dirty(cx, cy, cx + cw - 1, cy + ch - 1)
     end
 
     # A tap starts and ends on the same button, having travelled little in
