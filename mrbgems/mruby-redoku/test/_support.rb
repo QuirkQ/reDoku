@@ -122,12 +122,14 @@ class TestDisplay
   end
 
   # True when some ink rect lies entirely inside cell `index`'s rect, inset on
-  # every side by Layout::BLOCK_LINE. The inset is load-bearing: draw_board
-  # paints grid lines centred on cell boundaries, so up to BLOCK_LINE/2 px of
-  # line overhangs into every cell — without the inset, that overhang alone
-  # would make every cell report a glyph and the assertion would be vacuous.
-  # A digit at DIGIT_SCALE leaves 21 px of vertical margin, far clear of a
-  # 4 px inset, so the inset costs the real case nothing.
+  # every side by Layout::BLOCK_LINE. NOT a fix for draw_board today: its
+  # grid lines are painted as rects spanning the whole board, so a line rect
+  # is never entirely inside a single cell rect regardless of this inset —
+  # remove the inset and every existing assertion using this still passes.
+  # It is defence against a FUTURE per-cell line painter that would put a
+  # short line rect right at a cell's edge, which the whole-board painter
+  # never does. A digit at DIGIT_SCALE leaves 21 px of vertical margin, far
+  # clear of a 4 px inset, so the inset costs the real case nothing either way.
   def glyph_in_cell?(index)
     col = Redoku::Sudoku::Grid.col_of(index)
     row = Redoku::Sudoku::Grid.row_of(index)

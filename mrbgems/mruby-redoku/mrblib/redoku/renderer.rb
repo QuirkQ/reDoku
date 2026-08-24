@@ -22,14 +22,30 @@ module Redoku
     # scale (Font.draw only ever steps a glyph by whole pixels), leaving
     # 35 px of side margin and 21 px above and below — comfortably clear of
     # both the cell border and BLOCK_LINE's 2 px overhang into the cell.
+    # This hits §8's SIZE, not its METHOD: §8 wants that size from a Spleen
+    # BDF face via tools/fontpack.rb, and this is instead a 14x upscale of
+    # Font's built-in 5x7 table (see font.rb) — the BDF pipeline is
+    # deferred, and the visible trade-off is a blocky 14x14 pixel per glyph
+    # pixel rather than a crisp face.
     DIGIT_SCALE = 14
 
     # The splash ('GENERATING...') is the other full-board-width text the
     # renderer prints, so it takes the header's own scale rather than
     # inventing a third one: same visual weight as REDOKU, and verified
-    # (test/renderer.rb) to still leave more than half the board's width
-    # spare on top of that, so a longer status message would fit too.
+    # (test/renderer.rb) to fit inside the board. Referencing
+    # Layout::TITLE_SCALE at load time, rather than copying its value, relies
+    # on layout.rb sorting before renderer.rb in mrblib's alphabetical load
+    # order — true today ('l' < 'r'), and worth knowing if that ever stops
+    # being true.
     SPLASH_SCALE = Layout::TITLE_SCALE
+
+    # The exact status text shown while the generator digs. A constant
+    # rather than a caller-supplied literal because Font.draw silently draws
+    # NOTHING for a character it has no glyph for — a lowercase letter or a
+    # real ellipsis character would render as blank space with no error —
+    # so the string that ships is pinned here once and asserted
+    # (test/renderer.rb), instead of trusted anew at every call site.
+    SPLASH_TEXT = 'GENERATING...'
 
     def initialize(display)
       @d = display
@@ -117,7 +133,14 @@ module Redoku
     # rather than a wider area, is also what lets the caller's existing
     # flush_board cover exactly the region this dirties — a second flush
     # region would be a second way to do the one thing flush_board does.
-    def draw_splash(text)
+    # `text` defaults to SPLASH_TEXT rather than requiring every caller to
+    # pass it, so the only string that ever reaches here is the one already
+    # proven to have a glyph for every character. Note for anyone tempted to
+    # "fix" the result: board_rect's white fill leaves the 2 px frame
+    # overhang (see flush_board) untouched, so a thin dark hairline stays
+    # visible around the splash — that is the SAME invariant flush_board
+    # already relies on (the overhang never receives white), not a bug.
+    def draw_splash(text = SPLASH_TEXT)
       x, y, w, h = Layout.board_rect
       @d.fill_rect(x, y, w, h, WHITE)
       tw = Font.width(text, SPLASH_SCALE)

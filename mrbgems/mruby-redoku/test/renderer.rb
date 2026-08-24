@@ -157,6 +157,24 @@ assert('Renderer draws a digit into the right cell, not always the first') do
   assert_true d.painted_within?(x + (w - gw) / 2, y + (h - gh) / 2, gw, gh)
 end
 
+assert('Renderer draws a digit using col, not row, off the diagonal') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  scale = Redoku::Renderer::DIGIT_SCALE
+  # Indices 0 and 80 are both on the diagonal, where cell_rect(col, row) and
+  # cell_rect(row, col) agree, so a consistent col/row swap inside
+  # draw_digit would still pass both cases above. Index 2 is col 2, row 0 —
+  # off the diagonal — and this checks against a rect built directly from
+  # that (col, row), not derived by converting 2 back through
+  # Grid.col_of/row_of the way draw_digit itself does, so a swap in the
+  # renderer has nothing matching to cancel against.
+  r.draw_digit(2, 3, Redoku::Renderer::GIVEN_GRAY)
+  x, y, w, h = Redoku::Layout.cell_rect(2, 0)
+  gw = Redoku::Font.width('3', scale)
+  gh = Redoku::Font::HEIGHT * scale
+  assert_true d.painted_within?(x + (w - gw) / 2, y + (h - gh) / 2, gw, gh)
+end
+
 assert('Renderer draws givens darker than entries') do
   assert_equal 0, Redoku::Renderer::GIVEN_GRAY
   assert_true Redoku::Renderer::ENTRY_GRAY > Redoku::Renderer::GIVEN_GRAY
@@ -200,20 +218,35 @@ assert('Renderer prints givens in given ink and entries in entry ink') do
   grid.set_entry(0, 1)
   r.draw_puzzle(grid)
   # A given and an entry are both on the board, in two different grays.
+  # inked_grays alone only proves both grays appear SOMEWHERE, so it would
+  # still pass with the given/entry ternary inverted — the two gray_at
+  # checks below pin an exact pixel of each digit to its expected ink.
   assert_true d.inked_grays.include?(Redoku::Renderer::GIVEN_GRAY)
   assert_true d.inked_grays.include?(Redoku::Renderer::ENTRY_GRAY)
+  # Cell 0's entry is '1': glyph row 0 is '..#..', so column 2 of its 5-wide,
+  # 14x-scaled glyph is lit. The glyph starts at x 107, y 221 (cell_rect(0,0)
+  # centred), so (140, 225) sits inside that one lit block.
+  assert_equal Redoku::Renderer::ENTRY_GRAY, d.gray_at(140, 225)
+  # Cell 1's given is '2': glyph row 0 is '.###.', lit at columns 1-3. The
+  # glyph starts at x 247, y 221 (cell_rect(1,0) centred), so (265, 225)
+  # sits inside the lit column-1 block.
+  assert_equal Redoku::Renderer::GIVEN_GRAY, d.gray_at(265, 225)
 end
 
 assert('Renderer draws a splash the font can actually print') do
   d = TestDisplay.new
   r = Redoku::Renderer.new(d)
-  text = 'GENERATING...'
+  text = Redoku::Renderer::SPLASH_TEXT
   # Every character must have a glyph. Font.draw silently draws NOTHING for
   # an unknown character and just advances the cursor, so a lowercase or
   # ellipsis character would render as blank space with no error at all.
+  # Checking Renderer::SPLASH_TEXT itself, not a literal copied into this
+  # test, is what makes this a real guard: draw_splash's `text` parameter
+  # lets a caller pass anything, so a literal here would only ever cover
+  # itself, not the string draw_splash's default actually ships.
   text.each_char { |ch| assert_true !Redoku::Font::GLYPHS[ch].nil? }
 
-  r.draw_splash(text)
+  r.draw_splash
   bx, by, bw, bh = Redoku::Layout.board_rect
   sw = Redoku::Font.width(text, Redoku::Renderer::SPLASH_SCALE)
   assert_true sw < bw
@@ -224,16 +257,16 @@ end
 # SPLASH_SCALE is not handed to us the way DIGIT_SCALE is — Task 5a chose it,
 # so its arithmetic gets its own assertion rather than trust. Picked to match
 # Layout::TITLE_SCALE (the header's scale) for visual consistency between the
-# two full-board-width texts the renderer prints, and verified here rather
-# than assumed: 'GENERATING...' is 13 characters, and this proves it clears
-# the board with more than half its width still empty on both sides
-# combined, not just barely inside it.
-assert('SPLASH_SCALE matches the header scale and leaves a wide margin') do
+# two full-board-width texts the renderer prints.
+assert('SPLASH_SCALE matches the header scale and fits the board') do
   scale = Redoku::Renderer::SPLASH_SCALE
   assert_equal Redoku::Layout::TITLE_SCALE, scale
-  text = 'GENERATING...'
-  sw = Redoku::Font.width(text, scale)
+  sw = Redoku::Font.width(Redoku::Renderer::SPLASH_TEXT, scale)
   bw = Redoku::Layout::BOARD_W
+  # The actual requirement is that the splash fits the board — not a margin
+  # fraction of BOARD_W, which is really a fact about TITLE_SCALE (the
+  # header's own scale) wearing a splash-shaped disguise: retuning the
+  # header to scale 9 would fail a `sw < bw / 2` version of this assertion
+  # over a splash-sizing question it has nothing to do with.
   assert_true sw < bw
-  assert_true sw < bw / 2
 end

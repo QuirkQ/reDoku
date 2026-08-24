@@ -1,7 +1,10 @@
 module Redoku
   # Built-in 5x7 bitmap font for UI labels, scaled up by whole pixels.
-  # M1 needs short uppercase labels, not the crisp 96 px digits that will
-  # justify a BDF pipeline (PLAN.md §8) — that arrives with printed digits.
+  # Printed digits (Renderer::DIGIT_SCALE) ship from this same 5x7 table, at
+  # a 14x upscale, rather than from PLAN.md §8's Spleen BDF pipeline packed
+  # by tools/fontpack.rb — that pipeline does not exist yet (no tools/ in
+  # the tree). Deferred, not forgotten: every glyph pixel on the board is a
+  # blocky 14x14 square rather than a crisp face until that pipeline lands.
   module Font
     WIDTH  = 5
     HEIGHT = 7
