@@ -1,3 +1,12 @@
+# Two dig-chain seeds chosen for what their FLOOR is, because three assertions
+# below are unconditional and would be meaningless otherwise. Mined by a
+# throwaway script over seeds 1-60 (see the plan's Task 3 Step 0); rerun it if
+# the rater or the dig ever changes, because these are properties of the
+# CLASSIFIER, not of the seed. Measured over those 60 seeds: 43 floors solvable,
+# 17 rejects, and every one of the 17 rejects had a rescuable neighbourhood.
+SOLVED_FLOOR_SEED = 1  # floor_tier: :medium  -- our rules finish this floor
+REJECT_FLOOR_SEED = 6  # floor_tier: nil, rescue: :expert -- floor is a reject
+
 assert('Generator.full_board makes a complete valid grid, seed-stable') do
   gen = Redoku::Sudoku::Generator
   g = Redoku::Sudoku::Grid
@@ -150,26 +159,6 @@ assert('Generator.dig does not mutate the solution it digs from') do
   assert_equal(before, solution)
 end
 
-assert('Generator.dig walks from the shallow end, so easy keeps its clues') do
-  gen = Redoku::Sudoku::Generator
-  # Two requests against the SAME chain: the easier one must not come back
-  # with fewer clues than the harder one. That is the whole point of walking
-  # shallow-to-deep and returning the first acceptable board -- both ends of
-  # the chain would satisfy an easy request, and the one with more clues is
-  # the one that looks like the puzzle it claims to be.
-  solution = gen.full_board(Redoku::Rng.new(31))
-  easy = gen.dig(solution, :easy, Redoku::Rng.new(31))
-  hard = gen.dig(solution, :hard, Redoku::Rng.new(31))
-
-  easy_clues = 0
-  easy[0].each { |d| easy_clues += 1 if d != 0 }
-  hard_clues = 0
-  hard[0].each { |d| hard_clues += 1 if d != 0 }
-  assert_true easy_clues >= hard_clues
-  # And the easier request cannot have scored higher than the harder one.
-  assert_true easy[1][:score] <= hard[1][:score]
-end
-
 assert('Generator.tier_distance measures along the tier order') do
   gen = Redoku::Sudoku::Generator
   assert_equal(0, gen.tier_distance(:easy, :easy))
@@ -239,11 +228,14 @@ assert('Generator.generate never hands back a board that is barely dug') do
   # chains rather than settling early, and this test is about MAX_CLUES rather
   # than about reaching a tier.
   #
-  # The explicit 6 is DEFAULT_ATTEMPTS today, so it changes nothing right now
-  # -- it is not a reduced budget and must not be read as one. It pins the cost
-  # of this test against a future rise in DEFAULT_ATTEMPTS, which Task 3 is
-  # going to make: a test whose subject is a clue-count guard rail has no
-  # reason to pay for a bigger search than it does today.
+  # The explicit 6 was DEFAULT_ATTEMPTS when this was written and is now a
+  # REAL reduction for :medium, whose shipped cap is 12 (ATTEMPTS). That is
+  # deliberate and it is why the number stayed behind after the caps went per
+  # tier: a test whose subject is a clue-count guard rail has no reason to pay
+  # for a bigger search than it needs, and the guard rail it checks binds on
+  # attempt 1 or not at all. Measured after the deep walk landed, both rungs
+  # hit on their first attempt anyway (10 draws each, p50 61 ms and 65 ms), so
+  # the 6 is slack rather than a constraint.
   [:easy, :medium].each do |tier|
     out = gen.generate(tier, Redoku::Rng.new(50), 6)
     assert_true out[:clues] <= gen::MAX_CLUES
@@ -262,27 +254,22 @@ assert('Generator.generate hits the two rungs the bottom of the ladder offers') 
   # 16.0 s -- inside `make test`. Their reachability is established once, by
   # the measurement script in this plan's Task 3, not by the suite.
   #
-  # WHY MEDIUM IS SAFE TO ASSERT, and READ THE FIRST LINE OF THIS BEFORE
-  # BELIEVING THE REST. The 89%-of-chains figure at EDGE 140 was measured under
-  # the DEEP walk, which is Task 3's code and does not exist yet -- this task
-  # still walks every rung from the shallow end. So the figure is NOT direct
-  # evidence for what this assertion does here, and treating it as such is the
-  # mistake this comment exists to stop.
+  # WHY MEDIUM IS SAFE TO ASSERT, and it is now MEASURED rather than argued.
+  # This comment used to carry an argument in place of data, because the
+  # 89%-of-chains figure at EDGE 140 had been measured under the DEEP walk,
+  # which did not exist yet. It exists now, MEDIUM walks it, and the deep end
+  # of a chain is where MEDIUM lives: measured over 300 fresh chains the hard
+  # end is MEDIUM or harder on 292 of them (97%), and over 10 draws at the
+  # shipped cap of 12, a MEDIUM request hit on its FIRST attempt every time
+  # (p50 65 ms, max 180 ms). The argument still holds and is still worth
+  # knowing -- reachability is a property of the CHAIN, not of the direction it
+  # is walked, because MEASURE_BUDGET (16) exceeds the measured 8-to-12-board
+  # window, so both walks find a MEDIUM board on exactly the same chains and
+  # differ only in WHICH one they hand back -- but it is no longer the only
+  # thing holding this assertion up.
   #
-  # What carries it instead is an ARGUMENT, and it is worth checking rather than
-  # trusting: reachability is a property of the CHAIN, not of the direction it
-  # is walked. MEASURE_BUDGET (12 here, 16 after Task 3) exceeds the measured
-  # 8-to-12-board window between MAX_CLUES and the uniqueness floor, so both
-  # walks classify the whole window and find a MEDIUM board on exactly the same
-  # chains -- they differ only in WHICH one they hand back. On top of that,
-  # `generate` draws a FRESH solution per attempt, so DEFAULT_ATTEMPTS is six
-  # independent chains and the miss probability is 0.11^6, about two in a
-  # million per seed.
-  #
-  # The argument is why this assertion survives Task 3 unchanged. The
-  # MEASUREMENT under the shipped code lands in Task 3 Step 5, whose script
-  # prints a per-rung hit rate and whose output goes into that commit message.
-  # Until then, this is reasoning, not data.
+  # `generate` also draws a FRESH solution per attempt, so a cap of 12 is
+  # twelve independent chains and a miss needs all twelve to fail.
   [:easy, :medium].each do |tier|
     3.times do |n|
       out = gen.generate(tier, Redoku::Rng.new(200 + (n * 7)))
@@ -334,4 +321,249 @@ assert('Generator.generate reports the measurement of the board it returns') do
   assert_equal(m[:demand], out[:demand])
   assert_equal(m[:score], out[:score])
   assert_equal(m[:hardest], out[:hardest])
+end
+
+assert('Generator attempt budgets are per tier, because the rungs differ 50x') do
+  gen = Redoku::Sudoku::Generator
+  # One number cannot be right for both ends: a chain can serve EASY 100% of
+  # the time and MASTER 2% of the time. Measured hit rates at these caps
+  # (500-chain bootstrap, 500 trials): 100% / 100% / 100% / 99% / 94%.
+  Redoku::Sudoku::Rater::TIERS.each do |tier|
+    assert_false gen::ATTEMPTS[tier].nil?
+    assert_true gen::ATTEMPTS[tier] > 0
+  end
+  assert_true gen::ATTEMPTS[:master] > gen::ATTEMPTS[:easy]
+  assert_equal(gen::ATTEMPTS[:easy], gen.attempts_for(:easy))
+  # An unrecognised tier still gets a real cap rather than nil, because
+  # nil.times is a crash and this runs behind a splash on a device whose only
+  # escape is the power button.
+  assert_equal(gen::DEFAULT_ATTEMPTS, gen.attempts_for(:not_a_tier))
+end
+
+assert('only easy walks the shallow end of the chain') do
+  gen = Redoku::Sudoku::Generator
+  # THE MEDIUM FIX, and it costs nothing: the chain is already dug, so walking
+  # from the deep end is the same work in the other direction. Measured over
+  # 40 chains it is worth 4 clues at the median (up to 10) and upgrades the
+  # demand class on 17 of 39 chains. For EASY the shallow bias is a FEATURE --
+  # the deep end of a chain is 33-34 clues, and a first-rung puzzle should look
+  # generously clued -- so easy keeps it, alone.
+  assert_equal(:easy, gen::WALK_SHALLOW)
+
+  # SOLVED_FLOOR_SEED, not an arbitrary one: the two `hard_end` assertions
+  # below were guarded with `if hard[0]` in an earlier draft and would have
+  # gone vacuous on a chain whose floor rejects. A seed whose floor is solvable
+  # is the cheapest way to make them unconditional.
+  solution = gen.full_board(Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  removals = chain[0]
+  clues_after = chain[1]
+
+  easy = gen.shallow_walk(solution, removals, clues_after, :easy)
+  assert_false easy[1].nil?
+  assert_equal(:easy, easy[1][:tier])
+  easy_clues = Redoku::Sudoku::Rater.clue_count(easy[0])
+  # 44-45 clues over 500 measured chains, and never more than MAX_CLUES. 44 or
+  # 45 on all 34 chains re-measured for this task; 45 on this seed.
+  assert_true easy_clues <= gen::MAX_CLUES
+  assert_true easy_clues >= 40
+
+  # The hard end of the same chain is the FLOOR, which is strictly deeper.
+  # Measured on this seed: 26 clues against the shallow end's 45.
+  hard = gen.hard_end(solution, removals)
+  assert_false hard[0].nil?
+  assert_false hard[1].nil?
+  assert_true Redoku::Sudoku::Rater.clue_count(hard[0]) < easy_clues
+end
+
+assert('the hard end of a chain is its floor, and its class never decreases') do
+  gen = Redoku::Sudoku::Generator
+  r = Redoku::Sudoku::Rater
+  # The monotonicity that makes the whole design affordable: 0 class DECREASES
+  # in 527 adjacent chain steps, and it is provable in the direction that
+  # matters -- restoring givens can only remove candidates, so a board with
+  # more givens is solved by every rule set that solves the board with fewer.
+  # So the hardest board on a chain is its floor, and ONE classification of the
+  # floor decides whether the whole chain can serve a request.
+  #
+  # THIS SEED'S FLOOR IS SOLVABLE, and that is asserted rather than assumed.
+  # An earlier draft guarded the floor assertion with `if
+  # r.measure(floor)[:tier]`, which meant a change that made every floor reject
+  # would delete this test's subject and leave the suite green. Mined by Step 0
+  # (measured floor_tier: :medium).
+  solution = gen.full_board(Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  removals = chain[0]
+  clues_after = chain[1]
+
+  floor = gen.board_at(solution, removals, removals.size)
+  assert_false r.measure(floor)[:tier].nil?
+  out = gen.hard_end(solution, removals)
+  m = out[1]
+  assert_false m.nil?
+  # A solvable floor IS the hard end, untouched -- unconditionally, now that
+  # the line above has established the floor is solvable.
+  assert_equal(floor, out[0])
+
+  # No board shallower on the chain demands more than the hard end does. The
+  # non-nil assertion is not defensive padding -- it is the restoring argument
+  # stated as a test: this floor is solvable, so every shallower board must be
+  # too. If it ever fires, the argument is WRONG and the monotone dismissal is
+  # unsound, which is a finding about the design rather than a broken test.
+  # (0 class decreases in 527 measured adjacent chain steps agree with it, as
+  # do the 11 boards of this seed's own window.) An earlier draft wrote
+  # `unless shallower[:tier].nil?` here, which would have let the whole loop
+  # skip in silence.
+  k = gen.first_usable(clues_after)
+  while k <= removals.size
+    shallower = r.measure(gen.board_at(solution, removals, k))
+    assert_false shallower[:tier].nil?
+    assert_true r.rank(shallower[:tier]) <= r.rank(m[:tier])
+    k += 1
+  end
+end
+
+assert('a rejected floor is rescued by restoring one symmetric group') do
+  gen = Redoku::Sudoku::Generator
+  s = Redoku::Sudoku::Solver
+  r = Redoku::Sudoku::Rater
+  # 22% of chain floors (109 of 500) are boards our rules cannot finish. A
+  # rejected floor is not a wasted dig: restore any one removed GROUP and the
+  # board is a different legal puzzle, still 180-degree symmetric and still
+  # uniquely solvable for free -- the restored givens come from the same
+  # solution, so its solution set is a subset of the floor's, and the floor was
+  # unique. This is where the hard rungs come from: of 10 MASTER boards found
+  # in 500 chains, 7 came from a stalled floor's neighbourhood.
+  #
+  # THE SEED IS CHOSEN FOR ITS FLOOR, and both facts about it are asserted
+  # before anything else runs. An earlier draft wrapped this whole body in
+  # `unless out[0].nil?`, which meant the rescue path -- the source of 7 of 10
+  # measured MASTER boards -- could ship with zero coverage and a green suite.
+  # Mined by Step 0 (measured floor_tier: nil, rescue: :expert -- this one seed
+  # is the claim above in miniature: a rejected floor whose neighbourhood holds
+  # a rung the chain itself could not reach).
+  solution = gen.full_board(Redoku::Rng.new(REJECT_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(REJECT_FLOOR_SEED))
+  removals = chain[0]
+  floor = gen.board_at(solution, removals, removals.size)
+  assert_nil r.measure(floor)[:tier]
+
+  out = gen.rescue_floor(solution, removals, floor)
+  assert_false out[0].nil?
+  board = out[0]
+  # Two more clues than the floor (one, if it was the centre group), and the
+  # extra clues agree with the solution.
+  assert_true r.clue_count(board) > r.clue_count(floor)
+  81.times { |i| assert_equal(solution[i], board[i]) if board[i] != 0 }
+  # Still symmetric, and still unique -- asserted here even though the proof
+  # above says no Solver.unique? call is NEEDED, because the proof is what
+  # licences skipping the call in production and a wrong proof would be
+  # invisible.
+  81.times { |i| assert_equal(0, board[80 - i]) if board[i] == 0 }
+  assert_true s.unique?(board)
+  # And it is a board our rules CAN finish, which is the whole point.
+  assert_false out[1][:tier].nil?
+  # ...and hard_end routes through the rescue rather than handing back the
+  # reject, which is the only thing that connects this method to the search.
+  assert_equal(board, gen.hard_end(solution, removals)[0])
+end
+
+assert('a chain with nothing our rules can finish yields nothing, not a bad puzzle') do
+  gen = Redoku::Sudoku::Generator
+  r = Redoku::Sudoku::Rater
+  # The nil path, driven directly, because generate cannot be steered into it:
+  # it needs a chain where the floor AND all ~27 of its neighbours AND the
+  # shallowest usable board all reject, which was not observed in 500 chains.
+  # Built by hand instead -- blank everything but the middle row, symmetrically.
+  solution = solved_values
+  removals = []
+  36.times { |i| removals << [i, 80 - i] }
+  clues_after = [81]
+  removals.size.times { |k| clues_after << 81 - (2 * (k + 1)) }
+
+  floor = gen.board_at(solution, removals, removals.size)
+  assert_nil r.measure(floor)[:tier]
+  out = gen.rescue_floor(solution, removals, floor)
+  assert_nil out[0]
+  assert_nil out[1]
+
+  # THE SHALLOW FALLBACK REJECTS TOO, and this is a PROOF rather than a
+  # measurement, which is what makes the nil below non-accidental. The
+  # shallowest board MAX_CLUES allows on this hand-built chain is k = 18: rows
+  # 0, 1, 7 and 8 blank, rows 2 to 6 given. Swapping the contents of rows 0 and
+  # 1 -- two rows of the SAME 3x3 band -- leaves every row, column and box
+  # holding the same digits, so it is a second valid solution. A board with two
+  # solutions cannot be finished by rules that only ever write forced cells, so
+  # it stalls, so it is a reject.
+  shallow = gen.board_at(solution, removals, gen.first_usable(clues_after))
+  assert_nil r.measure(shallow)[:tier]
+  fall = gen.shallow_fallback(solution, removals, clues_after)
+  assert_nil fall[0]
+  assert_nil fall[1]
+
+  # Only now can the deep walk honestly answer nothing, and it must -- rather
+  # than inventing a board or handing back the reject.
+  deep = gen.deep_walk(solution, removals, clues_after, :hard)
+  assert_nil deep[0]
+  assert_nil deep[1]
+end
+
+assert('the shallow fallback is the shallowest usable board, or nothing') do
+  gen = Redoku::Sudoku::Generator
+  r = Redoku::Sudoku::Rater
+  # design section 6.4's fallback, and the reason `generate` almost never
+  # answers nil. In production it fires only on the never-observed path where
+  # the floor AND its whole neighbourhood reject -- a chain whose hard end is
+  # merely TOO EASY does not need it, because deep_walk hands that real board
+  # back as a candidate. So it is driven directly here, on an ordinary chain, to
+  # pin the contract rather than the rarity.
+  solution = gen.full_board(Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  out = gen.shallow_fallback(solution, chain[0], chain[1])
+  # This seed's floor is solvable, so by the restoring argument every board on
+  # the chain is -- including the shallowest. Unconditional on purpose.
+  assert_false out[0].nil?
+  assert_false out[1][:tier].nil?
+  assert_true r.clue_count(out[0]) <= gen::MAX_CLUES
+  # It really is the SHALLOWEST usable board, not merely some board.
+  assert_equal(gen.board_at(solution, chain[0], gen.first_usable(chain[1])),
+               out[0])
+end
+
+assert('Generator.generate reports progress once per completed attempt') do
+  gen = Redoku::Sudoku::Generator
+  seen = []
+  # A BLOCK, not a lambda or a callable object: block-passing is core mruby and
+  # mruby-method -- the Method class -- is one of the default-gembox gems this
+  # gem still does not declare.
+  gen.generate(:easy, Redoku::Rng.new(3), 4) { |done, total| seen << [done, total] }
+  # EASY hits on its first attempt on every one of 500 measured chains, so one
+  # report is the expected shape -- and it must carry the CAP as the
+  # denominator, not the attempt it stopped at.
+  assert_true seen.size >= 1
+  assert_equal([1, 4], seen[0])
+
+  # A request no chain can serve burns the whole budget and reports every
+  # attempt, in order, exactly once.
+  seen = []
+  gen.generate(:not_a_tier, Redoku::Rng.new(3), 3) { |done, total| seen << [done, total] }
+  assert_equal([[1, 3], [2, 3], [3, 3]], seen)
+end
+
+assert('an impossible request comes back honest rather than empty') do
+  gen = Redoku::Sudoku::Generator
+  s = Redoku::Sudoku::Solver
+  # generate returns nil ONLY if no attempt produced a single logically
+  # solvable board anywhere -- which needs consecutive pathological chains and
+  # was not observed in 500. A request it cannot satisfy is a different thing:
+  # it comes back with a real puzzle and an honest tier that is not the one
+  # asked for, and App is what decides to ask again.
+  out = gen.generate(:not_a_tier, Redoku::Rng.new(7), 2)
+  assert_false out.nil?
+  assert_false out[:tier] == :not_a_tier
+  assert_true s.unique?(out[:grid].values)
+  assert_false out[:tier].nil?
+  # The reply says which attempt the board came from, which is what a caller
+  # logs when it wants the real distribution rather than a bootstrap estimate.
+  assert_true out[:attempts] >= 1
 end
