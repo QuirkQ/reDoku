@@ -153,18 +153,34 @@ def touch_sample(sx, sy, down)
   [raw_x, raw_y, 0, down ? RM2::Input::FINGER : 0]
 end
 
-def new_app(batches = [])
+# The seed every App in this suite is built with. Arbitrary but FIXED, and
+# both halves of that matter. Fixed is what lets a test say "New produced a
+# DIFFERENT puzzle" at all — a clock-seeded App could deal two identical
+# boards on some unlucky run — and it also pins the suite's generation cost
+# instead of re-rolling it every time, because the dig is a search and a hard
+# request measured anywhere from 90 to 600 ms on this host depending on the
+# seed. 11 was chosen by timing the sequences these tests actually drive
+# (medium+hard+easy for the two three-press Level tests, easy+easy for New)
+# across a dozen candidate seeds and keeping one of the two fastest.
+#
+# The production default — App's own `rng:` keyword, which reads the clock —
+# is covered by one test of its own rather than incidentally by all of these:
+# see 'an App given no rng seeds itself from the clock'.
+GEN_SEED = 11
+
+def new_app(batches = [], rng: Redoku::Rng.new(GEN_SEED))
   d = TestDisplay.new
   input = FakeInput.new(batches)
   signals = FakeSignals.new
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
-                        FakeWaiter.new([input]), signals)
+                        FakeWaiter.new([input]), signals, rng: rng)
   [app, d, input, signals]
 end
 
 # An App with a touchscreen as well as a pen, and a clock under the test's
 # control.
-def new_touch_app(pen_batches = [], touch_batches = [])
+def new_touch_app(pen_batches = [], touch_batches = [],
+                  rng: Redoku::Rng.new(GEN_SEED))
   d = TestDisplay.new
   pen = FakeInput.new(pen_batches)
   finger = FakeInput.new(touch_batches)
@@ -172,7 +188,7 @@ def new_touch_app(pen_batches = [], touch_batches = [])
   waiter = FakeWaiter.new([pen, finger])
   app = Redoku::App.new(d, [pen], Redoku::Renderer.new(d), waiter,
                         FakeSignals.new, touch_sources: [finger],
-                        clock: clock)
+                        clock: clock, rng: rng)
   [app, d, clock, waiter, pen, finger]
 end
 
@@ -349,7 +365,7 @@ assert('every button acknowledges its press, at the button, for the same 200 ms'
     input = FakeInput.new
     waiter = TimelineWaiter.new([input], d)
     app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
-                          FakeSignals.new)
+                          FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED))
     bx, by, bw, bh = Redoku::Layout.button_rect(name)
     d.clear_calls
     app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
@@ -410,21 +426,29 @@ assert('the action runs while the button is held down, not after it comes up') d
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
-                        FakeSignals.new)
+                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED))
   nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
   d.clear_calls
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
-  # TWO updates had reached the panel by the time the hold began: the press
-  # flash and the board repaint New exists to do. 200 ms is how long a press
-  # lasts, not a toll to charge before every action — so the work starts the
-  # moment the tap is recognised and the button stays down while it happens.
-  assert_equal [2], waiter.updates_at
+  # THREE updates had reached the panel by the time the hold began: the press
+  # flash, the splash, and the board repaint carrying the new puzzle. Was two
+  # before M2, when New's whole action was one board repaint; the extra one is
+  # the splash, and it counts here for the same reason the others do — 200 ms
+  # is how long a press lasts, not a toll to charge before every action, so
+  # the work starts the moment the tap is recognised and the button stays down
+  # while it happens.
+  assert_equal [3], waiter.updates_at
   bx, by, bw, bh = Redoku::Layout.board_rect
+  # Both halves of the action go out over board_rect with the chrome
+  # waveform: the splash first, then the finished puzzle. Same rect, because
+  # draw_splash paints exactly board_rect (see Renderer#draw_splash), which is
+  # what lets one flush_board cover either of them.
   assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
-  # press, action, release — and the release is after the hold.
-  assert_equal 3, d.updates.size
-  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
+  # press, splash, puzzle, release — and the release is after the hold.
+  assert_equal 4, d.updates.size
+  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[3]
 end
 
 assert('the acknowledgement runs each action exactly once') do
@@ -437,8 +461,26 @@ assert('the acknowledgement runs each action exactly once') do
     # One step per tap: a press that ran cycle_difficulty twice would skip a
     # difficulty, and one that dropped it would stay put.
     assert_equal Redoku::Renderer::DIFFICULTIES[(i + 1) % 3], app.difficulty
-    chrome = d.updates.reject { |u| u[4] != RM2::GL16 }
-    assert_equal 1, chrome.size # exactly one header flush per tap
+    # Exactly one header flush per tap, exactly as before. What changed is how
+    # it is counted: Level now digs a puzzle as well as renaming the tier, and
+    # new_puzzle's two board flushes are GL16 chrome too, so counting GL16
+    # updates no longer isolates the header. Counted by REGION instead, which
+    # asks a tighter question than the old waveform count did, not a looser
+    # one — the old version would have accepted a header flush that landed on
+    # the wrong rect.
+    hx = Redoku::Layout::HEADER_X
+    hy = Redoku::Layout::HEADER_Y
+    header = d.updates.reject { |u| u[0] != hx || u[1] != hy }
+    assert_equal 1, header.size
+    # And exactly two board flushes, which is the same "exactly once" property
+    # applied to the new half of the action: the splash and then the puzzle,
+    # dug once per tap and not twice.
+    bx, by, = Redoku::Layout.board_rect
+    board = d.updates.reject { |u| u[0] != bx || u[1] != by }
+    assert_equal 2, board.size
+    # All three of those are chrome and none of them ink, which is the M1
+    # waveform discipline the old count was written in.
+    assert_equal 3, d.updates.reject { |u| u[4] != RM2::GL16 }.size
   end
 end
 
@@ -450,9 +492,15 @@ assert('a finger tap is acknowledged exactly the way the pen tap is') do
   app.handle_touch_sample(touch_sample(nx + nw / 2, ny + nh / 2, false))
   # One mechanism, not two: both sources arrive at the same press(), so the
   # feedback falls out rather than being written twice.
-  assert_equal 3, d.updates.size
+  #
+  # Four updates, not the three of M1: press flash, splash, puzzle, release.
+  # New's action grew a splash flush when it started digging a puzzle, and
+  # this test's subject is that a FINGER gets the identical sequence a pen
+  # does — so the count follows the pen's, and the release is still the last
+  # thing out.
+  assert_equal 4, d.updates.size
   assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
-  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
+  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[3]
   assert_equal 0, d.gray_at(nx, ny)
 end
 
@@ -461,7 +509,7 @@ assert('a Level press whose flash is refused still cycles the difficulty') do
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
-                        FakeSignals.new)
+                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED))
   lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
   app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
   app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
@@ -470,11 +518,26 @@ assert('a Level press whose flash is refused still cycles the difficulty') do
   # device — and the player must still get the thing they pressed.
   assert_equal :medium, app.difficulty
   assert_true app.running?
+  # ...and the puzzle that goes with the tier, which is the other half of what
+  # Level now means.
+  assert_false app.grid.nil?
   # Nothing reached the panel to hold or to put back, so neither happened.
   # The header, which is not a button, went out as usual.
   assert_equal [], waiter.calls
-  assert_equal 1, d.updates.size
+  # Three updates where M1 had one: the header, then new_puzzle's splash and
+  # its finished board. The deaf display refuses only button rects, so all
+  # three land. The header is still FIRST and still GL16 — that is the M1
+  # decision this test exists for, and the two board flushes after it are the
+  # dig Level gained, not a change to it.
+  assert_equal 3, d.updates.size
+  hx = Redoku::Layout::HEADER_X
+  hy = Redoku::Layout::HEADER_Y
   assert_equal RM2::GL16, d.updates[0][4]
+  assert_equal hx, d.updates[0][0]
+  assert_equal hy, d.updates[0][1]
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
 end
 
 assert('a New press whose flash is refused still clears the ink') do
@@ -482,7 +545,7 @@ assert('a New press whose flash is refused still clears the ink') do
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
-                        FakeSignals.new)
+                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED))
   app.handle_sample(pen_sample(300, 400, true))
   app.handle_sample(pen_sample(340, 440, true))
   app.handle_sample(pen_sample(340, 440, false))
@@ -491,8 +554,14 @@ assert('a New press whose flash is refused still clears the ink') do
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
   bx, by, bw, bh = Redoku::Layout.board_rect
-  assert_equal [[bx, by, bw, bh, RM2::GL16, 0]], d.updates
+  # Two board flushes where M1 had one: the splash, then the board carrying
+  # the new puzzle. Both over board_rect with the chrome waveform, exactly as
+  # the single one was — the refused button flash still costs the player
+  # nothing, which is what this test is for.
+  assert_equal [[bx, by, bw, bh, RM2::GL16, 0],
+                [bx, by, bw, bh, RM2::GL16, 0]], d.updates
   assert_nil app.ink_dirty
+  assert_false app.grid.nil?
   assert_true app.running?
   assert_equal [], waiter.calls
 end
@@ -543,10 +612,22 @@ assert('a tap on Level cycles the difficulty and repaints the header') do
     app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
     expected = Redoku::Renderer::DIFFICULTIES[(i + 1) % 3]
     assert_equal expected, app.difficulty
-    # press flash, header, release flash — the header is the middle one, and
-    # the only GL16 among them.
-    assert_equal 3, d.updates.size
+    # press flash, header, splash, puzzle, release flash. Was three before
+    # M2, when Level only renamed the tier; the two extra are the board the
+    # tier now comes with. The header is still the FIRST thing after the press
+    # and still GL16 — the M1 decision this test is named for — and it is no
+    # longer the only GL16, because the splash and the puzzle are chrome too.
+    assert_equal 5, d.updates.size
     assert_equal RM2::GL16, d.updates[1][4]
+    assert_equal Redoku::Layout::HEADER_X, d.updates[1][0]
+    assert_equal Redoku::Layout::HEADER_Y, d.updates[1][1]
+    bx, by, bw, bh = Redoku::Layout.board_rect
+    assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
+    assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[3]
+    assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[4]
+    # ...and a board of the new tier really is on the glass, which is what
+    # makes the label mean anything.
+    assert_false app.grid.nil?
   end
 end
 
@@ -560,12 +641,33 @@ assert('a tap on New clears the ink and repaints the board') do
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
   bx, by, bw, bh = Redoku::Layout.board_rect
-  # This GL16 board update is the evidence that the ink was cleared. It is
-  # updates[1], between the press flash and the release flash. The gray_at
-  # below only confirms draw_board's white fill covers that cell pixel:
-  # gray_at replays fill_rect calls, and ink is a draw_line.
+  # These GL16 board updates are the evidence that the ink was cleared: the
+  # splash at updates[1] and the repainted board at updates[2], between the
+  # press flash and the release flash. M1 had one of them; the splash is the
+  # one M2 added, and the board repaint is still there and still last.
   assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
-  assert_equal 255, d.gray_at(300, 400)
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
+  # The gray_at only confirms draw_board's white fill covers a pixel of the
+  # cell the ink was in: gray_at replays fill_rect calls, and ink is a
+  # draw_line, so it never could see the ink itself.
+  #
+  # The probe moved INTO THAT CELL'S MARGIN for M2, and the reason is not
+  # convenience: the board repaint now also draws the puzzle, and a digit's
+  # 70x98 glyph is centred in the 140 px cell, so (300, 400) — 53 px into the
+  # glyph box of cell (1, 1) — is a pixel draw_puzzle may legitimately
+  # blacken, depending on which digit the generator dealt. The 35 px margin no
+  # glyph can reach keeps this asking the question it always asked. 10 px in
+  # from the cell's left edge, clear of the 1 px cell line on it.
+  assert_equal 255, d.gray_at(Redoku::Layout::BOARD_X + Redoku::Layout::CELL +
+                              10, 400)
+  # ...and the puzzle did reach the board, so a New that quietly stopped
+  # drawing it could not hide behind the white fill above. The first given of
+  # the grid App now holds has a glyph inside its own cell, which draw_board's
+  # grid lines cannot fake: they span the whole board, so no line rect lies
+  # entirely inside one cell (see TestDisplay#glyph_in_cell?).
+  first_given = 0
+  first_given += 1 while !app.grid.given?(first_given)
+  assert_true d.glyph_in_cell?(first_given)
 end
 
 assert('App#step drains every source and flushes once') do
@@ -656,7 +758,20 @@ assert('App#run stops when the process is asked to terminate') do
   signals.terminated = true
   app.run
   assert_false app.running?
-  assert_equal 1, d.updates.size # only the opening full paint
+  # TWO updates, not M1's one, and both of them are startup: the opening full
+  # paint, and the board flush carrying the first puzzle. The loop itself
+  # still paints nothing on a turn with no input — its control flow is
+  # untouched, it runs exactly one turn and stops — so the second update is
+  # the first dig, which run now does BEFORE entering the loop rather than in
+  # the constructor.
+  assert_equal 2, d.updates.size
+  assert_equal RM2::GC16, d.updates[0][4]
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
+  # And the opening paint carries the splash rather than an empty grid: the
+  # first dig is the longest pause of the session, and the board is not worth
+  # looking at until it is over.
+  assert_false app.grid.nil?
 end
 
 assert('App#run repaints when the server resumes us') do
@@ -664,9 +779,15 @@ assert('App#run repaints when the server resumes us') do
   signals.resumed = true
   signals.terminated = true # one turn of the loop, then stop
   app.run
-  assert_equal 2, d.updates.size
+  # THREE updates where M1 had two. The startup pair comes first — full GC16
+  # paint, then the first puzzle's GL16 board — and the resume's full repaint
+  # is now the third rather than the second. The two GC16s this test is about
+  # are still the first and the last thing out, with only the first puzzle
+  # between them.
+  assert_equal 3, d.updates.size
   assert_equal RM2::GC16, d.updates[0][4]
-  assert_equal RM2::GC16, d.updates[1][4]
+  assert_equal RM2::GL16, d.updates[1][4]
+  assert_equal RM2::GC16, d.updates[2][4]
 end
 
 assert('a finger tap presses the button it landed on') do
@@ -949,4 +1070,127 @@ assert('a contact that met the pen mid-drag stays dead after the pen leaves') do
   # re-latch on. A resting palm jitters, and end_touch re-checks at the
   # lift, so the hole is narrow — but it is a hole, not a second rule.
   assert_true app.running?
+end
+
+# --- puzzle helpers. An App that holds a puzzle, and the two presses that
+# make it hold a different one. Built on new_app and pen_sample rather than a
+# parallel set, so a change to how an App is constructed lands in one place.
+
+def test_app
+  app, = new_app
+  app
+end
+
+def test_app_with_display
+  app, d, = new_app
+  [app, d]
+end
+
+def press_new(app)
+  press_pen_button(app, :new)
+end
+
+def press_level(app)
+  press_pen_button(app, :level)
+end
+
+# A tap: down and up on the centre of the named button, which is what every
+# existing press assertion above does by hand.
+def press_pen_button(app, name)
+  x, y, w, h = Redoku::Layout.button_rect(name)
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, true))
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, false))
+  app
+end
+
+assert('Rater tiers and Renderer difficulties are the same list') do
+  # Pinned because they are consumed as interchangeable: App cycles the
+  # renderer's list and hands the result to the generator as a tier. If they
+  # ever diverge, this fails here instead of silently drawing a wrong label.
+  assert_equal Redoku::Sudoku::Rater::TIERS, Redoku::Renderer::DIFFICULTIES
+end
+
+assert('App holds a generated puzzle once it has one') do
+  app = test_app
+  app.new_puzzle
+  assert_false app.grid.nil?
+  assert_true Redoku::Sudoku::Solver.unique?(app.grid.values)
+  assert_true app.grid.clue_count > 0
+end
+
+assert('App does not generate a puzzle in its constructor') do
+  # Generation is a search costing tens of milliseconds. Every existing App
+  # test constructs one, so a generating constructor would tax the whole
+  # suite and every future test.
+  app = test_app
+  assert_nil app.grid
+end
+
+assert('a tap on New generates a different puzzle') do
+  app = test_app
+  app.new_puzzle
+  before = app.grid.givens_s
+  press_new(app)
+  assert_false app.grid.givens_s == before
+  assert_true Redoku::Sudoku::Solver.unique?(app.grid.values)
+end
+
+assert('a tap on Level changes the difficulty and the puzzle with it') do
+  app = test_app
+  app.new_puzzle
+  before_tier = app.difficulty
+  before_puzzle = app.grid.givens_s
+  press_level(app)
+  assert_false app.difficulty == before_tier
+  assert_false app.grid.givens_s == before_puzzle
+end
+
+assert('the splash reaches the panel before generation finishes') do
+  # The splash is the only progress indication the player gets for a pause
+  # that PLAN.md §7 budgets at a few hundred ms on the Cortex-A7. If it is
+  # flushed after the puzzle is computed it is worthless.
+  app, d = test_app_with_display
+  app.new_puzzle
+  # The first update of the sequence must land before the board repaint that
+  # carries the finished puzzle, so there is more than one, in order.
+  assert_true d.updates.size >= 2
+end
+
+assert('a new puzzle clears the ink the player had written') do
+  app = test_app
+  app.new_puzzle
+  assert_nil app.ink_dirty
+end
+
+assert('a resume puts the puzzle back on the board it repaints') do
+  app, d = test_app_with_display
+  app.new_puzzle
+  d.clear_calls
+  app.handle_resume
+  # The full repaint is still the full repaint...
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                RM2::GC16, RM2::SYNC], d.updates[0]
+  # ...but draw_all paints an EMPTY board, so the puzzle has to go back on top
+  # of it. Without that, the first suspend and resume of a session would wipe
+  # the board the player was working on, and the GC16 would make the blank
+  # result look deliberate.
+  first_given = 0
+  first_given += 1 while !app.grid.given?(first_given)
+  assert_true d.glyph_in_cell?(first_given)
+end
+
+assert('an App given no rng seeds itself from the clock') do
+  # The `rng:` keyword's DEFAULT is the production path: main.rb omits it, so
+  # Rng.from_clock -- and with it Time, and with it the mruby-time dependency
+  # this gem now declares -- is exercised only by an App built without one.
+  # Every other App in this suite is handed a fixed seed so the suite stays
+  # deterministic, which is exactly why the default needs a test of its own
+  # rather than incidental coverage.
+  d = TestDisplay.new
+  input = FakeInput.new
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
+                        FakeWaiter.new([input]), FakeSignals.new)
+  app.new_puzzle
+  assert_false app.grid.nil?
+  assert_true Redoku::Sudoku::Solver.unique?(app.grid.values)
 end

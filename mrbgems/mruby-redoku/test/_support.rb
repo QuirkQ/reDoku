@@ -146,6 +146,54 @@ class TestDisplay
   end
 end
 
+# Stands in for a Time, for Rng.from_clock. It answers one fixed reading and
+# counts how often each half of it was asked for, so "reads the clock exactly
+# once" is something a test can check rather than assume.
+#
+# A SECOND read of either half answers a DRIFTED value — a second later, a
+# fresh microsecond — instead of raising. That is the hazard from_clock exists
+# to avoid, reproduced: two separate Time.now calls can straddle a second
+# boundary and mix a fresh microsecond into a stale second. Raising would also
+# make `reads` unable to ever exceed 1, which would turn the assertion that
+# reads it into one that cannot fail.
+class OneShotClock
+  def initialize(secs, usec)
+    @secs = secs
+    @usec = usec
+    @sec_reads = 0
+    @usec_reads = 0
+    @last_secs = secs
+    @last_usec = usec
+  end
+
+  def to_i
+    @sec_reads += 1
+    @last_secs = @sec_reads == 1 ? @secs : @secs + 1
+  end
+
+  def usec
+    @usec_reads += 1
+    @last_usec = @usec_reads == 1 ? @usec : @usec + 1
+  end
+
+  # One reading is one to_i AND one usec, so the two counters have to agree.
+  # When they do not the answer is nil rather than an average or a maximum: a
+  # caller that read the seconds twice and the microseconds never has not read
+  # the clock once, and `assert_equal 1, probe.reads` must not be talked into
+  # saying it did.
+  def reads
+    @sec_reads == @usec_reads ? @sec_reads : nil
+  end
+
+  # The seed the values this clock actually handed out imply. Pins the VALUE
+  # as well as the count: a from_clock that read the seconds twice would take
+  # the drifted one, and this would no longer match the seed the test asked
+  # for even though `reads` alone might.
+  def seed_seen
+    Redoku::Rng.clock_seed(@last_secs, @last_usec)
+  end
+end
+
 # --- sudoku fixtures, shared by the grid, solver, technique, rater and
 # generator suites. 81 characters, '.' for an empty cell, read row-major.
 # They live here rather than in one suite because four files assert against

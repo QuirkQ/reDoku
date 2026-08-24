@@ -185,7 +185,7 @@ module Redoku
     # The other half, and the reason draw_button takes its colours as
     # arguments: a pressed button has to come back up, because neither of the
     # two actions that survive their own press repaints the buttons
-    # (cycle_difficulty flushes the header, clear_ink the board), so an
+    # (cycle_difficulty flushes the header, new_puzzle the board), so an
     # inverted button would otherwise stay inverted for the session. Only
     # App knows which presses outlive themselves, so App decides — see
     # App#acknowledge.

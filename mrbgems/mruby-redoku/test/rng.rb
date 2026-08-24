@@ -123,3 +123,43 @@ assert('Rng.shuffle reaches many different permutations') do
   200.times { |s| seen.store(Redoku::Rng.new(s + 1).shuffle(source)[0], true) }
   assert_equal 9, seen.keys.size
 end
+
+assert('Rng.clock_seed mixes both halves of the clock') do
+  r = Redoku::Rng
+  # Sensitive to the sub-second half: two launches in the same second must
+  # not share a puzzle.
+  assert_false r.clock_seed(1_700_000_000, 0) == r.clock_seed(1_700_000_000, 1)
+  # And to the seconds half.
+  assert_false r.clock_seed(1_700_000_000, 5) == r.clock_seed(1_700_000_001, 5)
+  # It must stay inside a 32-bit SIGNED mrb_int, which is what the device
+  # has. A seed that overflows into Float promotion there would degrade
+  # puzzle variety on hardware while passing every host test.
+  assert_true r.clock_seed(1_700_000_000, 999_999) < 1073741824
+  assert_true r.clock_seed(1_700_000_000, 999_999) >= 0
+end
+
+assert('Rng seeded from a clock-sized value still spreads its draws') do
+  # Until now Rng only ever saw small test seeds. From here it receives a
+  # ~1.7e9 clock seed on a device whose mrb_int is 32-bit signed, so drive
+  # it from a realistic seed and check it has not degenerated.
+  r = Redoku::Rng.new(Redoku::Rng.clock_seed(1_700_000_000, 123_456))
+  seen = {}
+  300.times { seen.store(r.next_int(5), true) }
+  assert_equal 5, seen.keys.size
+  200.times do
+    n = r.next_int(10)
+    assert_true n >= 0
+    assert_true n < 10
+  end
+end
+
+assert('Rng.from_clock reads the clock exactly once') do
+  # One reading, not two: `Time.now.to_i ^ Time.now.usec` can straddle a
+  # second boundary and mix a fresh microsecond into a stale second.
+  probe = OneShotClock.new(1_700_000_000, 424_242)
+  rng = Redoku::Rng.from_clock(probe)
+  assert_equal 1, probe.reads
+  assert_equal Redoku::Rng.clock_seed(1_700_000_000, 424_242),
+               probe.seed_seen
+  assert_false rng.nil?
+end

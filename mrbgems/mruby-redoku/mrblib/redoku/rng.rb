@@ -41,6 +41,29 @@ module Redoku
     Q = 127773     # M / A
     R = 2836       # M % A
 
+    # Seeds from the wall clock, which is the only varying source available:
+    # Kernel#rand, srand and Random are all absent from this gem's mrbtest
+    # state, and RM2.monotonic_ms cannot be used because its epoch is the
+    # first call in the process (mruby-rm2's src/clock.c) — a seed default
+    # would BE that first call and would return 0 on every single launch,
+    # which is the identical-puzzle bug this method exists to prevent.
+    #
+    # `now` is a parameter so the reading can be faked in a test. It is read
+    # ONCE, deliberately: two separate Time.now calls can straddle a second
+    # boundary and mix a fresh microsecond into a stale second.
+    def self.from_clock(now = Time.now)
+      new(clock_seed(now.to_i, now.usec))
+    end
+
+    # Masked to 30 bits so the result always fits the device's 32-bit signed
+    # mrb_int with room to spare, rather than relying on Float promotion.
+    # XOR rather than a sum or a concatenation because both halves must
+    # matter: the seconds alone repeat for a whole second, and the
+    # microseconds alone repeat every second.
+    def self.clock_seed(secs, usec)
+      (secs ^ usec) & 0x3fffffff
+    end
+
     # State must be in 1..M-1: zero is a fixed point of the recurrence and
     # would emit nothing but zero for ever. Any seed is accepted and folded
     # into range rather than rejected, so callers may pass a tick count or a

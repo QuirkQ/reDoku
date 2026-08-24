@@ -64,10 +64,20 @@ module Redoku
     # [x1, y1, x2, y2] — the one rect in this codebase that is not
     # [x, y, w, h] with exclusive edges, because it grows corner by corner as
     # segments arrive and is converted only on its way out, in flush_ink.
-    attr_reader :difficulty, :ink_dirty
+    #
+    # `grid` is the puzzle on the board (nil until the first dig), `solution`
+    # its answer and `achieved_tier` the tier the generator actually reached —
+    # see fill_board for why the last of those is stored rather than shown.
+    attr_reader :difficulty, :ink_dirty, :grid, :solution, :achieved_tier
 
+    # `rng:` IS the boundary between a varying device and deterministic tests.
+    # Its default reads the wall clock, so each launch deals a different
+    # puzzle; Ruby evaluates a keyword default only when the argument is
+    # omitted, so a test that passes its own fixed-seed Rng never touches
+    # Time.now and generates the same boards every run.
     def initialize(display, sources, renderer, waiter = RM2::Input,
-                   signals = RM2, touch_sources: [], clock: RM2)
+                   signals = RM2, touch_sources: [], clock: RM2,
+                   rng: Rng.from_clock)
       @d = display
       @sources = sources
       @touch = touch_sources
@@ -75,7 +85,15 @@ module Redoku
       @waiter = waiter
       @signals = signals
       @clock = clock
+      @rng = rng
       @difficulty = Renderer::DIFFICULTIES[0]
+      # No puzzle until something asks for one. Generation is a search of tens
+      # of milliseconds here and PLAN.md §7 budgets a few hundred on the
+      # device, so it does not belong in a constructor that every test — and
+      # every future test — runs.
+      @grid = nil
+      @solution = nil
+      @achieved_tier = nil
       @running = true
       @mode = nil       # :ink, :button, :none, or nil for no stroke open
       @last = nil       # previous point of this stroke
@@ -100,9 +118,21 @@ module Redoku
       @running
     end
 
+    # The opening paint carries the SPLASH, and that ordering is the point:
+    # the first puzzle is dug before the loop starts, and that dig is the
+    # longest pause of the session. draw_all lays down the chrome, draw_splash
+    # replaces the board area with the status text, and one GC16 SYNC puts
+    # both on the panel — so the player reads GENERATING... rather than
+    # staring at an empty grid wondering whether the tap worked.
+    #
+    # One paint, not two: new_puzzle's own splash flush would be a second
+    # board refresh over a board that has this instant been painted with the
+    # splash already on it, so fill_board is called directly instead.
     def run
       @renderer.draw_all(@difficulty)
+      @renderer.draw_splash
       @renderer.flush_all
+      fill_board
       while @running
         step
         handle_resume if @signals.resumed?
@@ -193,6 +223,44 @@ module Redoku
       self
     end
 
+    # New: a fresh puzzle, and the ink the player had written goes with it.
+    #
+    # Repainting and flushing board_rect alone is enough to clear that ink,
+    # because ink cannot exist anywhere else: ink_to refuses any segment with
+    # an endpoint off the board, so every stamped pixel is within
+    # INK_WIDTH / 2 of a line inside board_rect — that is, inside it or on
+    # the Layout::BLOCK_LINE / 2 frame overhang, which draw_board repaints
+    # black over black (see Renderer#flush_board). That holds only while
+    # INK_WIDTH <= Layout::BLOCK_LINE, which is 4 and 4 today: a fatter
+    # brush reaches past the frame band onto white background, where stray
+    # ink would survive New and no host test could see it, because the mock
+    # records the update rather than rendering it. Raise INK_WIDTH and both
+    # flushes here have to widen with it.
+    #
+    # The splash is drawn and FLUSHED BEFORE the dig, not after: it is the
+    # only progress indication the player gets for a pause PLAN.md §7 budgets
+    # at a few hundred ms on the Cortex-A7, and a progress indication that
+    # reaches the panel once the work has finished is worse than none. It goes
+    # out through flush_board because draw_splash paints exactly board_rect
+    # (see Renderer#draw_splash), so the region is already the right one.
+    #
+    # No argument to draw_splash. Renderer::SPLASH_TEXT is pinned and
+    # glyph-asserted in one place because Font.draw silently draws NOTHING for
+    # a character it has no glyph for — the font holds only uppercase A-Z,
+    # 0-9, space, '-', ':' and '.' — so a literal here could paint a blank
+    # board under a fully green test suite.
+    #
+    # Public because it is what a New press does and what a test drives
+    # directly; the dig itself is fill_board, which cycle_difficulty and run
+    # also reach.
+    def new_puzzle
+      @ink_dirty = nil
+      @renderer.draw_splash
+      @renderer.flush_board
+      fill_board
+      self
+    end
+
     # After a SIGCONT the server has already re-flashed our buffer, but a
     # full repaint is the cheap way to be certain the panel matches us.
     #
@@ -208,6 +276,12 @@ module Redoku
     def handle_resume
       forget_input_state
       @renderer.draw_all(@difficulty)
+      # draw_all paints an EMPTY board, so the puzzle has to go back on top of
+      # it: without this the first suspend and resume would silently wipe the
+      # board the player was working on. Guarded because handle_resume is
+      # reachable before anything has been dug — every resume test does
+      # exactly that — and draw_puzzle wants a Grid.
+      @renderer.draw_puzzle(@grid) if @grid
       @renderer.flush_all
       self
     end
@@ -430,7 +504,7 @@ module Redoku
       case button
       when :quit then quit
       when :level then acknowledge(:level) { cycle_difficulty }
-      when :new then acknowledge(:new) { clear_ink }
+      when :new then acknowledge(:new) { new_puzzle }
       end
     end
 
@@ -453,10 +527,13 @@ module Redoku
     # repaint as their action and already read as responsive". Both halves
     # are false, and the device said so — the owner's report was that New and
     # Level "don't flash inverted and nothing visual occured", while both
-    # actions were in fact firing correctly the whole time. clear_ink's
-    # repaint is PIXEL-IDENTICAL on a board with no ink, and
-    # cycle_difficulty's only visible change is a header label about 1480 px
-    # from the finger that caused it, on a 1872 px screen.
+    # actions were in fact firing correctly the whole time. New's repaint —
+    # then a bare clear_ink, now new_puzzle — was PIXEL-IDENTICAL on a board
+    # with no ink, and cycle_difficulty's only visible change was a header
+    # label about 1480 px from the finger that caused it, on a 1872 px screen.
+    # Neither is invisible any more, now that both draw a fresh puzzle, but the
+    # acknowledgement is what makes the tap land AT ONCE rather than after a
+    # dig the player has no other reason to expect.
     #
     # ORDER — the action runs INSIDE the press, not before or after it.
     # 200 ms is how long a press lasts, not a toll the game may charge for
@@ -483,7 +560,7 @@ module Redoku
     #
     # What this deliberately does NOT cover, because it is the actions' own
     # pre-existing shape rather than the acknowledgement's: a flush raised by
-    # cycle_difficulty or clear_ink themselves still unwinds out of the loop,
+    # cycle_difficulty or new_puzzle themselves still unwinds out of the loop,
     # past main.rb's explicit display.close, and leaves the button inverted
     # on the way out. Containing that means making main.rb close the display
     # come what may, which is a change to the entry point, not to this
@@ -515,28 +592,64 @@ module Redoku
       false
     end
 
+    # Level advances the tier, repaints the label AND digs a new board at the
+    # new tier, because a tier means nothing until a puzzle of that tier is on
+    # the glass — a Level press that only changed a word would be a setting,
+    # not a button.
+    #
+    # Header first, puzzle second. The label is the cheap half and answers the
+    # tap at once; new_puzzle's splash then covers the dig, which is the
+    # expensive half. Doing it the other way round would leave the old tier's
+    # name over the new tier's board for the whole search.
     def cycle_difficulty
       list = Renderer::DIFFICULTIES
       @difficulty = list[(list.index(@difficulty) + 1) % list.size]
       @renderer.draw_header(@difficulty)
       @renderer.flush_header
+      new_puzzle
     end
 
-    # New wipes the ink. Repainting and flushing board_rect alone is enough
-    # because ink cannot exist anywhere else: ink_to refuses any segment with
-    # an endpoint off the board, so every stamped pixel is within
-    # INK_WIDTH / 2 of a line inside board_rect — that is, inside it or on
-    # the Layout::BLOCK_LINE / 2 frame overhang, which draw_board repaints
-    # black over black (see Renderer#flush_board). That holds only while
-    # INK_WIDTH <= Layout::BLOCK_LINE, which is 4 and 4 today: a fatter
-    # brush reaches past the frame band onto white background, where stray
-    # ink would survive New and no host test could see it, because the mock
-    # records the update rather than rendering it. Raise INK_WIDTH and this
-    # flush has to widen with it.
-    def clear_ink
-      @ink_dirty = nil
+    # Digs a puzzle at the current difficulty and puts it on the board. The
+    # caller owns the splash — new_puzzle flushes one first, and run's opening
+    # GC16 already carries one — so this is the second half of both.
+    #
+    # WHAT THE HEADER SHOWS is settled here, and it shows the REQUESTED tier:
+    # @difficulty is what cycle_difficulty advanced, what draw_header printed
+    # and what the generator was asked for. Generator.generate also reports
+    # the tier it ACTUALLY achieved, which really can differ — one measured
+    # solution in four yields no board harder than easy anywhere along its
+    # chain (see Generator#dig) — and that value is RECORDED in
+    # @achieved_tier rather than displayed.
+    #
+    # The reason is that the header is the Level button's read-out, not a
+    # rating of the board. @difficulty is the one piece of state Level cycles,
+    # so a label that followed the achieved tier would make the button
+    # unpredictable: ask for medium, get easy, and the label reads EASY — so
+    # the next press reads EASY as the current tier and offers medium again,
+    # three presses stop visiting three labels, and HARD can become
+    # unreachable. Splitting the two apart into "the tier you asked for" and
+    # "the tier you got" is also what keeps M1's one-step-per-tap guarantee
+    # (test/app.rb, 'the acknowledgement runs each action exactly once')
+    # meaningful.
+    #
+    # The counter-argument is real and worth writing down: the label then
+    # overstates a near miss, telling a player HARD over a board that rated
+    # medium. That is why the achieved tier is stored rather than discarded —
+    # M3 owns whether to surface it (a parenthetical in the header, a
+    # re-request, a menu), and it has the value to do so.
+    def fill_board
+      puzzle = Sudoku::Generator.generate(@difficulty, @rng)
+      @grid = puzzle[:grid]
+      # Kept, not used. M3's Check needs the answer and the generator has
+      # already paid for computing it, so throwing it away would mean digging
+      # a second time or solving the board again. Nothing in M2 reads it:
+      # there is no Check here, by scope.
+      @solution = puzzle[:solution]
+      @achieved_tier = puzzle[:tier]
       @renderer.draw_board
+      @renderer.draw_puzzle(@grid)
       @renderer.flush_board
+      self
     end
 
     # Grows the pending damage rect by the brush extent so every pixel the
