@@ -66,6 +66,55 @@ module Redoku
       ORDER = [:naked_single, :hidden_single, :pointing, :naked_pair,
                :naked_triple, :hidden_pair, :hidden_triple, :x_wing].freeze
 
+      # A bit per rule, in ORDER's positions. This is how a caller asks for a
+      # solve with a RESTRICTED repertoire, which is what Rater's demand
+      # classifier needs: "is this board finished by singles alone?" is a
+      # question about a rule SET, and the answer cannot be read off a single
+      # solve (see Rater::DEMAND_SETS).
+      #
+      # Derived from ORDER rather than written out, so a rule added to ORDER
+      # gets a bit automatically. Built by a method called from the class body,
+      # the house pattern Grid.build_rows and Grid.build_peers already use:
+      # a constant that raises while building takes the whole gem down at load
+      # and every other suite with it, so the building code wants to be plain.
+      # (Object#tap would read better as a one-liner and is genuinely absent --
+      # mruby-object-ext is one of the gems this gem still does not declare.)
+      def self.build_rule_bits
+        bits = {}
+        i = 0
+        while i < ORDER.size
+          bits.store(ORDER[i], 1 << i)
+          i += 1
+        end
+        bits
+      end
+      RULE_BIT = build_rule_bits.freeze
+
+      # Every rule. The default for `solve`, so today's one-argument callers
+      # are unaffected.
+      ALL_RULES = (1 << ORDER.size) - 1
+
+      # The mask for a list of rule names. An unknown name contributes
+      # nothing, deliberately: this runs inside generation and the safety net
+      # firing should make a board look HARDER (a weaker set fails, so the
+      # demand class rises) rather than kill the game. Rater's tables are
+      # pinned against ORDER by a test, which is where a typo is caught.
+      def self.mask_of(rules)
+        m = 0
+        rules.each do |name|
+          bit = RULE_BIT[name]
+          m |= bit if bit
+        end
+        m
+      end
+
+      # Does this set of rules finish this board? One solve, no search, no
+      # guessing. A set containing no WRITING rule (neither single) can never
+      # finish an unfinished board however much it eliminates.
+      def self.solves?(values, rules)
+        solve(values, mask_of(rules))[:solved]
+      end
+
       # Bounded well above the real worst case (81 writes plus 729 possible
       # bit removals). Reaching it means a rule is claiming progress it did
       # not make. It BREAKS rather than raises: this runs inside puzzle
@@ -73,30 +122,56 @@ module Redoku
       # rated harder than it really is, never a game that dies mid-tap.
       MAX_PASSES = 4000
 
-      def self.solve(values)
+      # `rules` restricts the repertoire to a mask of RULE_BIT bits. The
+      # default is every rule, so a one-argument call is exactly what it was.
+      #
+      # WHY A MASK AND NOT A DISPATCH TABLE. Object#send IS available (this
+      # gem declares mruby-metaprog since 18cc2f5), so the old reason for this
+      # shape is gone -- but the shape is right anyway, on two grounds that do
+      # not expire. A table of Method objects still needs the Method class,
+      # and mruby-method is one of the gems this gem does not declare. And
+      # SPEED: this loop is the hot path of the whole engine -- Rater.measure
+      # calls it once per board, the generator measures up to 16 boards per
+      # chain walk plus a ~27-board floor neighbourhood, and :master runs 150
+      # of those. Eight guarded ifs cost one bitwise AND per rule per pass;
+      # eight `send`s cost eight symbol dispatches per pass.
+      def self.solve(values, rules = ALL_RULES)
         work = values.dup
         cand = candidate_grid(work)
         hardest = nil
         counts = {}
         passes = 0
 
+        do_naked_single  = (rules & RULE_BIT[:naked_single]) != 0
+        do_hidden_single = (rules & RULE_BIT[:hidden_single]) != 0
+        do_pointing      = (rules & RULE_BIT[:pointing]) != 0
+        do_naked_pair    = (rules & RULE_BIT[:naked_pair]) != 0
+        do_naked_triple  = (rules & RULE_BIT[:naked_triple]) != 0
+        do_hidden_pair   = (rules & RULE_BIT[:hidden_pair]) != 0
+        do_hidden_triple = (rules & RULE_BIT[:hidden_triple]) != 0
+        do_x_wing        = (rules & RULE_BIT[:x_wing]) != 0
+
         while passes < MAX_PASSES
           passes += 1
 
-          i = find_naked_single(cand)
-          if i
-            place(work, cand, i, Grid::BIT_LIST[cand[i]][0])
-            hardest = harder(hardest, :naked_single)
-            tally(counts, :naked_single)
-            next
+          if do_naked_single
+            i = find_naked_single(cand)
+            if i
+              place(work, cand, i, Grid::BIT_LIST[cand[i]][0])
+              hardest = harder(hardest, :naked_single)
+              tally(counts, :naked_single)
+              next
+            end
           end
 
-          spot = find_hidden_single(cand)
-          if spot
-            place(work, cand, spot[0], spot[1])
-            hardest = harder(hardest, :hidden_single)
-            tally(counts, :hidden_single)
-            next
+          if do_hidden_single
+            spot = find_hidden_single(cand)
+            if spot
+              place(work, cand, spot[0], spot[1])
+              hardest = harder(hardest, :hidden_single)
+              tally(counts, :hidden_single)
+              next
+            end
           end
 
           # The eliminators mutate `cand` in place and write no digit. They
@@ -104,32 +179,32 @@ module Redoku
           # cheap writing rules get another look after each one. They appear
           # here in ORDER, and that is not cosmetic: an expensive rule that
           # ran first would be credited for work a cheap one could have done.
-          if pointing(cand)
+          if do_pointing && pointing(cand)
             hardest = harder(hardest, :pointing)
             tally(counts, :pointing)
             next
           end
-          if naked_pair(cand)
+          if do_naked_pair && naked_pair(cand)
             hardest = harder(hardest, :naked_pair)
             tally(counts, :naked_pair)
             next
           end
-          if naked_triple(cand)
+          if do_naked_triple && naked_triple(cand)
             hardest = harder(hardest, :naked_triple)
             tally(counts, :naked_triple)
             next
           end
-          if hidden_pair(cand)
+          if do_hidden_pair && hidden_pair(cand)
             hardest = harder(hardest, :hidden_pair)
             tally(counts, :hidden_pair)
             next
           end
-          if hidden_triple(cand)
+          if do_hidden_triple && hidden_triple(cand)
             hardest = harder(hardest, :hidden_triple)
             tally(counts, :hidden_triple)
             next
           end
-          if x_wing(cand)
+          if do_x_wing && x_wing(cand)
             hardest = harder(hardest, :x_wing)
             tally(counts, :x_wing)
             next

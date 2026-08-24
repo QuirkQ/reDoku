@@ -598,3 +598,67 @@ assert('find_naked_single finds a one-candidate cell and nothing less') do
   none[3] = 0
   assert_nil t.find_naked_single(none)
 end
+
+assert('Techniques rule masks name every rule in ORDER, once') do
+  t = Redoku::Sudoku::Techniques
+  # One bit per rule, in ORDER's own positions: the mask is how a caller says
+  # "solve with these rules and no others", and a rule missing from the table
+  # would silently be unaskable.
+  assert_equal(t::ORDER.size, t::RULE_BIT.size)
+  t::ORDER.each_with_index do |name, i|
+    assert_equal(1 << i, t::RULE_BIT[name])
+  end
+  # Every bit set, and nothing above them.
+  assert_equal((1 << t::ORDER.size) - 1, t::ALL_RULES)
+  t::ORDER.each { |name| assert_true (t::ALL_RULES & t::RULE_BIT[name]) != 0 }
+
+  # mask_of turns the readable form (a list of names) into the fast one.
+  assert_equal(0, t.mask_of([]))
+  assert_equal(t::RULE_BIT[:x_wing], t.mask_of([:x_wing]))
+  assert_equal(t::ALL_RULES, t.mask_of(t::ORDER))
+  # An unknown name contributes NOTHING rather than raising. That is the
+  # UNKNOWN_WEIGHT convention: this runs inside generation, and the cost of a
+  # typo should be a board that looks harder than it is (a weaker set fails to
+  # solve it, so its demand class comes out higher), never a game that dies
+  # mid-tap. Rater's table-agreement test is what actually catches the typo.
+  assert_equal(t::RULE_BIT[:pointing], t.mask_of([:pointing, :not_a_rule]))
+end
+
+assert('Techniques.solve with every rule is exactly what it was') do
+  t = Redoku::Sudoku::Techniques
+  # The filter must be free when nothing is filtered: this is the equivalence
+  # the design measured at 289/289 boards, asserted here on the fixtures.
+  [SOLVED_81, EASY_81, UNIQUE_81, MULTI_81].each do |board|
+    values = values_of(board)
+    plain = t.solve(values)
+    masked = t.solve(values, t::ALL_RULES)
+    assert_equal(plain[:solved], masked[:solved])
+    assert_equal(plain[:hardest], masked[:hardest])
+    assert_equal(plain[:counts], masked[:counts])
+    assert_equal(plain[:values], masked[:values])
+  end
+end
+
+assert('Techniques.solves? answers for a set of rules, not for all of them') do
+  t = Redoku::Sudoku::Techniques
+  singles = [:naked_single, :hidden_single]
+
+  # EASY_81's two holes are each forced by their row, so singles finish it.
+  assert_true t.solves?(values_of(EASY_81), singles)
+  # A finished board needs no rule at all, so even the empty set "solves" it.
+  assert_true t.solves?(solved_values, [])
+  # MULTI_81 has three givens: nothing our eight rules know can force a cell.
+  assert_false t.solves?(values_of(MULTI_81), t::ORDER)
+  assert_false t.solves?(values_of(MULTI_81), singles)
+
+  # A set with no WRITING rule can never finish an unfinished board, however
+  # much it eliminates. Worth pinning: it is the one way to hand solves? a set
+  # that cannot possibly work, and a caller could do it by accident.
+  assert_false t.solves?(values_of(EASY_81), [:naked_pair, :x_wing])
+
+  # It does not mutate the board it is asked about.
+  values = values_of(EASY_81)
+  before = values.dup
+  t.solves?(values, t::ORDER)
+  assert_equal(before, values)
+end
