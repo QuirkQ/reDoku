@@ -29,7 +29,18 @@ unit tests. No C in this change.
 the raw script output every number here traces back to. Secondary:
 `docs/design/difficulty-rating.md` (the decision record this plan partly
 supersedes and Task 6 corrects), `PLAN.md` §7 (engine) and §8 (layout). The
-spec travels with the plan; executors read both.
+spec travels with the plan; executors read both. This plan departs from the
+design in six places; they are enumerated in Task 6 Step 4 rather than left in
+code comments, and the Self-Review coverage table flags them per section.
+
+**Baseline:** revised against `2bebc4e` (2026-08-24). The first draft was
+written against `2aae216` and three commits landed under it — `75eb7cf`
+(deleted `Renderer::DIFFICULTIES`, landed `fill_board`'s nil guard), `c437d95`
++ `2bebc4e` (the pen eraser: `Renderer#redraw_cell`, `boundary_weight` /
+`leading_band` / `trailing_band`, `Sudoku::Grid.index_of`) and `18cc2f5`
+(declared eleven core gems, which retired most of Global Constraint 1). **Every
+line number below was re-verified at `2bebc4e`, and they have already moved
+twice — re-verify with `grep -n` rather than trusting them.**
 
 ---
 
@@ -37,46 +48,96 @@ spec travels with the plan; executors read both.
 
 These are project-wide. Every task's requirements implicitly include them.
 
-**1. The mrbtest dependency trap — measured, and this project has been bitten
-four times.** A gem's mrbtest state holds only its *declared* dependencies,
-while the shipped device binary links the whole `default` gembox. So code
-using an undeclared gem's method **passes on the device and crashes under
-`make test`**. `mruby-redoku` declares `mruby-rm2`, `mruby-string-ext` and
-`mruby-time` — nothing else.
+**1. The mrbtest dependency trap — real, but the forbidden list this project
+carried for two milestones was mostly fiction, and `18cc2f5` retired it.**
 
-**UNAVAILABLE — do not write these:**
+The mechanism is unchanged and still worth stating: a gem's mrbtest state
+holds only its *declared* dependencies, while the shipped device binary links
+the whole `default` gembox. So code using an **undeclared** gem's method
+passes on the device and raises `NoMethodError` under `make test`. This
+project was bitten four times by that gap.
 
-- `Array`: `uniq` `sum` `count` `sort_by` `flat_map` `tally` `take` `drop`
-  `fetch` `each_with_object` `none?` `one?` `filter` `compact` `flatten`
-  `combination` `permutation` `shuffle` `sample` `each_slice` `each_cons`
-  `minmax` `group_by` `rotate` `product` `transpose` `zip` `find_index`
-  `assoc` `values_at`
-- `Integer`: `zero?` `even?` `odd?` `positive?` `negative?` `clamp` `pow`
-  `gcd` `lcm` `pred` `digits`
-- `String`: `%` `format`
-- `Hash`: `fetch` `merge!` `each_pair` `min_by` `max_by` `count` `group_by`
-  `each_with_object` `sort_by`
-- `Kernel`: `rand` `srand` `format` `sprintf` `catch` `throw`
-- Classes absent entirely: `Set`, `Struct`, `Random`
+What changed is the size of the gap. `18cc2f5` read `build_config.rb` (both
+targets call `conf.gembox 'default'`) against `mrbgems/default.gembox`, found
+that the binary already linked stdlib, stdlib-ext, stdlib-io, math and
+metaprog, and **declared eleven of those gems** so that `make test` sees what
+already ships. `mruby-redoku` now declares:
 
-**AVAILABLE and used below:** `Array#each` `#map` `#select` `#reject` `#find`
-`#index` `#min` `#max` `#sort` `#any?` `#all?` `#reduce` `#each_with_index`
-`#first` `#last` `#dup` `#push` `#<<` `#pop` `#include?` `#empty?` `#size`
-`#reverse` `#join` `#delete` `#delete_at` `#slice`; `Integer#times` `#upto`
-`#downto` `#step` `#div` `#divmod` `#abs` `#succ` `#to_s` `#between?`;
-`String#each_char` `#chars` `#split` `#to_i` `#+` `#*` `#include?`;
-`Hash#each` `#each_key` `#keys` `#values` `#store` `#delete` `#size` `#key?`
-`#has_key?`; `Symbol#to_s`.
+```
+mruby-rm2  mruby-string-ext  mruby-time
+mruby-array-ext  mruby-enum-ext  mruby-hash-ext  mruby-numeric-ext
+mruby-compar-ext  mruby-sprintf  mruby-random  mruby-catch  mruby-set
+mruby-struct  mruby-metaprog
+```
 
-Consequences, not left to the implementer:
+**Proven, not argued:** `make test` totals identical before and after
+(Total 2455, OK 2410, KO 0, Crash 0, Skip 45), a 13-assertion probe of the
+newly visible methods passed and was deleted, `make build` clean with a valid
+ARM ELF — and **no `make clean` was needed**, even declaring eleven gems at
+once.
 
-- Write `x == 0`, never `x.zero?`. Write `n % 2 == 0`, never `n.even?`.
-- Build strings with `+`, `<<` and `join` — never `%`, `format` or `sprintf`.
-  Every log line and every label in this change is built that way.
+**So all of these are now LEGAL under `make test`:** every `Array` and
+`Enumerable` method (`uniq` `sum` `count` `sort_by` `flat_map` `tally`
+`each_with_object` `none?` `one?` `compact` `flatten` `zip` `group_by`
+`filter` — `filter` reaches us as `alias filter select` in `mruby-enum-ext`);
+every `Hash` extension (`fetch` `merge!` `min_by` `max_by`, and `each_pair`
+as `alias each_pair each` in `mruby-hash-ext`); every `Integer` extension
+(`zero?` `even?` `odd?` `clamp` `pow` `digits`); `format` / `sprintf` /
+`String#%`; `Kernel#rand` / `srand`; `catch` / `throw`; `Set`; `Struct`;
+and — the one that changes a decision in Task 5 — `Object#send` and
+`Object#instance_variable_set`, both from `mruby-metaprog`.
+
+**GENUINELY UNAVAILABLE, and this is the whole list that matters here:**
+
+- **`Integer#pred`** — absent from the mruby checkout entirely, not merely
+  undeclared. Zero matches anywhere. Write `n - 1`.
+- **Anything from a gem the `default` gembox links but this gem still does
+  not declare.** Those are `mruby-object-ext`, `mruby-range-ext`,
+  `mruby-symbol-ext`, `mruby-proc-ext`, `mruby-kernel-ext`,
+  `mruby-class-ext`, `mruby-method`, `mruby-eval`, `mruby-binding`,
+  `mruby-proc-binding`, `mruby-regexp`, `mruby-objectspace`, `mruby-fiber`,
+  `mruby-enumerator` (and `-lazy` / `-chain`), `mruby-pack`, `mruby-data`,
+  `mruby-toplevel-ext`, `mruby-math`, and the `mruby-io` family. The two that
+  this change actually touches:
+  - **`Object#tap`** (`mruby-object-ext`) — still absent. Task 1's table
+    builder is written without it.
+  - **`Method` / `UnboundMethod`** (`mruby-method`) — still absent, which is
+    still half the reason `Techniques.solve` filters with a bitmask rather
+    than a dispatch table (the other half is speed; see Task 1 Step 4).
+  - **`$stderr`** (`mruby-io`) — undefined under `make test`, and an
+    undefined global in Ruby is `nil`, not an error. That is exactly what
+    Task 5's `@log.puts(...) if @log` guard is for; do not remove it, and do
+    not declare `mruby-io` to make it go away.
+
+**TWO CAUTIONS, because "it is legal now" is not "rewrite it".**
+
+- **Do not rewrite speed-driven hand-rolled code.** The candidate bitmasks,
+  the allocation-free solver loops and `Grid.count_bits`'s nine-iteration
+  loop exist because bitwise operations are the fastest thing on a Cortex-A7
+  and the solver runs tens of thousands of times per puzzle. `Array#sum` over
+  a candidate mask would be correct and slower. Leave them.
+- **Do not mass-convert `x == 0` to `x.zero?`.** Legal now, not clearer, and
+  the churn would touch hot files for no benefit. Two comments in the tree
+  currently justify `== 0` by claiming `Integer#zero?` is unavailable —
+  `Renderer#boundary_weight` and `Rater.band`. The second is deleted by
+  Task 2; the first is corrected by Task 4, which is already editing that
+  file. Nothing else moves.
+
+Consequences that survive, and are not left to the implementer:
+
 - Build lookup tables with `times`/`while` loops in a `def self.build_*`
   method called from the class body, the way `Grid.build_rows` and
-  `Grid.build_peers` already do. A constant that fails to build takes the
-  whole gem down at load, and takes every other suite with it.
+  `Grid.build_peers` already do. This is house style, not a workaround: a
+  constant that fails to build takes the whole gem down at load, and takes
+  every other suite with it, so the building code wants to be readable.
+- **The "adding a dependency forces every contributor to `make clean`"
+  belief is WEAKENED, not established.** It comes from M1 fix wave A and has
+  now failed to reproduce twice — once with one gem (`mruby-time`), once with
+  eleven at a stroke. Two data points against, none for. It is a single trial
+  at eleven gems rather than a stress test of every irep-renumbering
+  scenario, so it is not *disproved*; but stop presenting it as a known cost,
+  and stop citing it as a reason to avoid a dependency. Nothing in this plan
+  adds one.
 
 **2. Integer width.** `mrb_int` is 64-bit on the host and **32-bit on the
 device**. Nothing here may rely on more. The widest product in this change is
@@ -97,20 +158,44 @@ sudoku/techniques.rb  touch.rb
 constant expression** — that raises `NameError` at load. The design document's
 §6.1 sketch does exactly that (`DEMAND_SETS = [ ..., Techniques::ORDER ]`) and
 it would take the gem down. Task 2 spells the fourth set out in full and pins
-its agreement with `ORDER` in a test, which is the same remedy `test/app.rb`
-already uses for `DIFFICULTIES == Rater::TIERS`. `Generator` loads before both
-`Rater` and `Techniques`, so its constants must be literals too.
+its agreement with `ORDER` in a test. `Generator` loads before both `Rater`
+and `Techniques`, so its constants must be literals too.
 
-**4. Verified signatures.** Get these right; the previous plan got three of
-them wrong:
+**There is no precedent for that pin in this gem any more, and the one that
+existed was deleted for being vacuous.** `75eb7cf` removed
+`Renderer::DIFFICULTIES` *and* "the vacuous test pinning the two lists equal",
+on the grounds that the constant was a duplicate of `Sudoku::Rater::TIERS`
+with no reason to exist. So Task 2's `DEMAND_SETS`-against-`ORDER` assertion
+is the **first** guard of its kind here, and it has to justify itself rather
+than cite a house pattern. It does, and the difference from the deleted one is
+the point: `DIFFICULTIES == TIERS` pinned two literals that had no reason to
+be separate, so the fix was to delete one of them. `DEMAND_SETS` **must** be a
+literal — the load order forbids the reference — so the copy is forced, and a
+test is the only thing that can keep a forced copy honest.
+
+**4. Verified signatures.** Re-checked against HEAD; the previous plan got
+three of them wrong:
 
 - `Layout.cell_rect(col, row)` takes **two** arguments and returns
   `[x, y, w, h]`.
-- `Font.width(text, scale)` takes **two** arguments.
+- `Font.width(text, scale)` takes **two** arguments, and is
+  `text.size * 6 * scale - scale` — so a 6-character label at `LABEL_SCALE 5`
+  is 175 px.
 - `Font.draw(display, text, x, y, scale, gray)` — `text` is the **third**
   argument, after the display.
 - The cell-count constant is `Sudoku::Grid::CELLS` (81). There is
   deliberately **no** `Grid::SIZE`, because `Layout::SIZE` already means 9.
+- `Sudoku::Grid.index_of(col, row)` exists (added by the eraser work) and is
+  the inverse of `Grid.col_of` / `Grid.row_of`.
+- `Renderer` has private `centered_origin(text, scale, x, y, w, h)` and — new
+  from the eraser work — private `boundary_weight` / `leading_band` /
+  `trailing_band`, plus public `redraw_cell(index, grid)`. Task 4 appends to
+  this file; read it whole first, because no snippet in this plan quotes it as
+  it now stands.
+- **`Renderer::DIFFICULTIES` DOES NOT EXIST.** It was deleted in `75eb7cf`.
+  The tier list has exactly one home, `Sudoku::Rater::TIERS`, and `app.rb`
+  (`:93`, `:719`) and `test/app.rb` (`:759`, `:909`) already read it directly.
+  Nothing in this plan may reference `Renderer::DIFFICULTIES`.
 - `Font::GLYPHS` holds `A-Z`, `0-9`, space, `-`, `:` and `.` and **nothing
   else**. `Font.draw` silently draws nothing for a missing glyph while still
   advancing the cursor, so `:very_hard` would render as `VERY`, a gap, `HARD`,
@@ -135,6 +220,12 @@ the classifier directly on a fixture board. Reachability is established once,
 by a throwaway measurement script whose output is pasted into the Task 3
 commit message — the same discipline the design used.
 
+`:medium` at its production cap of 12 **is** allowed, and two `test/app.rb`
+tests pay it because they construct an `App` directly (Task 2 Step 7 names
+them). It is p50 90 ms but p90 552 ms and max 1309 ms, which makes it the
+suite's largest single cost — worth knowing before blaming a slow run on the
+new floor rescue.
+
 ---
 
 ## File Structure
@@ -148,7 +239,7 @@ mrbgems/mruby-redoku/
 │   │   └── generator.rb    MOD  Task 2,3  tier-equality accept; deep walk,
 │   │                                      floor rescue, per-tier attempts,
 │   │                                      progress block
-│   ├── renderer.rb         MOD  Task 2,4  five DIFFICULTIES; progress bar
+│   ├── renderer.rb         MOD  Task 4  progress bar (+ one stale comment)
 │   └── app.rb              MOD  Task 2,5  generator seam; retry loops, nil
 │                                          guard, cross-retry bar, log
 └── test/
@@ -161,11 +252,16 @@ mrbgems/mruby-redoku/
 docs/
 ├── design/difficulty-rating.md   MOD  Task 6  the overturned decision
 └── plans/2026-08-24-difficulty-rework.md      this file
-PLAN.md                            MOD  Task 6  §7 bands, §10 M2 note
+PLAN.md                            MOD  Task 6  §7 engine, §10 M2 note
 ```
 
-`mrbgem.rake` is **not** modified: no new dependency, which is the point of
-every constraint above.
+**`renderer.rb` is NOT touched by Task 2.** An earlier draft of this plan had
+Task 2 grow `Renderer::DIFFICULTIES` to five names; that constant no longer
+exists (`75eb7cf`), so there is nothing to grow and the five-name list lands
+once, in `Rater::TIERS`. Renderer's only involvement is Task 4's bar.
+
+`mrbgem.rake` is **not** modified: this change needs no gem that `18cc2f5` did
+not already declare.
 
 ---
 
@@ -196,7 +292,12 @@ total spent — the caller counts the total from the block (see Task 5).
 **App's**, not the generator's: `num` counts attempts completed across every
 retry of one press, `den` is `num + total`. Never a Float, never a percentage
 string. Task 5 explains why that shape and not the design's `retry_cap`
-formula.
+formula — and names what it costs, because this shape has a visible
+consequence the design's did not: **the bar never fills.** An `:easy` press
+that hits on its first attempt stops at 1/(1+6) = 14% and is then replaced by
+the board. Design §6.5 promised "the bar jumps to full — correct, and cheap";
+under this shape it does not, and that is a deliberate trade recorded in Task
+5, not an oversight.
 
 ---
 
@@ -313,9 +414,12 @@ In `techniques.rb`, immediately after the `ORDER` constant and before
       # solve (see Rater::DEMAND_SETS).
       #
       # Derived from ORDER rather than written out, so a rule added to ORDER
-      # gets a bit automatically. Built by a method called from the class body
-      # because Array#each_with_index into a Hash is fine but Range#map and
-      # Object#tap are not in this gem's mrbtest state.
+      # gets a bit automatically. Built by a method called from the class body,
+      # the house pattern Grid.build_rows and Grid.build_peers already use:
+      # a constant that raises while building takes the whole gem down at load
+      # and every other suite with it, so the building code wants to be plain.
+      # (Object#tap would read better as a one-liner and is genuinely absent --
+      # mruby-object-ext is one of the gems this gem still does not declare.)
       def self.build_rule_bits
         bits = {}
         i = 0
@@ -363,10 +467,16 @@ body keeps the shape it has today:
       # `rules` restricts the repertoire to a mask of RULE_BIT bits. The
       # default is every rule, so a one-argument call is exactly what it was.
       #
-      # WHY A MASK AND NOT `send`: Object#send is not in this gem's mrbtest
-      # state, and a table of Method objects needs a Method class this gem
-      # does not have either. Eight guarded ifs is also the cheapest thing on
-      # the device: one bitwise and per rule per pass.
+      # WHY A MASK AND NOT A DISPATCH TABLE. Object#send IS available (this
+      # gem declares mruby-metaprog since 18cc2f5), so the old reason for this
+      # shape is gone -- but the shape is right anyway, on two grounds that do
+      # not expire. A table of Method objects still needs the Method class,
+      # and mruby-method is one of the gems this gem does not declare. And
+      # SPEED: this loop is the hot path of the whole engine -- Rater.measure
+      # calls it once per board, the generator measures up to 16 boards per
+      # chain walk plus a ~27-board floor neighbourhood, and :master runs 150
+      # of those. Eight guarded ifs cost one bitwise AND per rule per pass;
+      # eight `send`s cost eight symbol dispatches per pass.
       def self.solve(values, rules = ALL_RULES)
         work = values.dup
         cand = candidate_grid(work)
@@ -476,8 +586,10 @@ searches, which is a separate question with its own tests.
 **Files:**
 - Modify: `mrbgems/mruby-redoku/mrblib/redoku/sudoku/rater.rb`
 - Modify: `mrbgems/mruby-redoku/mrblib/redoku/sudoku/generator.rb`
-- Modify: `mrbgems/mruby-redoku/mrblib/redoku/renderer.rb` (one constant)
 - Modify: `mrbgems/mruby-redoku/mrblib/redoku/app.rb` (one keyword)
+- **Not** `renderer.rb`: `Renderer::DIFFICULTIES` was deleted in `75eb7cf`
+  and `Rater::TIERS` is the only tier list. Nothing in the renderer knows how
+  many rungs there are.
 - Modify: `mrbgems/mruby-redoku/test/_support.rb` (three fixtures)
 - Modify: `mrbgems/mruby-redoku/test/sudoku_rater.rb` (large rewrite)
 - Modify: `mrbgems/mruby-redoku/test/sudoku_generator.rb`
@@ -490,7 +602,8 @@ searches, which is a separate question with its own tests.
   - `Rater::TIERS` = `[:easy, :medium, :hard, :expert, :master]`
   - `Rater::DEMANDS` = `[:singles, :locked, :subset, :xwing]`
   - `Rater::DEMAND_SETS` — four Arrays of rule symbols, each a superset of the
-    last
+    last, and each — as a *set* — a contiguous prefix of `Techniques::ORDER`
+    (see Step 4; the classifier's early break depends on it)
   - `Rater::DEMAND_RANGE` — demand → `[first_tier_index, last_tier_index]`
   - `Rater::DEMAND_EDGES` — demand → Array of score edges inside its range
   - `Rater::RULE_LEVEL` — rule symbol → its index in `DEMANDS`
@@ -504,17 +617,17 @@ searches, which is a separate question with its own tests.
     `STALL_FLOOR` `TECHNIQUE_FLOOR` `slack` `accepts?` `in_band?` `band`
     `band_for` `harder_tier`, and `measure`'s `:guesses` and
     `:technique_points` keys
-  - `Renderer::DIFFICULTIES` = the five tiers
   - `App.new(..., generator: Sudoku::Generator)` — a new keyword
   - Fixtures `LOCKED_81`, `PAIR_81`, `XWING_81` in `test/_support.rb`
 
 - [ ] **Step 1: Write the failing test for the ladder tables**
 
 In `test/sudoku_rater.rb`, **replace** the assertion named `'Rater bands tile
-the whole score range with no gap or overlap'` (lines 50–73, the one that pins
-`TIERS.size == CEILING.size`) and the two that follow it, `'Rater.band_for
-places a score in exactly one band'` and `'Rater.harder_tier takes the harder
-of two, and unknowns lose'`, with:
+the whole score range with no gap or overlap'` (lines 51–73 at HEAD; line 57 is
+the `TIERS.size == CEILING.size` pin) and the two that follow it,
+`'Rater.band_for places a score in exactly one band'` (`:75`) and
+`'Rater.harder_tier takes the harder of two, and unknowns lose'` (`:88`),
+with:
 
 ```ruby
 assert('Rater has five rungs, named so the font can print them') do
@@ -578,11 +691,12 @@ end
 assert('Rater demand sets are nested and cover exactly ORDER') do
   r = Redoku::Sudoku::Rater
   t = Redoku::Sudoku::Techniques
-  # SET INCLUSION, not a prefix of Techniques::ORDER, and this test is the
-  # guard rail on that. ORDER puts naked_triple AHEAD of hidden_pair for
-  # readability, so a prefix definition would let that cosmetic choice decide a
-  # tier -- and it measured badly: the prefix reading found 0 X-wing boards in
-  # 1467 where set inclusion finds 10 in 4852, because it filed them as pairs.
+  # DEFINED BY MEMBERSHIP, NOT BY INDEX, and this test is the guard rail on
+  # that. ORDER puts naked_triple AHEAD of hidden_pair for readability, so a
+  # ladder keyed on ORDER POSITIONS -- one rung per rule -- would let that
+  # cosmetic choice decide a tier, and it measured badly: the per-rule prefix
+  # ladder found 0 X-wing boards in 1467 where these four sets find 10 in 4852,
+  # because it filed them under "pair".
   i = 1
   while i < r::DEMAND_SETS.size
     r::DEMAND_SETS[i - 1].each do |name|
@@ -615,6 +729,46 @@ assert('Rater demand sets are nested and cover exactly ORDER') do
   assert_equal(r::RULE_LEVEL[:naked_pair], r::RULE_LEVEL[:naked_triple])
   assert_equal(r::RULE_LEVEL[:naked_pair], r::RULE_LEVEL[:hidden_triple])
   assert_true r::RULE_LEVEL[:x_wing] > r::RULE_LEVEL[:hidden_triple]
+end
+
+assert('every demand set is a contiguous prefix of ORDER, which is what makes demand_of sound') do
+  r = Redoku::Sudoku::Rater
+  t = Redoku::Sudoku::Techniques
+  # THE LOAD-BEARING ACCIDENT, PINNED. demand_of walks DOWN the ladder and
+  # BREAKS the moment a set fails to solve the board -- which needs
+  # "DEMAND_SETS[k-1] fails => DEMAND_SETS[k-2] fails", and that does NOT
+  # follow from nesting alone. Adding a rule that sits EARLIER in ORDER can
+  # pre-empt the rule the weaker run relied on and send the solve down a
+  # different path, so "a bigger set still solves it" is not free in general.
+  #
+  # It IS free when every set is a contiguous prefix of ORDER, and here is the
+  # argument, which is the one upper_bound already uses run backwards. Let F be
+  # the rules that fired in a successful run with set S. At every state the
+  # solver takes the FIRST rule in ORDER that fires, so no rule ahead of the
+  # one it took fired at that state -- membership or not. Therefore any T with
+  # F subset T subset ORDER takes exactly the same rule at every state, visits
+  # exactly the same states, and solves. If S is a prefix and T is a longer
+  # prefix then F subset S subset T, so T solves whenever S does; contrapose it
+  # and the downward break is sound.
+  #
+  # Nothing else pins this. ORDER's own comment says its ordering is a
+  # READABILITY choice and invites re-ordering, and today's boundaries happen
+  # to fall at positions 2 and 7 -- either side of the naked_triple /
+  # hidden_pair swap, not through it. Move one name across a boundary and the
+  # break silently starts mis-classifying boards, with no other test failing.
+  # So: this assertion, or delete the break from demand_of. Not neither.
+  r::DEMAND_SETS.each do |set|
+    set.each { |name| assert_true t::ORDER.include?(name) }
+    # A prefix of length n as a SET: every one of ORDER's first n names is in
+    # it, and nothing after them is. Order WITHIN the array is irrelevant --
+    # mask_of ORs bits -- which is why this asks about membership, not indices.
+    n = set.size
+    i = 0
+    while i < t::ORDER.size
+      assert_equal(i < n, set.include?(t::ORDER[i]))
+      i += 1
+    end
+  end
 end
 
 assert('Rater.rank orders the tiers and puts a reject below all of them') do
@@ -665,11 +819,17 @@ pass.
 - [ ] **Step 3: Write the failing test for `demand_of` and `measure`**
 
 Still in `test/sudoku_rater.rb`, **replace** `'Rater.tier_for lets a technique
-raise the tier but never lower it'`, `'Rater.tier_for floors a stalled board
-short of the hardest tier'`, `'Rater.in_band? is strict and accepts?
-forgives, in that order'`, `'Rater.slack is the more generous of a flat and a
-proportional margin'` (they test methods that are being deleted), and the
-three `measure` assertions that read `:guesses` / `:technique_points`, with:
+raise the tier but never lower it'` (`:98`), `'Rater.tier_for floors a stalled
+board short of the hardest tier'` (`:136`), `'Rater.in_band? is strict and
+accepts? forgives, in that order'` (`:150`), `'Rater.slack is the more generous
+of a flat and a proportional margin'` (`:185`) — they test methods that are
+being deleted — plus the **two** assertions that read `:guesses` /
+`:technique_points` (`'Rater.measure reports a finished board as needing
+nothing'` at `:198`, and `'Rater.measure adds guess points only for what
+techniques cannot finish'` at `:210`, which goes away entirely because the
+guess term has left the rating path) and `'Rater.rate and Rater.score agree
+with measure'` (`:245`, which asserts a real tier for `MULTI_81` and for an
+empty board — both rejects now). With:
 
 ```ruby
 assert('Rater.upper_bound reads the demand ceiling straight off the counts') do
@@ -784,19 +944,38 @@ deleted:
       # cursor -- so :very_hard would render as "VERY", a gap, "HARD", with no
       # error anywhere. Renderer#draw_header prints difficulty.to_s.upcase, so
       # the SYMBOL is the label.
+      #
+      # The header survives five names without a layout change: EXPERT and
+      # MASTER are 6 characters, exactly as MEDIUM already is -- 175 px at
+      # Layout::LABEL_SCALE 5, right-aligned to x = 1332, so starting at
+      # x = 1157, against REDOKU ending at x = 352 at TITLE_SCALE 8.
+      #
+      # This is the ONLY tier list. Renderer::DIFFICULTIES used to hold a
+      # second copy and was deleted in 75eb7cf for being exactly that; app.rb
+      # and test/app.rb read TIERS directly. Do not reintroduce one.
       TIERS = [:easy, :medium, :hard, :expert, :master].freeze
 
       # THE RULE SETS THAT DEFINE THE LADDER, weakest first, each a superset of
       # the last. A board's DEMAND is the weakest of these that finishes it,
       # or nil -- a reject -- if even the strongest cannot.
       #
-      # SET INCLUSION, DELIBERATELY, AND NOT A PREFIX OF Techniques::ORDER.
-      # ORDER lists naked_triple AHEAD of hidden_pair (a readability choice
-      # recorded in techniques.rb), so a prefix definition would let that
-      # cosmetic ordering decide a tier. It also measured badly: the prefix
-      # reading found 0 X-wing boards in 1467 where this one finds 10 in 4852,
-      # because it filed them under "pair". Getting this wrong does not fail
-      # loudly -- it silently makes the top rung unreachable.
+      # DEFINED BY MEMBERSHIP, NOT BY ORDER POSITION. ORDER lists naked_triple
+      # AHEAD of hidden_pair (a readability choice recorded in techniques.rb),
+      # so a ladder with one rung per ORDER position would let that cosmetic
+      # ordering decide a tier -- and it measured badly: the per-rule prefix
+      # ladder found 0 X-wing boards in 1467 where these four sets find 10 in
+      # 4852, because it filed them under "pair". Getting that wrong does not
+      # fail loudly; it silently makes the top rung unreachable.
+      #
+      # BUT NOTE WHAT IS ALSO TRUE, because demand_of's early break leans on
+      # it: each of these four sets happens to be a CONTIGUOUS PREFIX of ORDER
+      # taken as a set -- ORDER[0..1], [0..2], [0..6], [0..7]. The level
+      # boundaries fall either side of the naked_triple / hidden_pair swap, not
+      # through it. That is what licenses breaking out of the downward walk
+      # (see demand_of), and it is an accident of where the boundaries landed,
+      # so test/sudoku_rater.rb pins it explicitly. Moving a name across a
+      # boundary, or re-ordering ORDER, breaks the soundness argument without
+      # breaking any other test.
       #
       # TRIPLES SIT WITH THE PAIRS and are not a rung. Boards that genuinely
       # require a naked or hidden triple turned up on 1 chain in 500; boards
@@ -811,8 +990,9 @@ deleted:
       # referenced: mrblib loads in sorted-path order, so rater.rb loads
       # BEFORE techniques.rb and naming Techniques::ORDER here would raise
       # NameError at load and take the whole gem down. test/sudoku_rater.rb
-      # pins this copy against ORDER, which is the same remedy test/app.rb
-      # uses for DIFFICULTIES == TIERS.
+      # pins this copy against ORDER, and that test is the only thing keeping
+      # the two in step -- the copy is forced by the load order, so it cannot
+      # be removed the way Renderer::DIFFICULTIES was.
       DEMAND_SETS = [
         [:naked_single, :hidden_single].freeze,
         [:naked_single, :hidden_single, :pointing].freeze,
@@ -926,6 +1106,40 @@ deleted:
       # board -- the rules that fire in a RESTRICTED run are not the rules that
       # fired in the full one. Walking down tests every set it claims.
       #
+      # WHY THE BREAK IS SOUND, spelled out because it is subtler than it
+      # looks and nothing else in this file says it. The loop stops at the
+      # first failure and reports the set below it, which needs
+      #
+      #     DEMAND_SETS[k-1] fails to solve  =>  DEMAND_SETS[k-2] fails too
+      #
+      # and THAT DOES NOT FOLLOW FROM NESTING. A superset can contain a rule
+      # that sits EARLIER in ORDER than the one the smaller run took, pre-empt
+      # it, and walk a different path -- so "more rules cannot hurt" needs an
+      # argument, not an appeal to obviousness.
+      #
+      # The argument is the one upper_bound uses, run backwards. At each state
+      # the solver takes the FIRST rule in ORDER that fires, so no rule ahead
+      # of it fired at that state, member of the set or not. So if F is the set
+      # of rules that fired in a successful run, EVERY T with
+      # F subset T subset ORDER takes the same rule at every state and solves.
+      # When the sets are contiguous ORDER PREFIXES, S subset T gives
+      # F subset S subset T, so T solves whenever S does -- and the
+      # contrapositive is exactly the implication the break needs.
+      #
+      # So the break is sound BECAUSE the four sets are ORDER prefixes, which
+      # they are today by where the boundaries happen to land. That is pinned
+      # by 'every demand set is a contiguous prefix of ORDER' in
+      # test/sudoku_rater.rb. If that test is ever deleted or a boundary moves,
+      # delete the `break` and walk the whole ladder instead: it costs at most
+      # three extra solves on the rare board that got past upper_bound, and it
+      # needs no property of ORDER at all.
+      #
+      # (A confluence argument would give the same conclusion for ANY nested
+      # sets -- these eight rules are all sound and monotone, so their closure
+      # should not depend on the order they are tried in. That is a stronger
+      # claim about how eight rules interact and nothing in this repository has
+      # measured it, so it is not what the code leans on.)
+      #
       # Measured cost over 500 chains: 1 solve per board at p50, mean 7 per
       # chain including the neighbourhood work, max 40.
       def self.demand_of(values, counts)
@@ -945,7 +1159,10 @@ deleted:
       # declines at every step of a run without it, since the two runs visit
       # exactly the same states. So the set of rules that fired is enough to
       # finish the board, and the weakest DEMAND_SET containing all of them is
-      # therefore enough too.
+      # therefore enough too. Note this needs NOTHING about prefixes -- any
+      # superset of the fired rules will do, which is why the upper bound is
+      # safe even if ORDER is re-ordered. demand_of's BREAK is the part that
+      # is not; see there.
       def self.upper_bound(counts)
         k = 0
         counts.each_key do |name|
@@ -1071,19 +1288,25 @@ In `generate`, replace the accept test and drop the dead key:
 
 `:guesses` leaves the reply because `measure` no longer computes it.
 
-- [ ] **Step 6: Grow `Renderer::DIFFICULTIES` to five**
+- [ ] **Step 6: There is no renderer step. Check that, do not skip it.**
 
-```ruby
-    # The same list as Rater::TIERS, and test/app.rb pins that they are equal.
-    # Spelled out rather than referenced because renderer.rb loads before
-    # sudoku/rater.rb (mrblib sorts full paths).
-    #
-    # Header layout survives five names: EXPERT and MASTER are 6 characters,
-    # exactly as MEDIUM already is -- 175 px at LABEL_SCALE 5, right-aligned to
-    # x = 1332, so starting at x = 1157, against REDOKU ending at x = 352 at
-    # TITLE_SCALE 8. No collision and no layout change.
-    DIFFICULTIES = [:easy, :medium, :hard, :expert, :master].freeze
+An earlier draft of this plan had a step here that read *"grow
+`Renderer::DIFFICULTIES` to five"*. **That constant does not exist.** It was
+deleted in `75eb7cf` — one commit after the tree this plan was first written
+against — as "dead weight next to `Sudoku::Rater::TIERS`, the real authority
+the generator actually consumes", together with the test that pinned the two
+lists equal. So the five names land once, in Step 4's `TIERS`, and the header
+layout argument that used to live in the renderer comment has moved there
+with them.
+
+Confirm rather than assume, since it takes one command:
+
+```bash
+grep -rn "DIFFICULTIES" mrbgems/ PLAN.md docs/design
 ```
+
+Expect **no hits** outside `docs/plans/`. If there are any, this plan is stale
+again and Task 2 has a step it does not know about.
 
 - [ ] **Step 7: Give the App a generator seam, and stop the tests assuming three tiers**
 
@@ -1189,37 +1412,73 @@ end
 
 Add the same `generator:` keyword to `new_touch_app`, defaulting the same way.
 
-Then fix the two places that hard-code three tiers. `test/app.rb:507` and
-`:657` both read `Redoku::Renderer::DIFFICULTIES[(i + 1) % 3]`; both become
+Then fix the two places that hard-code three tiers. **Re-verify these line
+numbers before editing** — they have moved twice already; `grep -n "% 3"
+mrbgems/mruby-redoku/test/app.rb` settles it. At HEAD they are
+`test/app.rb:759` (inside `'the acknowledgement runs each action exactly
+once'`) and `:909` (inside `'a tap on Level cycles the difficulty and repaints
+the header'`), and both read
 
 ```ruby
-    list = Redoku::Renderer::DIFFICULTIES
+    Redoku::Sudoku::Rater::TIERS[(i + 1) % 3]
+```
+
+— **`Rater::TIERS`, not `Renderer::DIFFICULTIES`**, since `75eb7cf` collapsed
+the two lists. Both become
+
+```ruby
+    list = Redoku::Sudoku::Rater::TIERS
     assert_equal(list[(i + 1) % list.size], app.difficulty)
 ```
 
-(and at line 657, `expected = list[(i + 1) % list.size]`). Leave the enclosing
+(and at `:909`, `expected = list[(i + 1) % list.size]`). Leave the enclosing
 `3.times do |i|` alone: three presses from `:easy` now visit medium, hard and
 expert, which is a better test of the cycle than three presses that wrap.
+With a FakeGenerator behind `new_app`, those three presses cost nothing.
 
-The two App tests that construct an App **directly** — `'the splash reaches
-the panel before generation starts'` and `'an App given no rng seeds itself
-from the clock'` — must keep the REAL generator, which they get for free from
-`App`'s own default. Both request `:easy`, whose measured cost is p50 53 ms.
-Do not convert them to `new_app`; the first one's whole point is observing the
-real dig from inside.
+**Which App tests keep the REAL generator, and what that costs.** Six of the
+fourteen `Redoku::App.new` call sites in `test/app.rb` construct an App
+directly *and* reach a dig. They keep the real generator, which they get for
+free from `App`'s own default, and they must not be converted to `new_app` —
+two of them exist precisely to observe the real thing:
+
+| test | tier(s) dug for real |
+|---|---|
+| `'every button acknowledges its press, at the button, for the same 200 ms'` (`:657`) | `:easy` (New), `:medium` (Level) |
+| `'the action runs while the button is held down, not after it comes up'` (`:720`) | `:easy` |
+| `'a Level press whose flash is refused still cycles the difficulty'` (`:803`) | `:medium` |
+| `'a New press whose flash is refused still clears the ink'` (`:839`) | `:easy` |
+| `'the splash reaches the panel before generation starts'` (`:1450`) | `:easy` |
+| `'an App given no rng seeds itself from the clock'` (`:1508`) | `:easy` |
+
+`:easy` is p50 53 ms. `:medium` at its production cap of 12 is p50 90 ms but
+p90 552 ms and max 1309 ms, and two tests pay it — that is within Global
+Constraint 6 (which bars `:hard` and above at the production cap, not
+`:medium`), but it is the suite's largest single cost and worth knowing before
+blaming a slow run on Task 3.
+
+**All six of these also gain a progress-bar update once Task 5 lands**, and
+three of them assert exact update counts. Task 5 Step 5 lists what each one
+becomes; do not fix them here, because the bar does not exist yet.
 
 `GEN_SEED`'s comment is now wrong about what the suite pays for. Replace its
 last paragraph with: *"Every App built through `new_app` now takes a
-FakeGenerator, so this seed no longer prices the suite's digging — the two
-tests that construct an App directly are the only ones that generate for
-real, and both ask for `:easy`."*
+FakeGenerator, so this seed no longer prices the suite's digging — only the
+six tests that construct an App directly generate for real, five of them at
+`:easy` and two of them (New-and-Level, and the refused Level flash) at
+`:medium`."*
 
 - [ ] **Step 8: Rewrite the Generator tests that spoke in bands**
 
 In `test/sudoku_generator.rb`:
 
 **Delete** `'Generator.score_distance is zero inside the band and grows
-outside'` — the method is gone.
+outside'` (`:183`) — the method is gone.
+
+**Leave `'Generator.tier_distance measures along the tier order'` (`:173`)
+alone.** It asserts `tier_distance(:nonsense, :easy) > tier_distance(:hard,
+:easy)`, which is `5 > 2` with five rungs instead of `3 > 2` with three. Still
+true, still meaningful, no edit.
 
 **Replace** `'Generator.closer? prefers the right tier, then the nearer
 score'` with:
@@ -1242,7 +1501,10 @@ assert('Generator.closer? prefers the tier nearer the one asked for') do
 end
 ```
 
-**Replace** the two assertions that read `m[:guesses]` and the tier-hit test:
+**Replace** the one assertion that reads `m[:guesses]` (`'Generator.generate
+reports the measurement of the board it returns'`, `:301` — it is the only
+place in `test/sudoku_generator.rb` that touches that key) and the tier-hit
+test (`'Generator.generate hits every tier it is asked for'`, `:260`):
 
 ```ruby
 assert('Generator.generate reports the measurement of the board it returns') do
@@ -1260,7 +1522,7 @@ assert('Generator.generate reports the measurement of the board it returns') do
   assert_equal(m[:hardest], out[:hardest])
 end
 
-assert('Generator.generate hits the two rungs a single chain always offers') do
+assert('Generator.generate hits the two rungs the bottom of the ladder offers') do
   gen = Redoku::Sudoku::Generator
   s = Redoku::Sudoku::Solver
   # EASY and MEDIUM only, and that is not timidity: measured over 500 chains,
@@ -1269,6 +1531,15 @@ assert('Generator.generate hits the two rungs a single chain always offers') do
   # would mean paying their attempt caps -- MASTER is host p50 4.7 s / p90
   # 16.0 s -- inside `make test`. Their reachability is established once, by
   # the measurement script in this plan's Task 3, not by the suite.
+  #
+  # WHY MEDIUM IS SAFE TO ASSERT at 89% per chain: `generate` draws a FRESH
+  # solution per attempt, so the six attempts of DEFAULT_ATTEMPTS are six
+  # independent chains and the miss probability is 0.11^6, about two in a
+  # million per seed. Reachability is also a property of the CHAIN and not of
+  # the walk direction -- MEASURE_BUDGET (12 here, 16 after Task 3) covers the
+  # whole measured 8-to-12-board window, so a shallow walk and a deep walk find
+  # a MEDIUM board on exactly the same chains and differ only in which one they
+  # return. That is why this assertion survives Task 3 unchanged.
   [:easy, :medium].each do |tier|
     3.times do |n|
       out = gen.generate(tier, Redoku::Rng.new(200 + (n * 7)))
@@ -1279,11 +1550,64 @@ assert('Generator.generate hits the two rungs a single chain always offers') do
 end
 ```
 
-In `'Generator.generate never hands back a board that is barely dug'` and
-`'Generator.dig walks from the shallow end, so easy keeps its clues'`, change
-the tier list from `[:easy, :medium, :hard]` to `[:easy, :medium]` and pass an
-explicit small budget (`gen.generate(tier, Redoku::Rng.new(50), 6)`) for the
-same reason. Task 3 rewrites the shallow/deep walk test properly.
+If a `:medium` seed here does miss, **do not weaken the assertion to
+`TIERS.include?`** — that would delete the only end-to-end evidence that the
+second rung is reachable at all. Swap the seed, and record in the commit
+message that the 89% figure came out lower than the design measured, because
+that is a finding about `DEMAND_EDGES[:singles]` and not about the test.
+
+**Rewrite** `'Generator.generate always returns a playable puzzle, tier or
+not'` (`:286`). It is the one assertion in the file that encodes the exact
+invariant this plan deliberately breaks: it asserts `assert_false out.nil?`
+and then dereferences `out[:grid]` on a `generate(:hard, rng, 1)` call that
+may now legitimately answer nil, and it asserts
+`TIERS.include?(out[:tier])` where nil is now a possible tier. No other step
+touched it, and the suite would have gone red on a contract change it was
+never told about:
+
+```ruby
+assert('Generator.generate answers a playable puzzle or nothing, never a lie') do
+  gen = Redoku::Sudoku::Generator
+  s = Redoku::Sudoku::Solver
+  # One attempt, so the requested tier may well be missed -- and under the new
+  # ladder a single attempt may also come back with NOTHING, which is the
+  # contract change: `generate` is nil when no attempt found a single board our
+  # rules can finish. Not observed in 500 chains, and this test does not assert
+  # it either way; what it pins is that a NON-nil reply is a real puzzle with a
+  # real tier. `if out` rather than an unconditional dereference is the whole
+  # edit.
+  out = gen.generate(:hard, Redoku::Rng.new(4), 1)
+  if out
+    assert_true s.unique?(out[:grid].values)
+    assert_true Redoku::Sudoku::Rater::TIERS.include?(out[:tier])
+    assert_false out[:tier].nil?
+    assert_true out[:clues] <= gen::MAX_CLUES
+  end
+end
+```
+
+That `if out` is the one guard in this plan that is allowed to make a test
+body skippable, and only because Task 3 Step 1's `'an impossible request comes
+back honest rather than empty'` asserts the non-nil case unconditionally on a
+seed chosen for it. If Task 3 is ever dropped, this one has to lose the guard.
+
+In `'Generator.generate never hands back a board that is barely dug'`
+(`:245`), change the tier list from `[:easy, :medium, :hard]` to
+`[:easy, :medium]` and pass an explicit small budget
+(`gen.generate(tier, Redoku::Rng.new(50), 6)`) for the same cost reason.
+
+**Leave `'Generator.dig walks from the shallow end, so easy keeps its clues'`
+(`:153`) alone in this task.** The earlier draft of this plan told you to
+"change its tier list", and it has no tier list — it calls `gen.dig` twice,
+once for `:easy` and once for `:hard`, on one chain, which is a single walk
+each and costs nothing. Task 2 does not change the walk direction, so its two
+assertions (`easy_clues >= hard_clues`, `easy_score <= hard_score`) should
+still hold: `:easy` still returns the shallowest match and a `:hard` request
+that cannot be met now settles for the nearest *tier*, which is the deepest
+board it looked at. **If it does fail, delete it** rather than repairing it —
+Task 3 Step 1 replaces it with `'only easy walks the shallow end of the
+chain'`, which asks the question properly, and Task 3 Step 4 deletes it in any
+case.
 
 - [ ] **Step 9: Run to GREEN**
 
@@ -1309,8 +1633,9 @@ boards, do not invent them. Write a throwaway script (delete it afterwards;
 the design's §12 scripts worked exactly this way):
 
 ```ruby
-# meas_fixtures.rb -- throwaway. Host only: printf and sort_by are FORBIDDEN
-# in production code for this gem, and fine here.
+# meas_fixtures.rb -- throwaway, run through the host mruby binary, which
+# links the whole default gembox. Nothing here is constrained by what the gem
+# declares.
 gen = Redoku::Sudoku::Generator
 r = Redoku::Sudoku::Rater
 seen = {}
@@ -1401,7 +1726,6 @@ Expected: PASS, KO 0, Crash 0, Warning 0. Delete the throwaway script.
 ```bash
 git add mrbgems/mruby-redoku/mrblib/redoku/sudoku/rater.rb \
         mrbgems/mruby-redoku/mrblib/redoku/sudoku/generator.rb \
-        mrbgems/mruby-redoku/mrblib/redoku/renderer.rb \
         mrbgems/mruby-redoku/mrblib/redoku/app.rb \
         mrbgems/mruby-redoku/test/_support.rb \
         mrbgems/mruby-redoku/test/sudoku_rater.rb \
@@ -1442,12 +1766,74 @@ they must not be conflated:
   - `Generator.hard_end(solution, removals)` → `[board, measurement]` or
     `[nil, nil]`
   - `Generator.rescue_floor(solution, removals, floor)` → same
+  - `Generator.shallow_fallback(solution, removals, clues_after)` → same
   - `Generator.walk_up(solution, removals, clues_after, tier)` → same
   - `Generator.shallow_walk(solution, removals, clues_after, tier)` → same
   - `Generator.deep_walk(solution, removals, clues_after, tier)` → same
   - `Generator.dig(solution, tier, rng)` → same shape as today
   - `Generator.generate(tier, rng, attempts = nil) { |done, total| }` → the
     candidate hash (now with `attempts:`) or **nil**
+
+- [ ] **Step 0: Mine the two seeds these tests need**
+
+**Do this before writing the tests, because two of them are meaningless
+without it.** The rescue path is where 7 of 10 measured `:master` boards come
+from, and a test that covers it only *if* its seed happens to reach a rejected
+floor is a test that can ship zero coverage under a green suite. So the seeds
+are chosen, not hoped for. Throwaway script, same discipline as Task 2 Step 10
+and the design's §12:
+
+```ruby
+# meas_floors.rb -- throwaway.
+gen = Redoku::Sudoku::Generator
+r = Redoku::Sudoku::Rater
+1.upto(60) do |seed|
+  solution = gen.full_board(Redoku::Rng.new(seed))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(seed))
+  removals = chain[0]
+  floor = gen.board_at(solution, removals, removals.size)
+  m = r.measure(floor)
+  # rescue_floor does not exist yet, so inline what it will do: restore each
+  # removed group in turn and keep the hardest board our rules can finish.
+  saved = nil
+  removals.each do |g|
+    b = floor.dup
+    b[g[0]] = solution[g[0]]
+    b[g[1]] = solution[g[1]]
+    mm = r.measure(b)
+    saved = mm[:tier] if !mm[:tier].nil? && saved.nil?
+  end
+  puts "seed=#{seed} floor_tier=#{m[:tier].inspect} rescue=#{saved.inspect}"
+end
+```
+
+Record two seeds in the tests below, by name:
+
+- **`SOLVED_FLOOR_SEED`** — a seed whose floor our rules CAN finish
+  (`floor_tier` not nil; about 78% of seeds qualify). Used by `'the hard end of
+  a chain is its floor'`.
+- **`REJECT_FLOOR_SEED`** — a seed whose floor is a REJECT and whose
+  neighbourhood yields a board (`floor_tier=nil`, `rescue` not nil; about 22%
+  of seeds reach the first condition). Used by `'a rejected floor is
+  rescued'`.
+
+Declare them at the top of `test/sudoku_generator.rb`, with the measured
+values recorded in the comment the way Task 2 Step 10 records the fixture
+seeds:
+
+```ruby
+# Two dig-chain seeds chosen for what their FLOOR is, because three assertions
+# below are unconditional and would be meaningless otherwise. Mined by a
+# throwaway script over seeds 1-60 (see the plan's Task 3 Step 0); rerun it if
+# the rater or the dig ever changes, because these are properties of the
+# CLASSIFIER, not of the seed.
+SOLVED_FLOOR_SEED = <n>  # floor_tier: <tier>   -- our rules finish this floor
+REJECT_FLOOR_SEED = <n>  # floor_tier: nil, rescue: <tier> -- floor is a reject
+```
+
+Then delete the script. **`13` was this plan's placeholder in both tests and
+is not a measured value**; using it unchecked is exactly how both tests became
+vacuous.
 
 - [ ] **Step 1: Write the failing test for the walk direction and the rescue**
 
@@ -1481,8 +1867,12 @@ assert('only easy walks the shallow end of the chain') do
   # generously clued -- so easy keeps it, alone.
   assert_equal(:easy, gen::WALK_SHALLOW)
 
-  solution = gen.full_board(Redoku::Rng.new(31))
-  chain = gen.dig_chain(solution, Redoku::Rng.new(31))
+  # SOLVED_FLOOR_SEED, not an arbitrary one: the two `hard_end` assertions
+  # below were guarded with `if hard[0]` in an earlier draft and would have
+  # gone vacuous on a chain whose floor rejects. A seed whose floor is solvable
+  # is the cheapest way to make them unconditional.
+  solution = gen.full_board(Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(SOLVED_FLOOR_SEED))
   removals = chain[0]
   clues_after = chain[1]
 
@@ -1496,8 +1886,9 @@ assert('only easy walks the shallow end of the chain') do
 
   # The hard end of the same chain is the FLOOR, which is strictly deeper.
   hard = gen.hard_end(solution, removals)
-  assert_false hard[1].nil? if hard[0]
-  assert_true Redoku::Sudoku::Rater.clue_count(hard[0]) < easy_clues if hard[0]
+  assert_false hard[0].nil?
+  assert_false hard[1].nil?
+  assert_true Redoku::Sudoku::Rater.clue_count(hard[0]) < easy_clues
 end
 
 assert('the hard end of a chain is its floor, and its class never decreases') do
@@ -1509,23 +1900,39 @@ assert('the hard end of a chain is its floor, and its class never decreases') do
   # more givens is solved by every rule set that solves the board with fewer.
   # So the hardest board on a chain is its floor, and ONE classification of the
   # floor decides whether the whole chain can serve a request.
-  solution = gen.full_board(Redoku::Rng.new(13))
-  chain = gen.dig_chain(solution, Redoku::Rng.new(13))
+  #
+  # THIS SEED'S FLOOR IS SOLVABLE, and that is asserted rather than assumed.
+  # An earlier draft guarded the floor assertion with `if
+  # r.measure(floor)[:tier]`, which meant a change that made every floor reject
+  # would delete this test's subject and leave the suite green. Mined by Step 0
+  # (measured floor_tier: <tier>).
+  solution = gen.full_board(Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(SOLVED_FLOOR_SEED))
   removals = chain[0]
   clues_after = chain[1]
 
   floor = gen.board_at(solution, removals, removals.size)
+  assert_false r.measure(floor)[:tier].nil?
   out = gen.hard_end(solution, removals)
   m = out[1]
   assert_false m.nil?
-  # A solvable floor IS the hard end, untouched.
-  assert_equal(floor, out[0]) if r.measure(floor)[:tier]
+  # A solvable floor IS the hard end, untouched -- unconditionally, now that
+  # the line above has established the floor is solvable.
+  assert_equal(floor, out[0])
 
-  # No board shallower on the chain demands more than the hard end does.
+  # No board shallower on the chain demands more than the hard end does. The
+  # non-nil assertion is not defensive padding -- it is the restoring argument
+  # stated as a test: this floor is solvable, so every shallower board must be
+  # too. If it ever fires, the argument is WRONG and the monotone dismissal is
+  # unsound, which is a finding about the design rather than a broken test.
+  # (0 class decreases in 527 measured adjacent chain steps agree with it.) An
+  # earlier draft wrote `unless shallower[:tier].nil?` here, which would have
+  # let the whole loop skip in silence.
   k = gen.first_usable(clues_after)
   while k <= removals.size
     shallower = r.measure(gen.board_at(solution, removals, k))
-    assert_true r.rank(shallower[:tier]) <= r.rank(m[:tier]) unless shallower[:tier].nil?
+    assert_false shallower[:tier].nil?
+    assert_true r.rank(shallower[:tier]) <= r.rank(m[:tier])
     k += 1
   end
 end
@@ -1541,61 +1948,106 @@ assert('a rejected floor is rescued by restoring one symmetric group') do
   # solution, so its solution set is a subset of the floor's, and the floor was
   # unique. This is where the hard rungs come from: of 10 MASTER boards found
   # in 500 chains, 7 came from a stalled floor's neighbourhood.
-  solution = gen.full_board(Redoku::Rng.new(13))
-  chain = gen.dig_chain(solution, Redoku::Rng.new(13))
+  #
+  # THE SEED IS CHOSEN FOR ITS FLOOR, and both facts about it are asserted
+  # before anything else runs. An earlier draft wrapped this whole body in
+  # `unless out[0].nil?`, which meant the rescue path -- the source of 7 of 10
+  # measured MASTER boards -- could ship with zero coverage and a green suite.
+  # Mined by Step 0 (measured floor_tier: nil, rescue: <tier>).
+  solution = gen.full_board(Redoku::Rng.new(REJECT_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(REJECT_FLOOR_SEED))
   removals = chain[0]
   floor = gen.board_at(solution, removals, removals.size)
-  out = gen.rescue_floor(solution, removals, floor)
+  assert_nil r.measure(floor)[:tier]
 
-  unless out[0].nil?
-    board = out[0]
-    # Two more clues than the floor (one, if it was the centre group), and the
-    # extra clues agree with the solution.
-    assert_true r.clue_count(board) > r.clue_count(floor)
-    81.times { |i| assert_equal(solution[i], board[i]) if board[i] != 0 }
-    # Still symmetric, and still unique -- asserted here even though the proof
-    # above says no Solver.unique? call is NEEDED, because the proof is what
-    # licences skipping the call in production and a wrong proof would be
-    # invisible.
-    81.times { |i| assert_equal(0, board[80 - i]) if board[i] == 0 }
-    assert_true s.unique?(board)
-    # And it is a board our rules CAN finish, which is the whole point.
-    assert_false out[1][:tier].nil?
-  end
+  out = gen.rescue_floor(solution, removals, floor)
+  assert_false out[0].nil?
+  board = out[0]
+  # Two more clues than the floor (one, if it was the centre group), and the
+  # extra clues agree with the solution.
+  assert_true r.clue_count(board) > r.clue_count(floor)
+  81.times { |i| assert_equal(solution[i], board[i]) if board[i] != 0 }
+  # Still symmetric, and still unique -- asserted here even though the proof
+  # above says no Solver.unique? call is NEEDED, because the proof is what
+  # licences skipping the call in production and a wrong proof would be
+  # invisible.
+  81.times { |i| assert_equal(0, board[80 - i]) if board[i] == 0 }
+  assert_true s.unique?(board)
+  # And it is a board our rules CAN finish, which is the whole point.
+  assert_false out[1][:tier].nil?
+  # ...and hard_end routes through the rescue rather than handing back the
+  # reject, which is the only thing that connects this method to the search.
+  assert_equal(board, gen.hard_end(solution, removals)[0])
 end
 
-assert('a floor whose whole neighbourhood rejects yields nothing, not a bad puzzle') do
+assert('a chain with nothing our rules can finish yields nothing, not a bad puzzle') do
   gen = Redoku::Sudoku::Generator
+  r = Redoku::Sudoku::Rater
   # The nil path, driven directly, because generate cannot be steered into it:
-  # it needs a chain where the floor AND all ~27 of its neighbours reject,
-  # which was not observed in 500 chains. Built by hand instead -- blank
-  # everything but the middle row, symmetrically, and no rule of ours can
-  # finish it or any one-group restoration of it.
+  # it needs a chain where the floor AND all ~27 of its neighbours AND the
+  # shallowest usable board all reject, which was not observed in 500 chains.
+  # Built by hand instead -- blank everything but the middle row, symmetrically.
   solution = solved_values
   removals = []
-  36.times do |i|
-    removals << [i, 80 - i] if i < 36
-  end
-  floor = gen.board_at(solution, removals, removals.size)
-  assert_nil Redoku::Sudoku::Rater.measure(floor)[:tier]
+  36.times { |i| removals << [i, 80 - i] }
+  clues_after = [81]
+  removals.size.times { |k| clues_after << 81 - (2 * (k + 1)) }
 
+  floor = gen.board_at(solution, removals, removals.size)
+  assert_nil r.measure(floor)[:tier]
   out = gen.rescue_floor(solution, removals, floor)
   assert_nil out[0]
   assert_nil out[1]
-  # And the deep walk passes that answer straight through rather than
-  # inventing a board.
-  clues_after = [81]
-  removals.size.times { |k| clues_after << 81 - (2 * (k + 1)) }
+
+  # THE SHALLOW FALLBACK REJECTS TOO, and this is a PROOF rather than a
+  # measurement, which is what makes the nil below non-accidental. The
+  # shallowest board MAX_CLUES allows on this hand-built chain is k = 18: rows
+  # 0, 1, 7 and 8 blank, rows 2 to 6 given. Swapping the contents of rows 0 and
+  # 1 -- two rows of the SAME 3x3 band -- leaves every row, column and box
+  # holding the same digits, so it is a second valid solution. A board with two
+  # solutions cannot be finished by rules that only ever write forced cells, so
+  # it stalls, so it is a reject.
+  shallow = gen.board_at(solution, removals, gen.first_usable(clues_after))
+  assert_nil r.measure(shallow)[:tier]
+  fall = gen.shallow_fallback(solution, removals, clues_after)
+  assert_nil fall[0]
+  assert_nil fall[1]
+
+  # Only now can the deep walk honestly answer nothing, and it must -- rather
+  # than inventing a board or handing back the reject.
   deep = gen.deep_walk(solution, removals, clues_after, :hard)
   assert_nil deep[0]
   assert_nil deep[1]
 end
 
+assert('the shallow fallback is the shallowest usable board, or nothing') do
+  gen = Redoku::Sudoku::Generator
+  r = Redoku::Sudoku::Rater
+  # design section 6.4's fallback, and the reason `generate` almost never
+  # answers nil. In production it fires only on the never-observed path where
+  # the floor AND its whole neighbourhood reject -- a chain whose hard end is
+  # merely TOO EASY does not need it, because deep_walk hands that real board
+  # back as a candidate. So it is driven directly here, on an ordinary chain, to
+  # pin the contract rather than the rarity.
+  solution = gen.full_board(Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(SOLVED_FLOOR_SEED))
+  out = gen.shallow_fallback(solution, chain[0], chain[1])
+  # This seed's floor is solvable, so by the restoring argument every board on
+  # the chain is -- including the shallowest. Unconditional on purpose.
+  assert_false out[0].nil?
+  assert_false out[1][:tier].nil?
+  assert_true r.clue_count(out[0]) <= gen::MAX_CLUES
+  # It really is the SHALLOWEST usable board, not merely some board.
+  assert_equal(gen.board_at(solution, chain[0], gen.first_usable(chain[1])),
+               out[0])
+end
+
 assert('Generator.generate reports progress once per completed attempt') do
   gen = Redoku::Sudoku::Generator
   seen = []
-  # A BLOCK, not a lambda or a callable object: Proc#call and block-passing
-  # are core mruby, and this gem's mrbtest state has no Method class.
+  # A BLOCK, not a lambda or a callable object: block-passing is core mruby and
+  # mruby-method -- the Method class -- is one of the default-gembox gems this
+  # gem still does not declare.
   gen.generate(:easy, Redoku::Rng.new(3), 4) { |done, total| seen << [done, total] }
   # EASY hits on its first attempt on every one of 500 measured chains, so one
   # report is the expected shape -- and it must carry the CAP as the
@@ -1632,7 +2084,11 @@ end
 - [ ] **Step 2: Run it and confirm RED**
 
 Run: `make test`
-Expected: FAIL — `NoMethodError: undefined method 'shallow_walk'`.
+Expected: FAIL — `NameError: uninitialized constant
+Redoku::Sudoku::Generator::ATTEMPTS`, then `NoMethodError` on
+`shallow_walk`, `deep_walk`, `hard_end`, `rescue_floor` and
+`shallow_fallback`. **Not** a `NameError` on `SOLVED_FLOOR_SEED` or
+`REJECT_FLOOR_SEED` — if you see one of those, Step 0 was skipped.
 
 - [ ] **Step 3: Implement the budgets, the two walks and the rescue**
 
@@ -1741,8 +2197,11 @@ Replace `dig` with the two-directional version and its helpers:
         out = hard_end(solution, removals)
         board = out[0]
         m = out[1]
-        # Nothing on this chain our rules can finish, floor or neighbourhood.
-        return [nil, nil] if m.nil?
+        # Nothing our rules can finish at the deep end, floor OR neighbourhood.
+        # Fall back to the shallow end rather than writing the chain off: design
+        # 6.4's fallback, and it costs one classification on a path not observed
+        # in 500 chains. See shallow_fallback.
+        return shallow_fallback(solution, removals, clues_after) if m.nil?
         return [board, m] if m[:tier] == tier
         # Dismissed: too easy. The board still comes back as a fallback
         # candidate -- it is a real puzzle, just an easier one, and `generate`
@@ -1798,6 +2257,31 @@ Replace `dig` with the two-directional version and its helpers:
         [best_board, best]
       end
 
+      # THE LAST RESORT ON A CHAIN, and the reason `generate` almost never
+      # answers nil: the shallowest board MAX_CLUES allows, classified once.
+      # That board was rung 1 on 500 of 500 measured chains, so a chain has to
+      # be pathological at BOTH ends before it yields nothing at all.
+      #
+      # design 6.4 put this fallback on every dismissed attempt. It is here
+      # instead, on the much rarer path where hard_end found nothing, and that
+      # is a DEVIATION worth naming rather than a simplification. The reason is
+      # that the version in 6.4 pays for it far more often for far less: a
+      # chain dismissed as TOO EASY already has a real board to offer -- its
+      # own hard end -- and deep_walk hands that back as the fallback candidate
+      # (see above), which is both a better board and free. Classifying the
+      # shallow end as well would add a second p50 9 ms classification to the
+      # attempt that the monotone dismissal exists to make cost ONE, and at
+      # :master's 150 attempts that is about 1.4 s added to a 4.7 s p50 for a
+      # strictly worse candidate. So the fallback survives, on the path that
+      # actually needs it.
+      def self.shallow_fallback(solution, removals, clues_after)
+        k = first_usable(clues_after)
+        return [nil, nil] if k > removals.size
+        board = board_at(solution, removals, k)
+        m = Rater.measure(board)
+        m[:tier].nil? ? [nil, nil] : [board, m]
+      end
+
       # Harder tier first, then higher score, so the pick is deterministic
       # rather than order-dependent among equals.
       def self.harder?(a, b)
@@ -1835,11 +2319,14 @@ nil contract and the hook:
       #
       # THE NIL CONTRACT, stated here because it used to be an undocumented
       # invariant spread over four methods in two files: this returns nil ONLY
-      # if no attempt produced a single logically solvable board anywhere --
-      # every attempt's chain floor rejected AND its whole neighbourhood
-      # rejected. Not observed in 500 chains, and it needs that to happen
-      # `attempts` times in a row. IT IS STILL POSSIBLE, SO THE CALLER MUST
-      # HANDLE IT (App#fill_board does).
+      # if no attempt produced a single logically solvable board anywhere. For
+      # one attempt that means its chain floor rejected AND all ~27 of the
+      # floor's one-group neighbours rejected AND the shallowest board
+      # MAX_CLUES allows rejected too (shallow_fallback) -- three independent
+      # failures, none of the first two observed in 500 chains and the third
+      # observed 0 times in 500. Then that has to happen `attempts` times in a
+      # row. IT IS STILL POSSIBLE, SO THE CALLER MUST HANDLE IT
+      # (App#fill_board does).
       #
       # If the tier is missed but a real board was found, that board comes back
       # with the tier it ACTUALLY achieved. The caller decides whether to ask
@@ -1859,10 +2346,10 @@ nil contract and the hook:
       # THE BLOCK reports progress: it fires once per COMPLETED attempt with
       # (done, total), both Integers, `done` counting completed attempts and
       # `total` the cap. A block rather than a callable, because block-passing
-      # is core mruby and this gem's mrbtest state has no Method class. It
-      # fires after the attempt's classification work and BEFORE the early
-      # return, so a generation that succeeds on its first attempt still
-      # reports once.
+      # is core mruby and mruby-method -- the Method class -- is one of the
+      # gems this gem does not declare. It fires after the attempt's
+      # classification work and BEFORE the early return, so a generation that
+      # succeeds on its first attempt still reports once.
       def self.generate(tier, rng, attempts = nil)
         attempts = attempts_for(tier) if attempts.nil?
         best = nil
@@ -1914,8 +2401,10 @@ Three failures to expect and how to read them:
   find it and give it an explicit small budget.
 - **`'Generator.dig walks from the shallow end, so easy keeps its clues'`
   fails**, because a `:hard` request no longer returns the shallowest match.
-  That assertion has been replaced by `'only easy walks the shallow end of the
-  chain'` in Step 1; delete the old one.
+  Delete it — `'only easy walks the shallow end of the chain'` in Step 1 is its
+  replacement and asks the question properly. **Delete it even if it passes:**
+  its name now describes the opposite of what the code does for four rungs out
+  of five, and a test whose name lies is worse than no test.
 - **`'every board along a dig chain is uniquely solvable'` still passes.**
   It must: the rescue restores whole groups from the same solution, and if
   this one breaks, the rescue is corrupting a board rather than restoring it.
@@ -1946,8 +2435,16 @@ end
 Expected shape, from the design's bootstrap: 5/5 for easy, medium, hard and
 expert; 4/5 or 5/5 for master, with master's wall clock in the seconds and one
 draw plausibly past 20 s. **If `:master` is 0/5, stop** — the most likely
-cause is `DEMAND_SETS` having been read as an `ORDER` prefix somewhere, which
-makes the top rung unreachable and fails no test. Delete the script.
+cause is `DEMAND_SETS[2]` having lost `hidden_pair` or `hidden_triple` (or
+`RULE_LEVEL` having been built from ORDER *positions* rather than from set
+membership), which files every X-wing board under `:subset`, makes the top rung
+unreachable, and fails no test in the suite. Delete the script.
+
+While that script is in hand, it is also the cheapest place to check the one
+figure Task 2 could not: paste the `:medium` line into the commit message too,
+because a `:medium` hit rate materially below 100% would mean
+`DEMAND_EDGES[:singles] = [140]` is cutting harder than the design's 89%
+per-chain measurement predicted.
 
 - [ ] **Step 6: Commit**
 
@@ -1975,6 +2472,8 @@ git commit -m "feat(redoku): dig for the demand — deep-end walk, floor rescue,
   - `Renderer.progress_fill(num, den)` → Integer pixels, 0..inner width
   - `Renderer#draw_progress(num, den)` → self
   - `Renderer#flush_progress` → the display's answer
+  - one corrected comment on the existing private `boundary_weight` (Step 3);
+    no behaviour change and no test change for it
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2008,8 +2507,7 @@ assert('Renderer.progress_fill scales a fraction to pixels, monotonically') do
   assert_equal(inner / 2, r.progress_fill(5, 10))
   # Integer arithmetic throughout: mrb_int is 32-bit on the device, and a bar
   # is pixels, so there is nothing a Float would add but a rounding rule to
-  # get wrong. String#% does not exist here either, so a percentage was never
-  # on the table.
+  # get wrong.
   assert_true r.progress_fill(1, 3) < r.progress_fill(2, 3)
   # Degenerate inputs answer a drawable number rather than raising: this is
   # called from inside a search, where a crash costs the player their puzzle.
@@ -2051,9 +2549,9 @@ assert('the progress bar flushes as ink, not as chrome') do
   r.flush_progress
   x, y, w, h = Redoku::Renderer.progress_rect
   # DU + FAST_DRAW, the same exception press_button makes and for the same
-  # reason: this is a two-level black-on-white repaint that happens up to
-  # twenty times inside one search, and a GL16 chrome refresh each time would
-  # cost more than the search it is reporting on.
+  # reason: this is a two-level black-on-white repaint that happens about ten
+  # times per attempt budget and about twenty times over a whole press, and a
+  # GL16 chrome refresh each time would cost more than the search it reports on.
   assert_equal([x, y, w, h, RM2::DU, RM2::FAST_DRAW], d.updates[0])
   assert_equal(1, d.updates.size)
 end
@@ -2066,10 +2564,13 @@ Expected: FAIL — `NoMethodError: undefined method 'progress_rect'`.
 
 - [ ] **Step 3: Implement the bar**
 
-Read `renderer.rb` whole first. A fix wave was refactoring it while this plan
-was written (it extracted a `boundary_weight` helper out of `draw_board`), so
-the file may not look exactly as quoted anywhere in this plan. Append after
-`SPLASH_TEXT`, wherever that now sits:
+Read `renderer.rb` whole first. Two fix waves refactored it after this plan
+was drafted, so the file does not look like any snippet quoted here: the eraser
+work extracted `boundary_weight`, `leading_band` and `trailing_band` out of
+`draw_board` and added `redraw_cell(index, grid)`, and `75eb7cf` deleted
+`DIFFICULTIES`. At HEAD the constants run `WHITE BUTTON_BORDER GIVEN_GRAY
+ENTRY_GRAY DIGIT_SCALE SPLASH_SCALE SPLASH_TEXT`, and `SPLASH_TEXT` is the last
+of them. Append after it:
 
 ```ruby
     # THE PROGRESS BAR, and it is a real one: generation already loops over
@@ -2080,6 +2581,15 @@ the file may not look exactly as quoted anywhere in this plan. Append after
     # decelerates as a search runs long, and can never fill -- because a search
     # that has not finished cannot promise it is about to. See App#show_progress
     # for why that is the shape and not a percentage of a fixed total.
+    #
+    # WHAT THAT LOOKS LIKE IN THE COMMON CASE, said plainly because it is the
+    # case the player meets: an EASY press hits on its first attempt, so the bar
+    # goes to 1/(1+6) -- 14%, 87 px of 614 -- and is then replaced by the board.
+    # A short bar that vanishes, not a bar that fills. design 6.5 predicted "the
+    # bar jumps to full"; that was true of a denominator of `total`, and it is
+    # not true of this one. The trade was taken deliberately: never resetting
+    # across a retry matters more than finishing, because the retry case is the
+    # one where the player is actually waiting.
     #
     # Geometry is derived from the splash text's own box so the two stay
     # centred together, and lives wholly inside board_rect so that draw_board's
@@ -2098,10 +2608,13 @@ the file may not look exactly as quoted anywhere in this plan. Append after
     end
 
     # The filled width in pixels for a fraction given as two Integers. Integer
-    # arithmetic throughout: a bar is pixels, mrb_int is 32-bit on the device,
-    # and String#% does not exist in this gem's mrbtest state anyway. Clamped
-    # at both ends and safe on a zero denominator, because this is called from
-    # inside a search where a raise costs the player their puzzle.
+    # arithmetic throughout, and the reason is the bar and not the toolchain:
+    # a bar is pixels, mrb_int is 32-bit on the device, and there is nothing a
+    # Float would add here but a rounding rule to get wrong. (String#% and
+    # `format` ARE available since 18cc2f5 declared mruby-sprintf; a percentage
+    # STRING is simply not what this returns.) Clamped at both ends and safe on
+    # a zero denominator, because this is called from inside a search where a
+    # raise costs the player their puzzle.
     def self.progress_fill(num, den)
       inner = PROGRESS_W - 2 * PROGRESS_BORDER
       return 0 if den <= 0 || num <= 0
@@ -2126,14 +2639,37 @@ the file may not look exactly as quoted anywhere in this plan. Append after
     end
 
     # DU + FAST_DRAW, the same exception to the chrome convention that
-    # press_button makes: this is two-level black on white, it happens up to
-    # twenty times inside one search, and a GL16 each time would cost more than
-    # the search it reports on.
+    # press_button makes: this is two-level black on white, it happens about ten
+    # times per attempt budget and about twenty times over a whole press
+    # however long it runs (App::PROGRESS_STEP_PX explains why the total is
+    # bounded), and a GL16 each time would cost more than the search it
+    # reports on.
     def flush_progress
       x, y, w, h = Renderer.progress_rect
       @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
     end
 ```
+
+**One stale comment to correct while you are in this file**, because Task 4 is
+the only task that opens it. `boundary_weight`'s comment reads:
+
+```ruby
+    # `== 0`, not `.zero?`: Integer#zero? is mruby-numeric-ext, which this gem
+    # does not depend on, so it is absent from its mrbtest state.
+```
+
+`18cc2f5` declared `mruby-numeric-ext`, so that is now false. **Correct the
+comment; do not change the code** — `i % 3 == 0` stays exactly as it is (see
+Global Constraint 1's second caution). Replace those two lines with:
+
+```ruby
+    # Every third boundary, counting from the board's own edge, which is why
+    # this is `% 3` and not a lookup.
+```
+
+That is the whole edit: a claim that its own repository has since falsified is
+worse than no comment. The identical claim in `Rater.band` needs no attention —
+Task 2 deletes that method.
 
 - [ ] **Step 4: Run to GREEN**
 
@@ -2180,23 +2716,46 @@ loop**:
 - Produces:
   - `App::GENERATE_TRIES` = 3, `App::PROGRESS_STEP_PX` = 30
   - `App.new(..., log: $stderr)` — a new keyword
-  - `App#fill_board` guards a nil reply
+  - `App#fill_board` guards a nil reply and repaints either way
   - `App#new_puzzle` paints an empty bar with the splash
+  - new **private** methods `search_for_puzzle`, `attempt_generation`,
+    `reset_progress`, `show_progress`, `log_line`
+  - **no new public methods, and no method made public.** `cycle_difficulty`
+    and `fill_board` both stay private; the tests reach them with `send`.
 
-- [ ] **Step 1: Check the tree before writing the nil guard**
+- [ ] **Step 1: Read the nil guard that has already landed, and know that you
+      are overriding half of it**
 
-A separate fix wave was landing a nil guard in `fill_board`. At the commit
-this plan was written against (`2aae216`), `fill_board` reads
+The guard this plan predicted **landed in `75eb7cf`**, before this task. At
+HEAD `fill_board` reads:
 
 ```ruby
       puzzle = Sudoku::Generator.generate(@difficulty, @rng)
-      @grid = puzzle[:grid]
+      # ... a long comment saying the invariant is about to be given up ...
+      return self if puzzle.nil?
 ```
 
-with **no guard**. Run `git log --oneline -5 -- mrbgems/mruby-redoku/mrblib/redoku/app.rb`
-and read the method. If a guard has landed, **extend it** — keep its wording
-and its test, and add only the retry loop and the logging around it. Do not
-add a second guard, and do not revert someone else's.
+So do not add a second guard. But **do not "keep its wording" either**, which
+is what an earlier draft of this step said, because one clause of it is a
+decision this task reverses. The existing comment ends:
+
+> *"On a nil result the puzzle already on the board is kept as-is — an
+> unchanged board beats a wiped one — and the caller's splash is left showing,
+> which is honest: nothing new was actually dug."*
+
+The first half stands and is load-bearing (the stuck-RUBBER fix in `2bebc4e`
+cites it by name as precedent for resolving corruption toward the
+non-destructive answer, so do not weaken it). **The second half does not.**
+`return self` before the repaint leaves `GENERATING...` on the panel with
+nothing coming, and e-ink holds the last image it was given — so a first
+generation that fails leaves the player looking at a permanent splash, which
+reads as a hang rather than as honesty. There was also never a test on that
+branch (it was unreachable when it landed), so nothing pins the old choice.
+
+Step 3's `fill_board` therefore repaints unconditionally: the previous puzzle
+if there is one, an empty board if there is not. Say so in the replacement
+comment, naming the reversal, rather than silently changing behaviour that a
+comment in the same file argues for.
 
 - [ ] **Step 2: Write the failing test for the two failure paths**
 
@@ -2222,26 +2781,64 @@ end
 # hits it. The only way to drive App's unbounded retry without an unbounded
 # test: a real generator either succeeds by luck or hangs.
 class MissingGenerator < FakeGenerator
-  def initialize(misses)
-    super()
+  # `progress:` is threaded through rather than poked in from outside afterwards.
+  # An earlier draft did `gen.instance_variable_set(:@progress, true)`, which
+  # works (mruby-metaprog is declared) but is a test reaching around a
+  # collaborator's own constructor because that constructor forgot an argument.
+  # Fixing the interface is the cheaper repair.
+  def initialize(misses, progress: false)
+    super(progress: progress)
     @misses = misses
   end
 
   def generate(tier, rng, attempts = nil, &block)
     out = super(tier, rng, attempts, &block)
     return out if @calls > @misses
-    # An honest reply naming the tier it ACTUALLY reached, which is what a
-    # missed request looks like: never a wrong label.
-    out.store(:tier, :easy)
+    # An honest reply naming a tier it ACTUALLY reached, which is what a missed
+    # request looks like: never a wrong label. NEVER the requested tier, which
+    # is why this is conditional -- an earlier draft always answered :easy, so a
+    # "miss" at the default difficulty of :easy was a HIT and every retry test
+    # built on it passed while turning the loop exactly once.
+    out.store(:tier, tier == :easy ? :medium : :easy)
     out
   end
 end
 
+# Cycles the difficulty until it reaches `tier`, which is how a player gets
+# there -- App has no setter, deliberately, because @difficulty is the Level
+# button's read-out.
+#
+# EACH CYCLE DIGS. cycle_difficulty ends in new_puzzle -> fill_board, so
+# walking :easy -> :master is FOUR generations, not a state change: with a
+# hitting FakeGenerator that is four cheap calls and four log lines, and a test
+# that wants exact counts has to install its real generator AFTERWARDS. An
+# earlier draft did not, and every count in the first test below was out by
+# four.
+#
+# `send`, not a public cycle_difficulty. Object#send is available (this gem
+# declares mruby-metaprog since 18cc2f5), so there is no reason to widen App's
+# API for a test -- which is what an earlier draft proposed, on the premise
+# that send was unavailable.
+def difficulty_to(app, tier)
+  Redoku::Sudoku::Rater::TIERS.size.times do
+    return app if app.difficulty == tier
+    app.send(:cycle_difficulty)
+  end
+  raise "no such difficulty: #{tier}"
+end
+
 assert('a missed tier is asked for again, without limit') do
+  # Get to :master on a generator that HITS, so the four cycling digs do not
+  # land in the counts below, then swap in the misser and a fresh recorder.
+  # instance_variable_set rather than a public seam on App: this is a test
+  # reaching into a test's own subject for one line, not an API anyone ships.
+  app, = new_app(generator: FakeGenerator.new, log: FakeLog.new)
+  difficulty_to(app, :master)
+
   gen = MissingGenerator.new(4)
   log = FakeLog.new
-  app, = new_app(generator: gen, log: log)
-  difficulty_to(app, :master) # the helper below; a player gets there by cycling
+  app.instance_variable_set(:@generator, gen)
+  app.instance_variable_set(:@log, log)
   app.new_puzzle
 
   # Five rounds: four misses and the hit. No fallback to an easier tier and no
@@ -2261,21 +2858,33 @@ assert('a generation that raises is retried a few times, then the board is kept'
   # THE DISTINCTION THAT MATTERS. A tier miss is bad luck and retries for ever;
   # an exception is a fault and must not, or an engine bug becomes a hang on a
   # device whose only escape is the power button.
-  good = FakeGenerator.new
-  log = FakeLog.new
-  app, = new_app(generator: good, log: log)
-  app.new_puzzle
-  kept = app.grid.givens_s
-
   broken = FakeGenerator.new(fail_with: 'dig exploded')
-  app.replace_generator(broken)
-  app.new_puzzle
+  log = FakeLog.new
+  app, = new_app(generator: broken, log: log)
+  app.new_puzzle          # nothing dug yet, so there is nothing to keep
 
   assert_equal(Redoku::App::GENERATE_TRIES, broken.calls)
-  # The puzzle the player was looking at is still there. A blank board would
-  # be worse than an old board.
-  assert_equal(kept, app.grid.givens_s)
-  assert_true log.lines[log.lines.size - 1].include?('dig exploded')
+  assert_nil app.grid
+  # THE LAST LINE IS THE GIVE-UP, NOT THE FAULT. attempt_generation logs one
+  # 'generation failed (...)' per fault and search_for_puzzle logs 'gave up'
+  # after the last of them, so 'dig exploded' is second from the end. An
+  # earlier draft asserted it was last, which would have failed on a correct
+  # implementation.
+  assert_equal(Redoku::App::GENERATE_TRIES + 1, log.lines.size)
+  assert_true log.lines[log.lines.size - 1].include?('gave up')
+  assert_true log.lines[log.lines.size - 2].include?('dig exploded')
+  log.lines.each_with_index do |line, i|
+    assert_true line.include?('dig exploded') if i < Redoku::App::GENERATE_TRIES
+  end
+
+  # And with a puzzle already on the board, THAT puzzle survives the fault --
+  # which is the half of the behaviour a fresh App cannot show.
+  app2, = new_app(generator: FakeGenerator.new, log: FakeLog.new)
+  app2.new_puzzle
+  before = app2.grid.givens_s
+  app2.instance_variable_set(:@generator, broken)
+  app2.send(:fill_board)
+  assert_equal(before, app2.grid.givens_s)
 end
 
 assert('a generator that finds nothing at all is treated as a fault, not as luck') do
@@ -2285,17 +2894,24 @@ assert('a generator that finds nothing at all is treated as a fault, not as luck
   # would leave a player staring at a splash.
   empty = FakeGenerator.new(answer_nil: true)
   log = FakeLog.new
-  app, = new_app(generator: empty, log: log)
+  app, d, = new_app(generator: empty, log: log)
   app.new_puzzle
   assert_equal(Redoku::App::GENERATE_TRIES, empty.calls)
   # Nothing was ever dug, so there is no puzzle to keep -- and the board is
-  # painted empty rather than left showing the splash.
+  # painted empty rather than left showing the splash, which is where this
+  # differs from the guard that landed in 75eb7cf. See Step 1.
   assert_nil app.grid
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[d.updates.size - 1]
+  # A nil reply is not an exception, so nothing logs a 'failed' line -- only the
+  # give-up. Worth pinning: it is what distinguishes the two bounded paths in
+  # the log a device run will actually produce.
+  assert_equal(1, log.lines.size)
+  assert_true log.lines[0].include?('gave up')
 end
 
 assert('the progress bar does not reset between retries') do
-  gen = MissingGenerator.new(2)
-  gen.instance_variable_set(:@progress, true)
+  gen = MissingGenerator.new(2, progress: true)
   d = TestDisplay.new
   app = Redoku::App.new(d, [FakeInput.new], Redoku::Renderer.new(d),
                         FakeWaiter.new([]), FakeSignals.new,
@@ -2365,71 +2981,24 @@ end
 would print a generation report for every one of the sixty-odd App
 assertions, and the tests that care pass their own recorder.
 
-The helper those tests need, appended near `press_pen_button`:
+**`App`'s public API does not change in this task, and that is a correction to
+an earlier draft of this plan.** That draft made `cycle_difficulty` public and
+added a `fill_board_with(generator)` seam, on one stated premise: *"`Object#send`
+is not available in this gem's mrbtest state."* Since `18cc2f5` declared
+`mruby-metaprog`, it is — along with `instance_variable_set` — so both
+concessions were bought with a dead premise and are withdrawn:
 
-```ruby
-# Cycles the difficulty until it reaches `tier`, which is how a player gets
-# there — App has no setter, deliberately, because @difficulty is the Level
-# button's read-out. Uses the private cycle rather than a tap so the test does
-# not pay for a press acknowledgement it is not asserting.
-def difficulty_to(app, tier)
-  Redoku::Renderer::DIFFICULTIES.size.times do
-    return app if app.difficulty == tier
-    app.send(:cycle_difficulty)
-  end
-  raise "no such difficulty: #{tier}"
-end
-```
+- `difficulty_to` calls `app.send(:cycle_difficulty)` (see its definition
+  above). `cycle_difficulty` stays private.
+- `fill_board_with` is not added. The one test that needs to swap a generator
+  mid-life does `app2.instance_variable_set(:@generator, broken)` followed by
+  `app2.send(:fill_board)`. `fill_board` stays private too — it already is, at
+  `app.rb:754`, below the `private` on `:348`.
 
-**`Object#send` is not available in this gem's mrbtest state** (Global
-Constraint 1), so `difficulty_to` cannot call a private method that way.
-Make `cycle_difficulty` public in Step 3 instead — it is already what a
-button press calls, `new_puzzle` next to it is public for exactly this
-reason, and the comment on it should say so. Then:
-
-```ruby
-def difficulty_to(app, tier)
-  Redoku::Renderer::DIFFICULTIES.size.times do
-    return app if app.difficulty == tier
-    app.cycle_difficulty
-  end
-  raise "no such difficulty: #{tier}"
-end
-```
-
-and the first test above uses `difficulty_to(app, :master)` in place of the
-`difficulty_is` placeholder, before `app.new_puzzle`. `replace_generator` is
-not needed either — build a second App with the broken generator and call
-`fill_board` on the first one's grid instead. Rewrite that test as:
-
-```ruby
-assert('a generation that raises is retried a few times, then the board is kept') do
-  broken = FakeGenerator.new(fail_with: 'dig exploded')
-  log = FakeLog.new
-  app, = new_app(generator: FakeGenerator.new, log: log)
-  app.new_puzzle
-  kept = app.grid.givens_s
-
-  app2, = new_app(generator: broken, log: log)
-  app2.new_puzzle              # nothing to keep: no puzzle yet
-  assert_equal(Redoku::App::GENERATE_TRIES, broken.calls)
-  assert_nil app2.grid
-  assert_true log.lines[log.lines.size - 1].include?('dig exploded')
-
-  # And with a puzzle already on the board, that puzzle survives the fault.
-  app3, = new_app(generator: FakeGenerator.new, log: log)
-  app3.new_puzzle
-  before = app3.grid.givens_s
-  app3.fill_board_with(broken)  # see Step 3
-  assert_equal(before, app3.grid.givens_s)
-  assert_equal(kept.size, before.size)
-end
-```
-
-`fill_board_with(generator)` is a one-line public test seam on `App`:
-`@generator = generator; fill_board`. Add it in Step 3 with a comment saying
-it exists so the "keeps the current puzzle" path can be driven after a
-successful one, and that nothing in production calls it.
+That is a test reaching into its own subject for two lines, which is a smaller
+thing than a production method that exists only because a test asked for it.
+The public surface of `App` after this task is exactly what it is today plus
+the two new keywords.
 
 - [ ] **Step 3: Run it and confirm RED, then implement the App**
 
@@ -2452,18 +3021,24 @@ In `app.rb`, add the constants next to `PRESS_ACK_MS`:
     # How far the progress bar's filled edge must move before it is worth a
     # panel refresh. E-ink updates are not free -- DU + FAST_DRAW is the cheap
     # two-level waveform and still costs tens of milliseconds -- and :master's
-    # budget fires the hook up to 150 times per round. 30 px of a 614 px
-    # interior is about 5%, so at most twenty paints per round: roughly a
-    # second of paint inside a search measured in seconds. Painting per
-    # attempt instead would add 150 refreshes and could double a :hard dig.
+    # budget fires the hook up to 150 times per round.
+    #
+    # 30 px of a 614 px interior is about 5%. Because the fraction is
+    # num/(num+total) rather than num/total, one full :master round only ever
+    # reaches 614*150/300 = 307 px, so a round costs about TEN paints, not
+    # twenty; and because the bar is monotone and asymptotic to 614 px, the
+    # whole press -- however many rounds it runs -- costs at most about twenty.
+    # Roughly a second of paint inside a search measured in seconds, and it does
+    # not grow with the tail. Painting per attempt instead would add 150
+    # refreshes per round and could double a :hard dig.
     PROGRESS_STEP_PX = 30
 ```
 
-Add the `log:` keyword beside `generator:`:
+Add the `log:` keyword beside `generator:`. **The signature line in full**,
+because an earlier draft of this plan showed it only inside a comment and
+never wrote it:
 
 ```ruby
-    #                   ... log: $stderr)
-    #
     # `log:` is where the generation report goes: which rung, how many rounds,
     # how many attempts, how many milliseconds. That line is the ONLY way the
     # real cost distribution on the device ever becomes visible -- every timing
@@ -2472,18 +3047,28 @@ Add the `log:` keyword beside `generator:`:
     # so stderr is read.
     #
     # GUARDED AT EVERY USE (`@log.puts(...) if @log`), and that is not
-    # defensive style: $stderr comes from mruby-io, which this gem does not
-    # declare, so under `make test` the global may simply be undefined -- and
-    # an undefined global in Ruby is nil, not an error. The guard is what makes
-    # one line of logging safe in both worlds. Tests pass their own recorder,
-    # or nil.
+    # defensive style: $stderr comes from mruby-io, one of the few default-gembox
+    # gems this gem still does not declare (see Global Constraint 1), so under
+    # `make test` the global is simply undefined -- and an undefined global in
+    # Ruby is nil, not an error. The guard is what makes one line of logging
+    # safe in both worlds, and it is why the fix is NOT to declare mruby-io.
+    # Tests pass their own recorder, or nil.
+    def initialize(display, sources, renderer, waiter = RM2::Input,
+                   signals = RM2, touch_sources: [], clock: RM2,
+                   rng: Rng.from_clock, generator: Sudoku::Generator,
+                   log: $stderr)
 ```
 
-Make `cycle_difficulty` public (move it above `private`, keeping its comment
-and adding one sentence: *"Public for the same reason `new_puzzle` is: it is
-what a button press does, and what a test drives directly."*).
+with `@log = log` beside `@generator = generator`. `main.rb` omits both
+keywords and needs no edit.
 
-Then replace `fill_board` with the guarded, retrying version:
+`cycle_difficulty` stays **private** — see the note at the end of Step 2 for
+why the earlier draft's plan to publish it was withdrawn.
+
+Then replace `fill_board` with the guarded, retrying version. It is currently
+private (below `app.rb:348`) and stays private; the new helpers below it are
+private too, so **do not add a second `private` keyword** — everything in this
+snippet goes where `fill_board` already sits.
 
 ```ruby
     # Digs a puzzle at the current difficulty and puts it on the board. The
@@ -2509,9 +3094,20 @@ Then replace `fill_board` with the guarded, retrying version:
     #
     # THE NIL GUARD is required, not defensive: Generator.generate's "cannot
     # return nil" was an undocumented invariant spread over four methods in two
-    # files, and this change breaks it deliberately and re-establishes it in
-    # ONE place -- generate's own comment -- with a shallow-board fallback
-    # behind it. It can still answer nil in principle, so this handles it.
+    # files, and this change breaks it deliberately and re-establishes it in ONE
+    # place -- generate's own comment, which names all three failures an attempt
+    # has to suffer (rejected floor, rejected neighbourhood, rejected shallow
+    # fallback) before it yields nothing.
+    #
+    # AND IT REPAINTS EITHER WAY, which reverses half of the guard that landed
+    # in 75eb7cf. That guard returned before the repaint so the splash stayed
+    # up, on the grounds that "nothing new was actually dug" and saying so is
+    # honest. It is not: e-ink holds the last image it was given, so a first
+    # generation that fails leaves GENERATING... on the panel for ever with
+    # nothing coming, which reads as a dead device rather than as an honest
+    # report. The half that stands is the other one -- an unchanged board beats
+    # a wiped one, so a fault after a successful dig repaints the puzzle the
+    # player already had, and only a fault with nothing ever dug paints empty.
     def fill_board
       found = search_for_puzzle
       if found
@@ -2522,24 +3118,12 @@ Then replace `fill_board` with the guarded, retrying version:
         @achieved_tier = found[:tier]
       end
       @renderer.draw_board
-      # Nil only when nothing has ever been dug AND this search produced
-      # nothing: paint the empty board anyway, so a failed first generation
-      # leaves a board rather than a stale splash.
+      # @grid is nil only when nothing has EVER been dug and this search
+      # produced nothing: paint the empty board anyway (see above).
       @renderer.draw_puzzle(@grid) if @grid
       @renderer.flush_board
       self
     end
-
-    # A test seam, and the only reason it is public: the "a fault keeps the
-    # current puzzle" path can only be driven after a successful generation, so
-    # a test needs to swap the generator mid-life. Nothing in production calls
-    # this.
-    def fill_board_with(generator)
-      @generator = generator
-      fill_board
-    end
-
-    private
 
     # Ask until the requested tier arrives, or until the engine has failed
     # GENERATE_TRIES times. Returns the candidate, or nil.
@@ -2674,10 +3258,17 @@ from nowhere a second later.
 
 - [ ] **Step 4: Fix the splash-ordering test's update list**
 
-`'the splash reaches the panel before generation starts'` asserts
-`assert_equal 2, d.updates.size`. It now sees three: the splash flush, the
-bar's first DU repaint from inside the search, and the finished board. Update
-it, keeping its claim intact:
+`'the splash reaches the panel before generation starts'` (`test/app.rb:1450`)
+asserts `assert_equal 2, d.updates.size`. It now sees three: the splash flush,
+the bar's one DU repaint from inside the search, and the finished board.
+
+*(One, not several: `:easy` hits on its first attempt on every measured chain,
+so the block fires once, `progress_fill(1, 1 + 6)` is 87 px, and 87 ≥
+`PROGRESS_STEP_PX` — so exactly one paint. That arithmetic is what makes every
+count in Step 5 predictable, and it is worth re-deriving if any of `ATTEMPTS`,
+`PROGRESS_STEP_PX` or `PROGRESS_W` changes.)*
+
+Update it, keeping its claim intact:
 
 ```ruby
   # Exactly one update had reached the panel when the generator took its first
@@ -2701,23 +3292,130 @@ it, keeping its claim intact:
 That test constructs its App directly and therefore uses the real generator
 at `:easy`; it must also pass `log: nil` so the run prints nothing.
 
+- [ ] **Step 4a: Fix the other three direct-App update counts, which move for
+      exactly the same reason**
+
+Task 2 Step 7 listed the six tests that keep the REAL generator. Five of them
+dig, so five gain the bar's DU update — and **three assert exact update counts
+or exact update lists, so three go red.** An earlier draft of this step told
+the implementer these counts should NOT move and to go hunting if they did,
+which would have sent them after a non-bug. They move. Here is what each
+becomes.
+
+The sequence for a real dig through `new_puzzle` is now: **splash (GL16,
+`board_rect`) → one or more bar paints (DU, `progress_rect`) → board (GL16,
+`board_rect`)**. Through a button press, a press flash comes first and a
+release flash last.
+
+**"One or more", and that is the trap in these three fixes.** The number of bar
+paints is the number of attempts whose `progress_fill` step cleared
+`PROGRESS_STEP_PX`, so it depends on how many attempts the search took:
+`:easy` is measured to hit on its first attempt on 500 of 500 chains, giving
+`progress_fill(1, 1 + 6) = 87 px` and exactly **one** paint; but `:medium` at a
+cap of 12 gives 47 px on its first attempt and another 40 on its second, so a
+seed that needs two attempts paints **twice**. Deterministic (the suite is
+seeded) but not predictable from this document.
+
+So the two `:medium` tests are converted to **count by REGION**, which is the
+pattern `'the acknowledgement runs each action exactly once'` already uses in
+this same file — "a tighter question than the old waveform count did, not a
+looser one". The `:easy` test keeps its exact count, because for `:easy` the
+arithmetic above pins it.
+
+1. **`'the action runs while the button is held down, not after it comes up'`
+   (`:720`).** Press New with a `TimelineWaiter`, `:easy`, so exact counts hold.
+   - `assert_equal [3], waiter.updates_at` → `assert_equal [4], waiter.updates_at`
+   - `d.updates[1]` and `[2]` were both the board rect; now `[1]` is the
+     splash, `[2]` is the **bar** and `[3]` is the finished board. Assert the
+     bar explicitly rather than skipping over it — it is the whole point of
+     this change and this test is already the one that reads the sequence.
+   - `assert_equal 4, d.updates.size` → `5`, and the release flash moves from
+     `d.updates[3]` to `d.updates[4]`.
+   - Its comment says "THREE updates had reached the panel by the time the hold
+     began". Make it four, and say which one is new: the bar moved *during* the
+     dig, which is the half of covering the pause a static splash cannot do.
+     Add the one-paint arithmetic, so the next person to change `ATTEMPTS[:easy]`
+     knows why this number is 4.
+2. **`'a Level press whose flash is refused still cycles the difficulty'`
+   (`:803`).** `DeafButtonsDisplay` refuses button rects only, and the bar is
+   inside `board_rect`, so the bar lands. This one digs `:medium` at the
+   production cap, so **drop the total count** rather than guessing it:
+   ```ruby
+     # The header is still FIRST and still GL16 -- the M1 decision this test
+     # exists for -- and there is still exactly one of it.
+     hx = Redoku::Layout::HEADER_X
+     hy = Redoku::Layout::HEADER_Y
+     assert_equal RM2::GL16, d.updates[0][4]
+     assert_equal [hx, hy], [d.updates[0][0], d.updates[0][1]]
+     assert_equal 1, d.updates.reject { |u| u[0] != hx || u[1] != hy }.size
+     # Then exactly two board flushes: the splash and the finished puzzle. That
+     # is the dig Level gained, counted by REGION rather than by total, because
+     # the progress bar between them paints once per VISIBLE STEP and a :medium
+     # search may take more than one attempt to hit.
+     bx, by, bw, bh = Redoku::Layout.board_rect
+     board = d.updates.reject { |u| u[0] != bx || u[1] != by }
+     assert_equal 2, board.size
+     board.each { |u| assert_equal [bx, by, bw, bh, RM2::GL16, 0], u }
+     # ...and the bar moved at least once, in the ink waveform, between them.
+     px, py, = Redoku::Renderer.progress_rect
+     bar = d.updates.reject { |u| u[0] != px || u[1] != py }
+     assert_true bar.size >= 1
+     bar.each { |u| assert_equal RM2::DU, u[4] }
+     # Nothing else reached the panel at all.
+     assert_equal d.updates.size, 1 + board.size + bar.size
+   ```
+   That last line is what replaces `assert_equal 3, d.updates.size`: it still
+   says "and nothing else", without hard-coding a number the bar controls.
+3. **`'a New press whose flash is refused still clears the ink'` (`:839`).**
+   Asserts the whole update list as one literal:
+   ```ruby
+     assert_equal [[bx, by, bw, bh, RM2::GL16, 0],
+                   [bx, by, bw, bh, RM2::GL16, 0]], d.updates
+   ```
+   This digs `:easy`, so the literal *could* just grow to three entries with
+   `[px, py, pw, ph, RM2::DU, RM2::FAST_DRAW]` in the middle. Use the same
+   region form as (2) anyway — two board flushes, at least one bar paint,
+   nothing else — so that the two refused-flash tests read alike and neither
+   breaks the next time an attempt budget moves. Its comment says "Two board
+   flushes where M1 had one"; make it "two board flushes with the bar moving
+   between them", and keep the point it is actually making: the refused button
+   flash still costs the player nothing.
+
+`'every button acknowledges its press, at the button, for the same 200 ms'`
+(`:657`) digs for real too, but every assertion in it indexes `d.updates[0]`,
+`d.rects[0]`, `d.rects[1]` and `waiter.calls` — all of which are the press
+flash's, and all of which come before any bar. **It should stay green. If it
+goes red, that is a real bug**: something is painting or flushing before
+`show_press`.
+
+`'an App given no rng seeds itself from the clock'` (`:1508`) asserts only that
+a grid arrived, so the bar cannot touch it.
+
 - [ ] **Step 5: Run to GREEN**
 
 Run: `make test`
 
 Failures to expect:
 
-- **Update-count assertions elsewhere in `test/app.rb`.** `FakeGenerator`
-  does not call the progress block unless asked, so `'a tap on Level cycles
-  the difficulty and repaints the header'` (5 updates) and `'the
-  acknowledgement runs each action exactly once'` (2 board flushes) should be
-  untouched. If they moved, something is painting the bar unconditionally —
-  find it rather than adjusting the count.
+- **The three counts in Step 4a.** Expected, and fixed there. Anything *else*
+  moving is the signal to go hunting.
+- **Nothing in the `new_app` tests.** `FakeGenerator` does not call the
+  progress block unless asked, so `'a tap on Level cycles the difficulty and
+  repaints the header'` (5 updates) and `'the acknowledgement runs each action
+  exactly once'` (2 board flushes) really should be untouched. Note that
+  `new_puzzle`'s `draw_progress(0, 1)` still *draws* — it adds rects — but it
+  goes out on the splash's own `flush_board` and adds no update; and
+  `fill_board`'s `draw_board` white-fills over it before the board flush, so no
+  `gray_at` probe in the file can see it either. If one of these two moves,
+  something is flushing the bar unconditionally: find it rather than adjusting
+  the count.
 - **A hang.** If `make test` does not return, the unbounded path has been
   reached by a test that meant to reach the bounded one: check that
-  `attempt_generation` returns nil for a raise *and* for a nil reply, and that
-  a `FakeGenerator` built with neither `fail_with` nor `answer_nil` answers the
-  tier it was asked for.
+  `attempt_generation` returns nil for a raise *and* for a nil reply, that a
+  `FakeGenerator` built with neither `fail_with` nor `answer_nil` answers the
+  tier it was asked for, and that `MissingGenerator`'s miss tier is never equal
+  to the tier requested (it answers `:medium` for an `:easy` request precisely
+  so that a miss at the default difficulty is still a miss).
 
 - [ ] **Step 6: Commit**
 
@@ -2830,8 +3528,11 @@ The claim that "nothing may assume `TIERS.size == 3`" was **already false in
 this repository** when it was written, and finding out cost nothing only
 because it was looked for. Three places broke:
 
-1. `test/app.rb:507` and `:657` computed the next difficulty as
-   `DIFFICULTIES[(i + 1) % 3]`.
+1. `test/app.rb` computed the next difficulty as
+   `Rater::TIERS[(i + 1) % 3]` in two places — at HEAD, `:759` and `:909`.
+   (A third copy lived in `Renderer::DIFFICULTIES`, which `75eb7cf` deleted
+   for being a duplicate of `TIERS` before this rework reached it. Two tier
+   lists would have been two edits.)
 2. `test/sudoku_rater.rb:57-64` pinned `TIERS.size == CEILING.size` and the
    band-tiling derivation — correct for the old design and meaningless in the
    new one; it is now written against `DEMAND_RANGE` and `DEMAND_EDGES`.
@@ -2840,11 +3541,31 @@ because it was looked for. Three places broke:
    rungs differ in rarity by 50×, and one attempt budget cannot be right for
    both ends of that.
 
-One consequence worth stating: the new scheme is *less* sensitive to
-`Techniques::ORDER` than the old one. §3's one-unit warning applied because a
-calibrated sum decided the tier; a set-membership answer cannot be changed by
-re-ordering the set. Adding a *rule* still demands recalibration; re-ordering
-the existing ones no longer does.
+**A sensitivity to `Techniques::ORDER` that has changed shape rather than
+gone away, and this correction matters more than it looks.** §3 warned that a
+cost metric and the propagation it is measured against are one unit, because a
+calibrated *sum* decided the tier. A set-membership answer does not have that
+problem — but it has a different one, and an earlier draft of this section
+claimed the opposite ("a set-membership answer cannot be changed by re-ordering
+the set"), which is false twice over:
+
+- The technique solver takes the **first** applicable rule in `ORDER` at every
+  step, so re-ordering `ORDER` changes which rules fire, hence `counts`, hence
+  `hardest` and `Rater.upper_bound`. The upper bound stays *sound* (any superset
+  of the fired rules solves the board), but it is not the same number.
+- More sharply: `Rater.demand_of` stops walking down the ladder at the first set
+  that fails, and that early exit is sound only because each `DEMAND_SET` is a
+  contiguous prefix of `ORDER` **as a set** — `ORDER[0..1]`, `[0..2]`, `[0..6]`,
+  `[0..7]`. Today the level boundaries fall either side of the
+  `naked_triple`/`hidden_pair` swap rather than through it. Move a name across a
+  boundary, or re-order `ORDER`, and the break can mis-classify boards with
+  nothing failing. `test/sudoku_rater.rb`'s `'every demand set is a contiguous
+  prefix of ORDER'` is the guard rail, and `Rater.demand_of`'s comment carries
+  the proof.
+
+So: adding a *rule* still demands recalibration. Re-ordering the existing ones
+no longer demands recalibration, but it does demand re-checking that prefix
+test — and if it fails, deleting the early break rather than the test.
 ```
 
 - [ ] **Step 3: Record the chain rule as future work, not as a loss**
@@ -2880,9 +3601,16 @@ the tier being "the harder of the score's band and the floor its hardest
 technique implies" with the five-rung ladder — demand class, what each rung
 requires, the measured per-chain yield, and the note that clue count separates
 `:easy` from everything else and nothing more. Keep the pointer to
-`docs/design/difficulty-rating.md` and the "bands are calibrated against
-measurement, not borrowed" sentence; add that `Generator::ATTEMPTS` is per
-tier and why.
+`docs/design/difficulty-rating.md`; **rewrite** the "Bands are calibrated
+against measurement, not borrowed, and are derived from two ordered lists so
+that going to five levels is a table edit plus a recalibration" sentence rather
+than keeping it — going to five levels turned out to be a table edit *plus* a
+new per-tier `ATTEMPTS` entry, which is the claim §5 of the design record now
+corrects, so PLAN.md must not go on making the easier promise. Also update the
+**`Generator`** bullet in the same section: it currently says the dig walks
+"from the shallow end and keep[s] the first one whose score lands in the
+requested band", which is wrong in three ways after Task 3 (only `:easy` walks
+shallow, the score no longer decides, and `generate` may now answer nil).
 
 In §10's M2 paragraph, the sentence *"And the header shows the tier the player
 asked for, not the tier the generator achieved, which can differ"* now needs
@@ -2892,13 +3620,56 @@ kept. Add one line to the v2 parking lot: *"one chain rule (XY-wing or simple
 colouring), which would make the top rung both faster and better — see
 `docs/design/difficulty-rating.md` §6."*
 
+**While rewriting that paragraph, KEEP the sentence "Palm suppression under
+this build is unverified: it was not part of the device report."** It is one of
+four things §10 says M2 deliberately did not establish, and it is the surviving
+half of M1's own hardware caveat (§1's device block records it too, at "Palm
+suppression under the new build is unverified… it is the half of M1's caveat
+that stays open"). It is the last item carried forward from M1 that is not yet
+discharged, and rewriting the paragraph around it is the one realistic way it
+gets lost. **Nothing in this rework touches the proximity or palm logic**, so
+the caveat is as open after this change as before it — see this plan's Known
+Risks, which restates it so the plan is self-sufficient if the M2 workspace is
+ever deleted.
+
 In the design document's status line, replace *"design, measured, not
 implemented"* with *"design, measured, implemented 2026-08-24 by
-`docs/plans/2026-08-24-difficulty-rework.md`"*, and add one line under it
-naming the two places the plan deviated from this document (§6.1's
-`DEMAND_SETS` referencing `Techniques::ORDER` at load time, which the mrblib
-load order forbids; and §6.5's `retry_cap` denominator, which decision 4
-removed).
+`docs/plans/2026-08-24-difficulty-rework.md`"*, and add under it the **six**
+places this plan departs from the document. An earlier draft said "the two
+places", counting only the first two; the other four are argued in code
+comments and nowhere else, which is exactly how a deviation becomes an
+undocumented difference. All six, then, and the last is a consequence rather
+than a disagreement but still changes what a reader should expect:
+
+1. **§6.1's `DEMAND_SETS` references `Techniques::ORDER`** in a constant
+   expression. The mrblib load order forbids it (`rater.rb` loads before
+   `techniques.rb`), so the fourth set is spelled out and pinned against
+   `ORDER` by a test.
+2. **§6.5's `retry_cap` denominator** does not exist, because decision 4
+   removed the retry cap. The bar is `num / (num + total)` instead, which never
+   resets across a retry and never fills. §6.5's "the bar jumps to full" does
+   not happen.
+3. **§6.2's `demand_of` is replaced, not implemented.** The design's cascade
+   branches on which rules fired and can return `:locked` without ever testing
+   whether `LOCKED` solves the board. This plan walks the ladder downward
+   instead, so every set it names has been tested — and the early break needs
+   the `ORDER`-prefix property the design does not mention.
+4. **A `nil` measurement is routed to the FAULT path, not the miss path.**
+   §6.4 says the caller "retries with a fresh seed a few times"; this plan makes
+   that concrete and distinguishes it sharply from a tier miss, which retries
+   without limit. Conflating them would turn an engine bug into a hang.
+5. **§6.4's shallow-board fallback fires on a narrower path.** The design
+   classifies the shallowest usable board on *every* dismissed attempt; this
+   plan does it only when `hard_end` found nothing at all, because a dismissed
+   chain already has a real board to offer (its own hard end) and the extra
+   classification would double the cost the monotone dismissal exists to
+   avoid — about 1.4 s added to `:master`'s 4.7 s p50 for a strictly worse
+   candidate. `Generator.shallow_fallback`'s comment carries the argument.
+6. **`@achieved_tier` has narrowed in meaning**, from "the tier the generator
+   reached, which often differs from the request" to "the tier on the glass,
+   which differs from the request only after a fault". Not a deviation from the
+   design so much as a consequence of decision 4, but it changes what a future
+   reader of that attribute should expect, so it goes in the list.
 
 - [ ] **Step 5: Read it back, then commit**
 
@@ -2920,16 +3691,16 @@ git commit -m "docs: record the overturned hard-tier decision and the five-rung 
 
 | design section | where it lands |
 |---|---|
-| §5.1 rule sets, set inclusion not ORDER prefix | Task 2 (`DEMAND_SETS` + the nesting/coverage test) |
+| §5.1 rule sets, by membership not by ORDER position | Task 2 (`DEMAND_SETS`, the nesting/coverage test, and the ORDER-prefix test the classifier's break needs) |
 | §5.2 `hardest` as a free upper bound | Task 2 (`upper_bound`, generalised from `hardest` to `counts`) |
 | §5.3 rejection rule | Task 2 (`measure` → `tier: nil`) |
-| §5.4 neighbourhood rescue | Task 3 (`rescue_floor`) |
+| §5.4 neighbourhood rescue | Task 3 (`rescue_floor`; the test drives a seed mined for a rejecting floor, so the path cannot go uncovered) |
 | §6.1 `Rater` tables | Task 2 |
 | §6.1a class gates, score ranks within | Task 2 (`DEMAND_RANGE` width, `DEMAND_EDGES`) |
-| §6.2 the classifier, ~1 solve | Task 1 (`solves?`) + Task 2 (`demand_of`) |
+| §6.2 the classifier, ~1 solve | Task 1 (`solves?`) + Task 2 (`demand_of`) — **DEVIATION**: the design's per-rule cascade is replaced by a downward walk (Task 6 Step 4, item 3) |
 | §6.3 walk direction, hard end, per-tier attempts | Task 3 |
-| §6.4 the nil invariant, in one place | Task 3 (`generate`'s comment + contract) and Task 5 (`fill_board`'s guard) |
-| §6.5 the progress hook | Task 3 (the block) + Task 4 (the bar) + Task 5 (throttle, cross-retry denominator) |
+| §6.4 the nil invariant, in one place | Task 3 (`generate`'s comment + contract, and `shallow_fallback`) and Task 5 (`fill_board`'s guard) — **PARTIAL**: the fallback fires only when `hard_end` found nothing, not on every dismissal (Task 6 Step 4, item 5) |
+| §6.5 the progress hook | Task 3 (the block) + Task 4 (the bar) + Task 5 (throttle, cross-retry denominator) — **DEVIATION**: no `retry_cap` denominator, so the bar never fills (Task 6 Step 4, item 2) |
 | §7 clue counts, symmetry kept, single greedy pass | no code change — the design's recommendation is "keep what we have"; recorded in Task 6's §4 append |
 | §8 what breaks the table-edit claim | Task 2 (`% 3`, the rater test) and Task 3 (`ATTEMPTS`) |
 | §9.2 what gets worse | Task 6, named in the design record |
@@ -2942,7 +3713,9 @@ shipped (`DEMAND_SETS[3]`), retry for ever on a miss (Task 5), the two-step
 prefill ladder accepted and recorded (Task 6), cost behind a bar (Tasks 3–5),
 a real bar (Task 4).
 
-**2. Placeholder scan.** Three deliberate gaps, called out rather than hidden:
+**2. Placeholder scan.** Four deliberate gaps, called out rather than hidden.
+All four are values that must be **measured** before the test around them means
+anything, and all four have a script in the step that needs them:
 
 - **The three demand fixtures (`LOCKED_81`, `PAIR_81`, `XWING_81`) are
   `'<81 chars>'` in Task 2 Step 10.** They cannot be written here: a board
@@ -2951,28 +3724,52 @@ a real bar (Task 4).
   gives the script that mines them, the seeds to record, and — crucially — a
   test that pins each fixture's class **by definition** (`solves?` against the
   weaker and stronger sets) rather than by the classifier that found it.
+- **`SOLVED_FLOOR_SEED` and `REJECT_FLOOR_SEED` are `<n>` in Task 3 Step 0.**
+  Same reason and a sharper consequence: three assertions in Task 3 are
+  unconditional *because* those seeds are chosen for what their chain floor is.
+  An earlier draft used `13` for both and guarded the bodies with `unless
+  out[0].nil?` and `if r.measure(floor)[:tier]`, which meant the floor-rescue
+  path — the source of 7 of 10 measured `:master` boards — could ship with zero
+  coverage and a green suite. Mining the seed is what converts a hope into a
+  test.
 - **Task 6's PLAN.md §7 edit is described, not written out.** It is prose in a
   document whose current wording the implementer must read; quoting a
-  replacement here would fight whatever the fix wave leaves behind.
-- **Task 5 Step 2 contains a test written twice** — once with `send` and
-  `replace_generator`, then corrected in place. That is deliberate: the first
-  form is the one a reasonable implementer would reach for, and `Object#send`
-  is unavailable in this gem's mrbtest state. Leaving the wrong turn visible
-  with its reason is cheaper than a note nobody connects to the code.
+  replacement here would fight whatever the last fix wave left behind. Step 4
+  names the three specific claims in it that are now false, so "described" does
+  not mean "left to taste".
 
 **3. Type consistency.** Checked across tasks: `values` is an 81-element
 Array of Integer everywhere; `rules` is an **Array of symbols** at
 `Techniques.solves?` and `Rater::DEMAND_SETS`, and an **Integer mask** only
 inside `Techniques.solve` and `mask_of`; `Rater.measure`'s six keys are the
-same in Task 2's tests, Task 3's `hard_end`/`rescue_floor`/`walk_up` and Task
-5's `fill_board`; `[board, measurement]` is the return shape of all five walk
-helpers; `Generator.generate`'s reply carries `attempts:` in Task 3 and is
-read as `out[:tier]` in Task 5; `Renderer.progress_fill(num, den)` and
-`draw_progress(num, den)` take the same pair in the same order in Tasks 4 and
-5; `Rater::TIERS` and `Renderer::DIFFICULTIES` are separate lists pinned equal
-by `test/app.rb`, and Task 2 edits both.
+same in Task 2's tests, Task 3's `hard_end`/`rescue_floor`/`walk_up`/
+`shallow_fallback` and Task 5's `fill_board`; `[board, measurement]` is the
+return shape of all six walk helpers; `Generator.generate`'s reply carries
+`attempts:` in Task 3 and is read as `out[:tier]` in Task 5;
+`Renderer.progress_fill(num, den)` and `draw_progress(num, den)` take the same
+pair in the same order in Tasks 4 and 5; and **`Rater::TIERS` is the only tier
+list in the tree** — `Renderer::DIFFICULTIES` was deleted in `75eb7cf`, so
+there is no second copy to keep in step and no equality test to maintain.
 
 **4. Known risks, recorded rather than resolved.**
+
+- **Palm suppression is still unverified on hardware, and this plan does not
+  change that.** It is the last item carried forward from M1 that remains open:
+  the owner's device run discharged the button-feedback half of M1's caveat and
+  said nothing about the palm half. Nothing here touches
+  `note_pen_proximity`, `expire_pen_proximity`, `touch_suppressed?` or the
+  `@touch_blocked` birth latch, so the risk is neither raised nor lowered —
+  it is simply still there, and it needs a pen-and-finger device run to close.
+  Recorded here as well as in `PLAN.md` §1 and §10 so that deleting the M2
+  workspace cannot lose it, and Task 6 Step 4 says explicitly not to drop
+  §10's sentence while rewriting the paragraph around it.
+- **The `:master` progress bar stops around a third full and then vanishes.**
+  `num / (num + total)` reaches 307 px of 614 after one full budget and 460
+  after three; the board's arrival is the completion signal. An `:easy` press
+  stops at 87 px (14%). Deliberate — never resetting across a retry was judged
+  worth more than finishing — but it is the most likely thing for the owner to
+  report as a bug on the first device run, so it is written down here before
+  they do.
 
 - **The unbounded retry is genuinely unbounded.** If a rung ever becomes
   unreachable — a table typo, a rule regression — the game searches for ever
