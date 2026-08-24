@@ -197,6 +197,16 @@ def eraser_sample(sx, sy, down)
   [s[0], s[1], s[2], RM2::Input::RUBBER | (down ? RM2::Input::TOUCH : 0)]
 end
 
+# A TIP sample with the eraser bit stuck on as well. `tools` is a sticky mask
+# whose bits are set and cleared per evdev code independently (input.c), so
+# this is the state a LOST `BTN_TOOL_RUBBER 0` packet leaves behind — and the
+# digitizer never mentions RUBBER again afterwards, so nothing clears it.
+# A packet with both tools is corrupt: the hardware reports one or the other.
+def stuck_rubber_sample(sx, sy, down)
+  s = pen_sample(sx, sy, down)
+  [s[0], s[1], s[2], s[3] | RM2::Input::RUBBER]
+end
+
 # The flat 0..80 cell index a sample lands in — derived from the point the
 # transform actually produces, not the one the test asked for, because both
 # directions of Pen.to_screen round.
@@ -398,6 +408,11 @@ assert('the eraser end clears the cell it touched instead of inking') do
   s = eraser_sample(300, 400, true)
   index = cell_index_of(s)
   app.handle_sample(s)
+  # A second sample inside the same cell, so that the no-ink claim below is
+  # about ink_to refusing rather than about ink_to never being reached: a lone
+  # down sample runs begin_stroke only, and nothing on that path draws a line
+  # whatever the mode, which would make the assertion unable to fail.
+  app.handle_sample(eraser_sample(320, 420, true))
   # No ink: ink_to only draws for @mode == :ink, and this stroke is :erase.
   assert_equal [], d.lines
   # ...and the cell was repainted from the model instead. The white fill is
@@ -501,6 +516,30 @@ assert('a stroke that went down on the tip inks even if the eraser bit turns up'
   assert_equal [p1[0], p1[1], p2[0], p2[1], Redoku::App::INK_WIDTH,
                 Redoku::App::INK_GRAY], d.lines[0]
   assert_equal 0, count_fills(d, cell_index_of(s2))
+end
+
+assert('a stuck RUBBER bit does not turn the pen tip into an eraser') do
+  app, d, = new_app
+  s1 = stuck_rubber_sample(300, 400, true)
+  s2 = stuck_rubber_sample(340, 440, true)
+  p1 = screen_of(s1)
+  p2 = screen_of(s2)
+  app.handle_sample(s1)
+  app.handle_sample(s2)
+  # PEN | RUBBER is not "the eraser", it is a mask that lost a packet: the two
+  # documented packet-eaters are the display server draining a thawed
+  # client's backlog and SYN_DROPPED, the same two PEN_SILENCE_MS exists for.
+  # Reading RUBBER alone would make every tip stroke for the rest of the
+  # session wipe the cell the player was writing in, with no way back but
+  # flipping the pen over and returning. So a corrupt packet inks, which is
+  # the same trade fill_board makes: an unchanged board beats a wiped one.
+  assert_equal 1, d.lines.size
+  assert_equal [p1[0], p1[1], p2[0], p2[1], Redoku::App::INK_WIDTH,
+                Redoku::App::INK_GRAY], d.lines[0]
+  assert_equal 0, count_fills(d, cell_index_of(s1))
+  # The stroke is a plain ink stroke, so it also leaves ink damage to flush,
+  # rather than a cell-sized repaint region.
+  assert_false app.ink_dirty.nil?
 end
 
 assert('a stroke that went down on the eraser never inks, tip bit or not') do

@@ -178,19 +178,48 @@ module Redoku
     end
 
     # RM2::Input::TOUCH is the tool pressed against the glass and says nothing
-    # about WHICH end is pressed; RUBBER is the tool identity, set while the
-    # eraser end is in proximity (PEN while the tip is — the digitizer latches
-    # one or the other on proximity entry and never both). So the two bits are
-    # read together here: contact from TOUCH, meaning from RUBBER, and the
-    # meaning is handed to begin_stroke and latched there for the whole
-    # stroke. Re-reading it per sample would let a stroke change identity
-    # halfway, which no other stroke decision in this loop can do.
+    # about WHICH end is pressed; RUBBER is the tool identity, reported while
+    # the eraser end is in proximity (PEN while the tip is — the digitizer
+    # latches one tool on proximity entry and reports only that one). So the
+    # two bits are read together here: contact from TOUCH, meaning from
+    # RUBBER, and the meaning is handed to begin_stroke and latched there for
+    # the whole stroke. Re-reading it per sample would let a stroke change
+    # identity halfway, which no other stroke decision in this loop can do.
     def handle_sample(sample)
       raw_x, raw_y, _pressure, tools = sample
       note_pen_proximity(tools)
       x, y = Pen.to_screen(raw_x, raw_y)
       down = (tools & RM2::Input::TOUCH) != 0
-      erasing = (tools & RM2::Input::RUBBER) != 0
+      # RUBBER set AND PEN clear, not RUBBER alone. `tools` is a STICKY mask
+      # whose bits are set and cleared per evdev code independently (the rm2
+      # gem's input.c: `if (ev->value != 0) in->tools |= bit; else in->tools
+      # &= ~bit;`), so PEN | RUBBER together is reachable — it is exactly what
+      # a LOST `BTN_TOOL_RUBBER 0` packet leaves behind, and the two things
+      # that eat such a packet are the same two PEN_SILENCE_MS exists for: the
+      # display server draining a thawed client's evdev backlog, and
+      # SYN_DROPPED. The digitizer then never mentions RUBBER again, because it
+      # only ever reports the tool actually in range, so reading RUBBER alone
+      # would make every later TIP stroke erase the cell the player meant to
+      # write in — for the rest of the session, recoverable only by flipping
+      # the pen over and back, which nobody would guess. That is the shape of
+      # the bug the lost-packet fix took out of the touch path, pointed the
+      # destructive way.
+      #
+      # A both-bits packet is corrupt by definition, and the safe reading of
+      # corruption in a DESTRUCTIVE decision is "ink": it is the trade
+      # fill_board already makes when a dig hands back nil, where an unchanged
+      # board beats a wiped one. Guess wrong this way and the player gets a
+      # stroke of ink in a cell they wanted cleared, which they can erase;
+      # guess wrong the other way and they lose writing they cannot get back.
+      #
+      # note_pen_proximity keeps ORing the two bits, deliberately, and that is
+      # not an inconsistency: proximity asks "is any end of the tool near the
+      # glass", where either bit is evidence enough and a stuck one merely
+      # over-suppresses touch until PEN_SILENCE_MS expires it. Only a
+      # destructive decision needs the strict reading, so only this one gets
+      # it.
+      erasing = (tools & RM2::Input::RUBBER) != 0 &&
+                (tools & RM2::Input::PEN) == 0
 
       if down && @mode.nil?
         begin_stroke(x, y, erasing)
@@ -384,9 +413,16 @@ module Redoku
     #
     # A fresh cooldown rather than a clean slate: a hand is quite likely to
     # be on the glass at the moment the game comes back, and the pen's next
-    # packet is the first evidence either way. The pen's own stroke state is
-    # deliberately left alone — an interrupted stroke is one wrong line, not
-    # a dead input device, and the pen path is verified on hardware.
+    # packet is the first evidence either way.
+    #
+    # The pen's own stroke state is deliberately left alone, and the worst case
+    # for that is no longer merely one wrong line: with :erase in the set, a
+    # stroke still open across a resume can go on CLEARING CELLS. The decision
+    # holds anyway, because of what handle_resume does immediately after this —
+    # draw_all plus draw_puzzle repaint the whole board from the model, which
+    # is exactly what a continued erase would do to one cell of it, so the
+    # continuation is a no-op rather than a loss. What it is not is a dead
+    # input device, which is what the latches above would otherwise become.
     def forget_input_state
       @pen_near = false
       @pen_seen_at = nil

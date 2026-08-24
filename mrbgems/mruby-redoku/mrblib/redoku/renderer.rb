@@ -151,15 +151,19 @@ module Redoku
     # THE LIMIT WORTH KNOWING, since it follows from this being cell-exact:
     # the brush is INK_WIDTH (4) px and stamped biased up-left (2 px up and
     # left, 1 px down and right — see rm2_stamp), so ink written hard against
-    # a cell's LEFT or TOP edge lands up to 2 px inside the previous cell,
-    # where repainting this one cannot reach it. At a block boundary the 4 px
-    # line swallows all of that; at a 1 px cell boundary up to 2 px of it can
-    # survive as a hairline in the neighbour until the neighbour is erased
-    # too (or New repaints the board). The right and bottom edges have no such
-    # hole — 1 px of overshoot always lands on the next cell's own line.
-    # Widening the repaint into the neighbours would trade that hairline for
-    # something worse: shaving pixels off ink the player wrote in a cell they
-    # never touched.
+    # a cell's LEFT or TOP edge lands up to 2 px outside it, where repainting
+    # this cell cannot reach it. Three neighbours can hold that residue, not
+    # one: the cell to the left, the cell above, and — for a stroke through
+    # the corner, which reaches 2 px left AND 2 px up — the cell diagonally
+    # up-left. At a block boundary the 4 px line swallows all of it; at a 1 px
+    # cell boundary up to 2 px survives, and 2 px is its WIDTH, not its
+    # extent: it can run the whole length the stroke travelled along that
+    # boundary, up to a full 140 px cell edge. It goes when that neighbour is
+    # erased in its turn, or when New repaints the board. The right and bottom
+    # edges have no such hole — 1 px of overshoot always lands on the next
+    # cell's own line. Widening the repaint into the neighbours would trade
+    # that band for something worse: shaving pixels off ink the player wrote
+    # in a cell they never touched.
     def redraw_cell(index, grid)
       col = Sudoku::Grid.col_of(index)
       row = Sudoku::Grid.row_of(index)
@@ -167,6 +171,15 @@ module Redoku
       @d.fill_rect(x, y, w, h, WHITE)
       redraw_cell_lines(col, row, x, y, w, h)
       if grid && !grid.empty?(index)
+        # WAVEFORM WARNING for whoever wires M3's recogniser through here.
+        # ENTRY_GRAY is 96, a mid tone, and the caller that exists today
+        # (App#erase_at) flushes this region as RM2::DU — a TWO-LEVEL
+        # waveform, which thresholds 96 to black or white and destroys the
+        # given-versus-entry distinction PLAN.md §8 asks for. Nothing in M2
+        # can reach it (no entries exist yet), so the ONLY gray this method
+        # ever actually prints today is GIVEN_GRAY. Repaint a cell holding an
+        # entry and the flush for it has to be GL16; App#flush_ink says the
+        # same thing at the point where the waveform is chosen.
         gray = grid.given?(index) ? GIVEN_GRAY : ENTRY_GRAY
         draw_digit(index, grid.value_at(index), gray)
       end

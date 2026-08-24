@@ -63,8 +63,16 @@ What that device run did **not** establish, and must not be read as saying:
   No formal legibility assessment was made, but the deferral drew no visual
   complaint in the first device run, which is some evidence it was a
   reasonable call and nothing stronger.
+- **Nothing about erasing.** Erasing with the pen's eraser end landed *after*
+  that run, on 2026-08-24 (§6), and has **zero** hardware verification: every
+  assertion behind it is a host assertion, and §9 records why no automated
+  test can ever be more than that. Until someone flips the pen on the device,
+  "the eraser clears the cell" is a claim about Ruby and not about the panel.
+  The one part of it that *is* measured on hardware is the digitizer reporting
+  `BTN_TOOL_RUBBER` at all (§3).
 
-Next: Milestone 3 — the recognizer and the game proper.
+Next: Milestone 3 — the recognizer and the game proper. Erase is no longer part
+of it: the eraser end replaced §6's planned scribble gesture between M2 and M3.
 
 ---
 
@@ -538,12 +546,17 @@ sequence of injected strokes can produce an eraser event at all, and no
 screenshot assertion downstream of one can exist. Layer (1) covers the Ruby
 side completely and cheaply (an eraser sample is a pen sample with one array
 element changed: `test/app.rb`'s `eraser_sample`), and that is where every
-erase assertion in the suite lives. Everything below Ruby — that this
-digitizer really reports the tool, that the shim decodes it on the device,
-that a `DU` cell repaint reads as an erase on the panel — is **manual verify
-by flipping the pen on hardware, permanently**, unless someone patches
-rM2-stuff's `Input` message and `sendPen` to carry a tool flag. Treat any
-change to erase behaviour as unverified until that has been done by hand.
+erase assertion in the suite lives.
+
+One layer below Ruby is already settled and is *not* on the manual list: the
+digitizer's own report, which §3 records as measured from an evdev trace on
+this device. What remains manual is everything between the two — that the shim
+decodes the tool on the device as it does on the host, that an eraser press
+lands on the cell the player aimed at, and that a `DU` cell repaint reads as an
+erase rather than as a flash — and it is **manual verify by flipping the pen on
+hardware, permanently**, unless someone patches rM2-stuff's `Input` message
+and `sendPen` to carry a tool flag. Treat any change to erase behaviour as
+unverified until that has been done by hand.
 
 **Device install (`device/install.sh`)** — as built, after on-device
 discovery of 3.27.3.0 (2026-08-21):
