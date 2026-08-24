@@ -29,4 +29,32 @@ MRuby::Gem::Specification.new('mruby-redoku') do |spec|
   # declaration is the documented remedy. Do not remove it on the grounds
   # that something else supplies Time today.
   spec.add_dependency('mruby-time', core: 'mruby-time')
+
+  # This project spent two milestones treating a long list of Ruby methods
+  # (Array#uniq, Hash#fetch, format, Set, Struct, Object#send, and more) as
+  # unavailable in mruby, and was bitten four times by using one anyway: it
+  # PASSES on device and raises NoMethodError under `make test`. Reading
+  # build_config.rb shows both build targets call `conf.gembox 'default'`,
+  # and mrbgems/default.gembox pulls in stdlib, stdlib-ext, stdlib-io, math
+  # and metaprog — which is exactly where all of the methods above live. The
+  # shipped binary already links every gem below; the list was never a
+  # description of mruby's limits, it was a description of this gem's
+  # undeclared dependencies. As with mruby-time above, a gem's mrbtest state
+  # holds only what it declares, so these declarations change nothing about
+  # the device binary and exist solely to make `make test` see what already
+  # ships.
+  spec.add_dependency('mruby-array-ext',   core: 'mruby-array-ext')
+  spec.add_dependency('mruby-enum-ext',    core: 'mruby-enum-ext')
+  spec.add_dependency('mruby-hash-ext',    core: 'mruby-hash-ext')
+  spec.add_dependency('mruby-numeric-ext', core: 'mruby-numeric-ext')
+  spec.add_dependency('mruby-compar-ext',  core: 'mruby-compar-ext')
+  spec.add_dependency('mruby-sprintf',     core: 'mruby-sprintf')
+  spec.add_dependency('mruby-random',      core: 'mruby-random')
+  spec.add_dependency('mruby-catch',       core: 'mruby-catch')
+  spec.add_dependency('mruby-set',         core: 'mruby-set')
+  spec.add_dependency('mruby-struct',      core: 'mruby-struct')
+  # Object#send and #instance_variable_set are mruby-metaprog (src/metaprog.c),
+  # not core: core only defines __send__ (src/class.c), and mruby-metaprog is
+  # what the default gembox's `metaprog.gembox` pulls in for the plain names.
+  spec.add_dependency('mruby-metaprog',    core: 'mruby-metaprog')
 end

@@ -1,10 +1,8 @@
 module Redoku
-  # A seeded pseudo-random generator, because `Kernel#rand` does not exist in
-  # this gem's mrbtest state and borrowing `mruby-random` is not free:
-  # declaring a new test dependency renumbers the generated test ireps, so
-  # every contributor's incremental build stops compiling until they
-  # `make clean`. That cost was paid once already in M1's fix wave A and is
-  # not worth paying again for `rand`.
+  # A seeded pseudo-random generator, hand-rolled rather than `Kernel#rand`
+  # from `mruby-random` (mrbgem.rake now declares that gem anyway, for other
+  # methods, so borrowing it here would cost nothing dependency-wise —
+  # that is not why this class exists).
   #
   # Being seeded is a feature rather than a consolation. Generation is a
   # search, so a bug in it is a bug in one particular puzzle; a seed turns
@@ -41,12 +39,12 @@ module Redoku
     Q = 127773     # M / A
     R = 2836       # M % A
 
-    # Seeds from the wall clock, which is the only varying source available:
-    # Kernel#rand, srand and Random are all absent from this gem's mrbtest
-    # state, and RM2.monotonic_ms cannot be used because its epoch is the
-    # first call in the process (mruby-rm2's src/clock.c) — a seed default
-    # would BE that first call and would return 0 on every single launch,
-    # which is the identical-puzzle bug this method exists to prevent.
+    # Seeds from the wall clock, which is a source that changes on its own
+    # between launches. RM2.monotonic_ms cannot be used for that instead,
+    # because its epoch is the first call in the process (mruby-rm2's
+    # src/clock.c) — a seed default would BE that first call and would
+    # return 0 on every single launch, which is the identical-puzzle bug
+    # this method exists to prevent.
     #
     # `now` is a parameter so the reading can be faked in a test. It is read
     # ONCE, deliberately: two separate Time.now calls can straddle a second
