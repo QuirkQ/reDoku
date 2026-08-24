@@ -115,6 +115,49 @@ class FakeSignals
   end
 end
 
+# An Rng that records how much had already reached the panel the first time
+# the generator drew from it.
+#
+# It exists because the splash's ORDERING cannot be seen from outside. A
+# splash flushed BEFORE the dig and a splash flushed after it leave the
+# identical update list behind — same rects, same waveforms, same count — so
+# every assertion written after the fact holds either way, and the one thing
+# PLAN.md §7 needs the splash for (covering a pause of a few hundred ms on the
+# Cortex-A7) would be protected by nothing but code reading. Observing from
+# INSIDE the dig is what makes the ordering testable: the generator's first
+# draw is a moment during generation, and what has reached the panel by then
+# is exactly the question.
+#
+# Both entry points are noted, not just shuffle: shuffle is all the generator
+# and solver use today (Generator#dig_order, Solver#solve), but next_int is
+# public and a future search could draw from it directly. shuffle calls
+# next_int itself, and the nil guard is what keeps that from counting twice.
+class SpyRng < Redoku::Rng
+  attr_reader :updates_at_first_draw
+
+  def initialize(display, seed)
+    super(seed)
+    @d = display
+    @updates_at_first_draw = nil
+  end
+
+  def next_int(n)
+    note_first_draw
+    super(n)
+  end
+
+  def shuffle(list)
+    note_first_draw
+    super(list)
+  end
+
+  private
+
+  def note_first_draw
+    @updates_at_first_draw = @d.updates.size if @updates_at_first_draw.nil?
+  end
+end
+
 # A pen sample — [raw_x, raw_y, pressure, tools] — built from the screen
 # point it should land on. Both directions of the mapping round, so tests
 # assert against screen_of(sample), never the point they started from.
@@ -373,9 +416,10 @@ assert('every button acknowledges its press, at the button, for the same 200 ms'
     # The first thing out is the press, at the button, in the ink waveform.
     # This used to be Quit's alone, on the premise that New and Level
     # "repaint as their action and already read as responsive". Both halves
-    # are false on hardware: clear_ink's repaint is pixel-identical on a
-    # board with no ink, and cycle_difficulty's only visible change is a
-    # header label 1480 px from the finger that caused it.
+    # are false on hardware: New's repaint — a bare clear_ink when the device
+    # said so, new_puzzle now — is pixel-identical on a board with no ink, and
+    # cycle_difficulty's only visible change is a header label 1480 px from
+    # the finger that caused it.
     assert_equal [bx, by, bw, bh, RM2::DU, RM2::FAST_DRAW], d.updates[0],
                  name.to_s
     # Inverted means black paper under a white border and label.
@@ -396,7 +440,7 @@ assert('New and Level come back up; Quit stays down because it is leaving') do
     app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
     app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
     assert_true app.running?, name.to_s
-    # Neither action repaints the buttons — clear_ink flushes the board,
+    # Neither action repaints the buttons — new_puzzle flushes the board,
     # cycle_difficulty the header — so without a release of its own the
     # button would stay inverted for the rest of the session.
     assert_equal [bx, by, bw, bh, RM2::DU, RM2::FAST_DRAW],
@@ -651,6 +695,14 @@ assert('a tap on New clears the ink and repaints the board') do
   # cell the ink was in: gray_at replays fill_rect calls, and ink is a
   # draw_line, so it never could see the ink itself.
   #
+  # What it establishes, exactly: this pixel of the cell ends the press WHITE,
+  # so nothing the New path draws leaves a mark on it. It does not attribute
+  # that white to draw_board — draw_splash fills board_rect white first, so
+  # either fill would satisfy it — and after M2 there is no probe that could,
+  # because the two fills are the same colour over the same rect. The board
+  # repaint's own evidence is the update at updates[2] above and the glyph
+  # below.
+  #
   # The probe moved INTO THAT CELL'S MARGIN for M2, and the reason is not
   # convenience: the board repaint now also draws the puzzle, and a digit's
   # 70x98 glyph is centred in the 140 px cell, so (300, 400) — 53 px into the
@@ -665,8 +717,13 @@ assert('a tap on New clears the ink and repaints the board') do
   # the grid App now holds has a glyph inside its own cell, which draw_board's
   # grid lines cannot fake: they span the whole board, so no line rect lies
   # entirely inside one cell (see TestDisplay#glyph_in_cell?).
-  first_given = 0
-  first_given += 1 while !app.grid.given?(first_given)
+  # Bounded, not `while !given?`: an unbounded walk would spin off the end of
+  # a hypothetical zero-clue grid instead of failing an assertion.
+  first_given = nil
+  Redoku::Sudoku::Grid::CELLS.times do |i|
+    first_given = i if first_given.nil? && app.grid.given?(i)
+  end
+  assert_false first_given.nil?
   assert_true d.glyph_in_cell?(first_given)
 end
 
@@ -1145,15 +1202,34 @@ assert('a tap on Level changes the difficulty and the puzzle with it') do
   assert_false app.grid.givens_s == before_puzzle
 end
 
-assert('the splash reaches the panel before generation finishes') do
+assert('the splash reaches the panel before generation starts') do
   # The splash is the only progress indication the player gets for a pause
   # that PLAN.md §7 budgets at a few hundred ms on the Cortex-A7. If it is
-  # flushed after the puzzle is computed it is worthless.
-  app, d = test_app_with_display
+  # flushed after the puzzle has been computed it is worthless.
+  #
+  # Counting updates afterwards CANNOT catch that, which is why this test is
+  # shaped the way it is: `draw_splash; fill_board; flush_board` leaves the
+  # same two board updates behind as `draw_splash; flush_board; fill_board`,
+  # so every after-the-fact assertion passes either way. So the question is
+  # asked from inside the dig instead — see SpyRng.
+  d = TestDisplay.new
+  input = FakeInput.new
+  spy = SpyRng.new(d, GEN_SEED)
+  app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
+                        FakeWaiter.new([input]), FakeSignals.new, rng: spy)
   app.new_puzzle
-  # The first update of the sequence must land before the board repaint that
-  # carries the finished puzzle, so there is more than one, in order.
-  assert_true d.updates.size >= 2
+  # Exactly one update had reached the panel when the generator took its first
+  # draw, and that update is the splash. Nought would mean the splash flush
+  # had moved after the dig; more would mean something else is flushing in
+  # between and this test should be told about it.
+  assert_equal 1, spy.updates_at_first_draw
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[0]
+  # ...and the board carrying the finished puzzle came after it, so the splash
+  # is a cover for the pause rather than the last word on it.
+  assert_equal 2, d.updates.size
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
+  assert_false app.grid.nil?
 end
 
 assert('a new puzzle clears the ink the player had written') do
@@ -1174,8 +1250,13 @@ assert('a resume puts the puzzle back on the board it repaints') do
   # of it. Without that, the first suspend and resume of a session would wipe
   # the board the player was working on, and the GC16 would make the blank
   # result look deliberate.
-  first_given = 0
-  first_given += 1 while !app.grid.given?(first_given)
+  # Bounded, not `while !given?`: an unbounded walk would spin off the end of
+  # a hypothetical zero-clue grid instead of failing an assertion.
+  first_given = nil
+  Redoku::Sudoku::Grid::CELLS.times do |i|
+    first_given = i if first_given.nil? && app.grid.given?(i)
+  end
+  assert_false first_given.nil?
   assert_true d.glyph_in_cell?(first_given)
 end
 

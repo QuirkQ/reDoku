@@ -36,27 +36,35 @@ the press acknowledgement.
 Techniques, Rater and Generator; the renderer prints digits, whole puzzles and
 a `GENERATING...` splash; and the event loop now holds a puzzle — `run` digs
 the first one behind the opening paint, New digs a fresh one, Level digs at
-the new tier, and a suspend/resume repaints the board it was on. Green on 2437
+the new tier, and a suspend/resume repaints the board it was on. Green on 2438
 host assertions (KO 0, Crash 0, Warning 0) plus the bintest, and cross-built
 clean for armv7.
 
-**M2 is proven by host tests only. Nothing in it has been run on the
-device.** Two specific things that means:
+Witnessed on the real device 2026-08-24, not inferred: the `GENERATING...`
+splash renders and appears *during* generation as intended; New generates a
+puzzle; Level generates a puzzle; Quit works; and the buttons respond to both
+pen and finger. That discharges the button-feedback half of M1's outstanding
+hardware caveat.
 
-- **Generation timing on the Cortex-A7 is unmeasured.** The host figures are
-  easy ≈55 ms, medium ≈86 ms and hard ≈157 ms, but the spread matters more
-  than the medians: measured across 13 seeds a *hard* dig ran from 90 ms to
-  596 ms on the host alone, and the device is substantially slower. §7's "a
-  few hundred ms" budget is therefore untested at the top of the range, which
-  is exactly what the splash exists to cover.
+What that device run did **not** establish, and must not be read as saying:
+
+- **Generation timing is still unmeasured.** No timings were taken on the
+  device. What the run establishes is that the pause was *acceptable to the
+  owner in practice* — a subjective acceptance, not a measurement. The host
+  figures are easy ≈55 ms, medium ≈86 ms and hard ≈157 ms, and the spread
+  matters more than the medians: across 13 seeds a *hard* dig ran from 90 ms
+  to 596 ms on the host alone, and the Cortex-A7 is substantially slower, so
+  the worst-case pause remains an unknown number.
+- **Palm suppression under the new build is unverified.** It was not mentioned
+  in the device report, and it is the half of M1's caveat that stays open.
 - **The digits are not §8's font.** They are a 14× upscale of the built-in
-  5×7 table, so each glyph pixel is a blocky 14×14 square. §8's Spleen BDF
+  5×7 table, so each glyph pixel is a blocky 14×14 square; §8's Spleen BDF
   pipeline (`tools/fontpack.rb`) does not exist yet — deferred, not dropped.
+  No formal legibility assessment was made, but the deferral drew no visual
+  complaint in the first device run, which is some evidence it was a
+  reasonable call and nothing stronger.
 
-Also still unwitnessed on hardware from M1: the button-feedback and
-proximity-recovery build — worth checking that New and Level flash at the
-button, and that palm suppression is exactly as good as it was. Next:
-Milestone 3 — the recognizer and the game proper.
+Next: Milestone 3 — the recognizer and the game proper.
 
 ---
 
@@ -516,27 +524,38 @@ draws the empty board and echoes pen ink into cells; Quit button returns to
 xochitl. Launched via SSH.
 
 **M2 — sudoku engine.** Grid/Solver/Generator/Rater, fully host-tested.
-Board renders generated puzzles with given digits. **Passed 2026-08-24**, and
-what that rests on is host tests and nothing else: 2437 assertions green
-(KO 0, Crash 0, Warning 0) plus the bintest, and a clean armv7 cross-build
-whose ELF was checked. Witnessed in those tests, not inferred — a generated
-board is uniquely solvable and reaches the panel as given digits in
-`GIVEN_GRAY`; New deals a different puzzle and clears the player's ink with
-it; Level advances the tier, repaints the label as GL16 and digs at the new
-tier; the splash reaches the panel *before* the dig it covers; and every one
-of those presses still acknowledges itself at the button in `RM2::DU`, which
-is M1's decision and was re-checked rather than relaxed.
+Board renders generated puzzles with given digits. **Passed 2026-08-24.**
 
-Three things this milestone deliberately did NOT establish. **Nothing ran on
-the device**, so generation timing on the Cortex-A7 is unmeasured (host: easy
-≈55 ms, medium ≈86 ms, hard 90–596 ms across 13 seeds — the tail, not the
-median, is what §7's budget has to survive). **The digits are not §8's
+Witnessed by host tests: 2438 assertions green (KO 0, Crash 0, Warning 0) plus
+the bintest, and a clean armv7 cross-build whose ELF was checked. Named
+rather than summarised, because each is a specific claim — a generated board
+is uniquely solvable and reaches the panel as given digits in `GIVEN_GRAY`;
+New deals a different puzzle and clears the player's ink with it; Level
+advances the tier, repaints the label as GL16 and digs at the new tier; the
+splash flush lands *before* the generator's first draw (pinned from inside the
+dig by a spy Rng, because the finished update list is identical either way);
+and every one of those presses still acknowledges itself at the button in
+`RM2::DU`, which is M1's decision and was re-checked rather than relaxed.
+
+Witnessed on the device the same day, by the owner: the `GENERATING...` splash
+renders and appears during generation; New generates a puzzle; Level generates
+a puzzle; Quit works; buttons respond to pen *and* finger. This is what
+discharges the button-feedback half of M1's hardware caveat below.
+
+Four things this milestone deliberately did NOT establish. **Generation timing
+on the Cortex-A7 is unmeasured** — no timings were taken on the device, and
+what the run shows is that the pause was acceptable to the owner in practice,
+a subjective acceptance rather than a number (host: easy ≈55 ms, medium
+≈86 ms, hard 90–596 ms across 13 seeds — the tail, not the median, is what
+§7's budget has to survive). **Palm suppression under this build is
+unverified**: it was not part of the device report. **The digits are not §8's
 face** — a 14× upscale of the built-in 5×7 table stands in until
-`tools/fontpack.rb` exists. And the header shows the tier the player
-**asked** for, not the tier the generator achieved, which can differ; the
-achieved tier is recorded on the App (`achieved_tier`) and M3 owns whether to
-surface it. See `App#fill_board` for why the read-out follows the button
-rather than the rating.
+`tools/fontpack.rb` exists; no legibility assessment was made, though the
+deferral drew no complaint in the first device run. And the header shows the
+tier the player **asked** for, not the tier the generator achieved, which can
+differ; the achieved tier is recorded on the App (`achieved_tier`) and M3 owns
+whether to surface it. See `App#fill_board` for why the read-out follows the
+button rather than the rating.
 
 **M3 — the game.** Recognizer + templates + `--record`; entries, erase
 gesture, Check, difficulty menu, win screen, state persistence. This is the
