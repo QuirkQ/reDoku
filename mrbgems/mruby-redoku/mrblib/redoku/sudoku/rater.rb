@@ -29,7 +29,7 @@ module Redoku
     #
     # WHY THERE IS NO GUESS TERM ANY MORE. This class used to add search cost
     # for whatever the techniques could not finish, priced at GUESS points a
-    # decision. Under the no-guessing rule a board our eight rules cannot
+    # decision. Under the no-guessing rule a board our nine rules cannot
     # finish is a REJECT -- `measure` answers tier: nil -- rather than a hard
     # puzzle, so there is nothing left for that term to price. Solver.cost
     # survives as a diagnostic with tests of its own; it is simply not called
@@ -89,7 +89,8 @@ module Redoku
         hidden_pair: 70,
         naked_triple: 80,
         hidden_triple: 100,
-        x_wing: 140
+        x_wing: 140,
+        xy_wing: 160
       }.freeze
 
       # A technique that fired but has no weight scores as the hardest known
@@ -99,7 +100,11 @@ module Redoku
       # deliberately not zero either -- a rule added to Techniques::ORDER and
       # forgotten here would otherwise be silently free, and no test would
       # catch a difficulty that quietly stopped counting.
-      UNKNOWN_WEIGHT = 140
+      #
+      # It tracks the dearest weight in the table, so it rose from 140 to 160
+      # when xy_wing arrived. A test pins that relationship rather than the
+      # number, because "the hardest known rule" is the property that matters.
+      UNKNOWN_WEIGHT = 160
 
       # The novelty premium: a technique costs full price the first time and
       # less per repeat, expressed as a fraction. Sudoku Of The Day is the one
@@ -147,7 +152,7 @@ module Redoku
       #
       # BUT NOTE WHAT IS ALSO TRUE, because demand_of's early break leans on
       # it: each of these four sets happens to be a CONTIGUOUS PREFIX of ORDER
-      # taken as a set -- ORDER[0..1], [0..2], [0..6], [0..7]. The level
+      # taken as a set -- ORDER[0..1], [0..2], [0..6], [0..8]. The level
       # boundaries fall either side of the naked_triple / hidden_pair swap, not
       # through it. That is what licenses breaking out of the downward walk
       # (see demand_of), and it is an accident of where the boundaries landed,
@@ -164,6 +169,24 @@ module Redoku
       # units and is the only rule in our repertoire that adds a genuinely
       # different kind of inference.
       #
+      # THE X-WING AND THE XY-WING SHARE THE TOP SET, which is a deliberate
+      # widening rather than an oversight, and it is why there is no sixth
+      # rung. With x_wing alone the top set was reachable on about 2% of dig
+      # chains: MASTER cost 6961 ms at the median on the host, hit 80% of
+      # requests at its 150-attempt cap, and each miss burned 17-21 s. The
+      # owner's requirement is that the top rung need an ADVANCED technique,
+      # not that it need one SPECIFIC advanced technique, so the set says "an
+      # X-wing or an XY-wing" and the rarity problem goes away. The other side
+      # of the same win: 22% of chain floors used to be rejects our rules
+      # could not finish at all, and the XY-wing converts part of that pool
+      # into certifiable top-tier boards instead of discarding it.
+      #
+      # The demand's NAME is still :xwing, which is now a slight misnomer --
+      # it means "the two-unit-and-beyond rules". Left alone deliberately: the
+      # name is internal (TIERS supplies every label a player sees) and
+      # renaming it would churn DEMAND_RANGE, DEMAND_EDGES and four tests for
+      # no behaviour.
+      #
       # The strongest set is Techniques::ORDER, SPELLED OUT rather than
       # referenced: mrblib loads in sorted-path order, so rater.rb loads
       # BEFORE techniques.rb and naming Techniques::ORDER here would raise
@@ -177,7 +200,7 @@ module Redoku
         [:naked_single, :hidden_single, :pointing, :naked_pair, :hidden_pair,
          :naked_triple, :hidden_triple].freeze,
         [:naked_single, :hidden_single, :pointing, :naked_pair, :hidden_pair,
-         :naked_triple, :hidden_triple, :x_wing].freeze
+         :naked_triple, :hidden_triple, :x_wing, :xy_wing].freeze
       ].freeze
 
       # The name of each set, in the same order.
@@ -239,7 +262,7 @@ module Redoku
       #   score    the weighted technique sum, or nil for a reject
       #   counts   how many times each technique was needed
       #   hardest  the hardest single technique that fired, or nil
-      #   solved   whether the eight rules finished it
+      #   solved   whether the nine rules finished it
       #
       # tier: nil means REJECT: our rules cannot finish this board, so it is
       # not a puzzle we may ship under the no-guessing rule. CALLERS MUST
@@ -361,9 +384,9 @@ module Redoku
       # needs no property of ORDER at all.
       #
       # (A confluence argument would give the same conclusion for ANY nested
-      # sets -- these eight rules are all sound and monotone, so their closure
+      # sets -- these nine rules are all sound and monotone, so their closure
       # should not depend on the order they are tried in. That is a stronger
-      # claim about how eight rules interact and nothing in this repository has
+      # claim about how nine rules interact and nothing in this repository has
       # measured it, so it is not what the code leans on.)
       #
       # Measured cost over 500 chains: 1 solve per board at p50, mean 7 per

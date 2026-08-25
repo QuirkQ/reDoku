@@ -2,14 +2,14 @@ module Redoku
   module Sudoku
     # A solver that only does what a person would do, and exists for one
     # purpose: rating. It never guesses and never searches, so when it stalls
-    # the puzzle needs more than the eight rules below — and that stall is
+    # the puzzle needs more than the nine rules below — and that stall is
     # exactly what makes a puzzle "hard" (see Rater).
     #
     # THE SHAPE, and it is the part worth understanding before editing:
     #
-    # Two of the eight rules WRITE a digit (the singles). The other six only
-    # ELIMINATE candidates (pointing/box-line, the two pairs, the two triples
-    # and the X-wing). That difference drives everything:
+    # Two of the nine rules WRITE a digit (the singles). The other seven only
+    # ELIMINATE candidates (pointing/box-line, the two pairs, the two triples,
+    # the X-wing and the XY-wing). That difference drives everything:
     #
     #   - Candidates live in a `cand` array of 81 masks and are maintained
     #     INCREMENTALLY: writing a digit clears that cell's mask and strips
@@ -63,8 +63,16 @@ module Redoku
       # mirror image and splitting the pairs apart makes both harder to read.
       # What that costs: a board where either rule would do gets credited the
       # naked triple, so it rates one notch easier than HoDoKu would call it.
+      #
+      # XY-WING GOES LAST, which both graders agree with: HoDoKu 160 against
+      # X-wing's 140, Sudoku Explainer 4.2 against 3.2. It is the only rule
+      # here that CHAINS -- two deductions linked through a third cell rather
+      # than one pattern inside one or two units -- and last is also where it
+      # has to be for Rater's demand ladder to stay sound, since every
+      # DEMAND_SET must remain a contiguous prefix of this list.
       ORDER = [:naked_single, :hidden_single, :pointing, :naked_pair,
-               :naked_triple, :hidden_pair, :hidden_triple, :x_wing].freeze
+               :naked_triple, :hidden_pair, :hidden_triple, :x_wing,
+               :xy_wing].freeze
 
       # A bit per rule, in ORDER's positions. This is how a caller asks for a
       # solve with a RESTRICTED repertoire, which is what Rater's demand
@@ -133,8 +141,8 @@ module Redoku
       # SPEED: this loop is the hot path of the whole engine -- Rater.measure
       # calls it once per board, the generator measures up to 16 boards per
       # chain walk plus a ~27-board floor neighbourhood, and :master runs 150
-      # of those. Eight guarded ifs cost one bitwise AND per rule per pass;
-      # eight `send`s cost eight symbol dispatches per pass.
+      # of those. Nine guarded ifs cost one bitwise AND per rule per pass;
+      # nine `send`s cost nine symbol dispatches per pass.
       def self.solve(values, rules = ALL_RULES)
         work = values.dup
         cand = candidate_grid(work)
@@ -150,6 +158,7 @@ module Redoku
         do_hidden_pair   = (rules & RULE_BIT[:hidden_pair]) != 0
         do_hidden_triple = (rules & RULE_BIT[:hidden_triple]) != 0
         do_x_wing        = (rules & RULE_BIT[:x_wing]) != 0
+        do_xy_wing       = (rules & RULE_BIT[:xy_wing]) != 0
 
         while passes < MAX_PASSES
           passes += 1
@@ -207,6 +216,11 @@ module Redoku
           if do_x_wing && x_wing(cand)
             hardest = harder(hardest, :x_wing)
             tally(counts, :x_wing)
+            next
+          end
+          if do_xy_wing && xy_wing(cand)
+            hardest = harder(hardest, :xy_wing)
+            tally(counts, :xy_wing)
             next
           end
 
@@ -665,6 +679,112 @@ module Redoku
       # its row when we are scanning columns.
       def self.cross_of(i, by_row)
         by_row ? Grid.col_of(i) : Grid.row_of(i)
+      end
+
+      # THE ONLY CHAINING RULE HERE, and the only one whose three cells need
+      # share no unit at all.
+      #
+      # A PIVOT with exactly two candidates {A,B}, and two PINCERS that are
+      # both peers of the pivot and both have exactly two candidates: one is
+      # {A,C}, the other {B,C}. Whichever digit the pivot turns out to be, it
+      # forces one of the pincers to C -- pivot = A rules the A out of {A,C},
+      # pivot = B rules the B out of {B,C} -- so AT LEAST ONE PINCER IS C. No
+      # cell that sees BOTH pincers can therefore be C.
+      #
+      # Three parts of that are easy to get wrong, and each has a test:
+      #
+      #   - the pincers must take DIFFERENT digits from the pivot. Two pincers
+      #     both sharing A leave the B case forcing nothing, and the deduction
+      #     evaporates.
+      #   - both pincers must SEE the pivot. A bi-value cell elsewhere on the
+      #     board with the right digits is not a pincer; the pivot has no hold
+      #     over it.
+      #   - the victim must see BOTH pincers. Seeing one says nothing, since
+      #     it is the other one that may be the C.
+      #
+      # C cannot equal A or B by construction (it is what is left of a pincer
+      # after the pivot's bits are taken away), so the pivot itself never holds
+      # C and needs no exclusion. Neither pincer is its own peer, so they are
+      # not victims of themselves either. The pincers need not see each other.
+      #
+      # WHY THE SEARCH IS SHAPED THIS WAY, because the obvious version is
+      # O(cells x peers x peers) with an `include?` inside it and this is the
+      # hot path of the whole engine. The pivot's own PEERS list IS the
+      # candidate pincer list, so walking it costs 20 iterations instead of 81
+      # plus a peer test each -- and it makes "both pincers see the pivot" a
+      # property of the loop rather than a condition to check. Only cells with
+      # exactly two candidates open the inner loop at all, and mid-solve those
+      # are scarce. What is left is a Grid::BIT_COUNT lookup and three bitwise
+      # ops per peer, with no allocation anywhere in the scan.
+      def self.xy_wing(cand)
+        i = 0
+        while i < Grid::CELLS
+          pivot = cand[i]
+          if Grid.count_bits(pivot) == 2
+            peers = Grid::PEERS[i]
+            n = peers.size
+            na = 0
+            while na < n
+              a = peers[na]
+              am = cand[a]
+              # Two candidates, exactly one of them the pivot's: two 2-bit
+              # masks union to 3 bits precisely when they overlap in one.
+              #
+              # The union test is a PERFORMANCE GUARD, not the correctness
+              # one, and it is worth saying so because mutation testing
+              # removed it and no assertion moved. It keeps `ac` and `ashare`
+              # single bits, which is what makes the comments below true, but
+              # the inner condition already refuses every peer it excludes: a
+              # peer sharing NOTHING with the pivot has a two-bit `ac`, so a
+              # matching `b` would need three bits; a peer equal to the pivot
+              # has `ac` zero and `ashare` the whole pivot, so the only
+              # matching `b` is the pivot itself and the `!=` refuses it. What
+              # the guard buys is not opening the inner loop at all.
+              if Grid.count_bits(am) == 2 && Grid.count_bits(am | pivot) == 3
+                ac = am & ~pivot     # this pincer's C, one bit
+                ashare = am & pivot  # the pivot digit it takes, one bit
+                nb = na + 1
+                while nb < n
+                  b = peers[nb]
+                  bm = cand[b]
+                  # Same C, and the OTHER pivot digit. Those two conditions
+                  # plus a count of two are the whole pattern: bm is then
+                  # ac | (bm & pivot), and bm & pivot cannot be zero (that
+                  # would leave one bit) nor both pivot bits (that would leave
+                  # three), so it is exactly the pivot digit `a` did not take.
+                  if Grid.count_bits(bm) == 2 && (bm & ~pivot) == ac &&
+                     (bm & pivot) != ashare
+                    return true if strip_seen_by_both(cand, a, b, ac)
+                  end
+                  nb += 1
+                end
+              end
+              na += 1
+            end
+          end
+          i += 1
+        end
+        false
+      end
+
+      # Clear `bit` from every cell that is a peer of BOTH `a` and `b`. True
+      # only if a mask actually changed.
+      #
+      # Every such cell is cleared before answering, so one call finishes the
+      # pattern rather than leaving the rest for the next pass to rediscover --
+      # x_wing_lines does the same thing for its two cross-lines. The cheap
+      # bit test comes first so the `include?` only runs on the handful of
+      # cells that could actually be victims.
+      def self.strip_seen_by_both(cand, a, b, bit)
+        changed = false
+        other = Grid::PEERS[b]
+        Grid::PEERS[a].each do |i|
+          next if (cand[i] & bit) == 0
+          next unless other.include?(i)
+          cand[i] &= ~bit
+          changed = true
+        end
+        changed
       end
 
       # Clear `digit` from every cell of `unit` that is not one of `keep`.

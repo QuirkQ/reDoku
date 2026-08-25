@@ -762,7 +762,7 @@ module Redoku
     def fill_board
       puzzle = @generator.generate(@difficulty, @rng)
       # Guarded, and the nil it guards for now really happens. `generate`
-      # answers nil when no attempt found a single board our eight rules can
+      # answers nil when no attempt found a single board our nine rules can
       # finish — under the no-guessing rule such a board is a REJECT rather
       # than a hard puzzle, so there is nothing to hand back. This guard was
       # written one commit ahead of that change, against the invariant the

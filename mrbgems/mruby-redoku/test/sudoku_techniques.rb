@@ -90,8 +90,8 @@ assert('pointing does not fire when the box homes straddle two lines') do
   assert_equal(b5 | (1 << 6), cand[3])
 end
 
-# --- The triples and the X-wing get THREE assertions each, and the third is
-# the one that earns its keep:
+# --- The triples, the X-wing and the XY-wing get at least THREE assertions
+# each, and the third is the one that earns its keep:
 #
 #   1. it fires, eliminates exactly the right bits, and leaves the pattern's
 #      own cells alone;
@@ -102,6 +102,10 @@ end
 #      rule fires on. Each near-miss below names the specific wrong rule it
 #      rules out, because "returns false on something" is not evidence of
 #      anything by itself.
+#
+# The XY-wing gets a fourth: it has two independent ways to be wrong (a pincer
+# that does not see the pivot, and two pincers taking the same pivot digit),
+# and one near-miss board cannot exhibit both.
 
 assert('naked_triple strips a three-cell triple from the rest of its unit') do
   t = Redoku::Sudoku::Techniques
@@ -315,6 +319,124 @@ assert('x_wing needs BOTH columns to match, not just one') do
   assert_equal(before, cand)
 end
 
+assert('xy_wing clears the shared digit from every cell that sees both pincers') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # The pivot at r0c0 offers {1,2}. Its two pincers each share ONE of those
+  # with it and both offer a 3: r0c4 is {1,3} (row peer), r4c0 is {2,3}
+  # (column peer). Whichever way the pivot falls, one pincer is forced to the
+  # 3 -- pivot 1 forces r0c4, pivot 2 forces r4c0 -- so no cell that sees BOTH
+  # pincers can be a 3.
+  #
+  # Note the pincers do NOT see each other (r0c4 and r4c0 share no unit), and
+  # that is not an oversight: the rule never needs them to.
+  cand[0]  = (1 << 1) | (1 << 2)   # r0c0, the pivot
+  cand[4]  = (1 << 1) | (1 << 3)   # r0c4, pincer taking the 1
+  cand[36] = (1 << 2) | (1 << 3)   # r4c0, pincer taking the 2
+  # The ONLY cell that sees both pincers: r4c4 is on r0c4's column and on
+  # r4c0's row. It loses the 3.
+  cand[40] = (1 << 3) | (1 << 5)
+  # Two cells that see exactly ONE pincer each. They keep their 3s -- "sees
+  # both" is the whole claim, and a rule that strips the peers of either
+  # pincer alone takes these too.
+  cand[13] = (1 << 3) | (1 << 6)   # r1c4, sees r0c4 only
+  cand[45] = (1 << 3) | (1 << 7)   # r5c0, sees r4c0 only
+
+  assert_true t.xy_wing(cand)
+  assert_equal((1 << 5), cand[40])
+  assert_equal((1 << 3) | (1 << 6), cand[13])
+  assert_equal((1 << 3) | (1 << 7), cand[45])
+  # The pattern's own three cells are untouched. The pivot cannot hold the 3
+  # in the first place -- C differs from both of the pivot's digits by
+  # construction -- and neither pincer sees itself.
+  assert_equal((1 << 1) | (1 << 2), cand[0])
+  assert_equal((1 << 1) | (1 << 3), cand[4])
+  assert_equal((1 << 2) | (1 << 3), cand[36])
+
+  # Nothing left to do the second time. Same termination argument as every
+  # other eliminator: claiming progress it did not make is what makes `solve`
+  # spin to MAX_PASSES.
+  assert_false t.xy_wing(cand)
+end
+
+assert('xy_wing does not fire when nothing seeing both pincers holds the digit') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # A genuine XY-wing with no victim: r4c4 is still the only cell seeing both
+  # pincers, and it offers no 3.
+  cand[0]  = (1 << 1) | (1 << 2)
+  cand[4]  = (1 << 1) | (1 << 3)
+  cand[36] = (1 << 2) | (1 << 3)
+  cand[40] = (1 << 5) | (1 << 6)
+  cand[13] = (1 << 3) | (1 << 6)
+  cand[45] = (1 << 3) | (1 << 7)
+  before = cand.dup
+
+  assert_false t.xy_wing(cand)
+  assert_equal(before, cand)
+end
+
+assert('xy_wing needs the pincers to take DIFFERENT digits from the pivot') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # Both pincers are {1,3}, so both share the SAME pivot digit. Then pivot 2
+  # forces neither of them and the 3 is not pinned anywhere: nothing may be
+  # eliminated. A version that only checks "two bi-value peers of the pivot
+  # sharing one candidate with it and one with each other" fires here and
+  # strips the 3 from r4c4.
+  cand[0]  = (1 << 1) | (1 << 2)   # pivot {1,2}
+  cand[4]  = (1 << 1) | (1 << 3)   # shares the 1
+  cand[36] = (1 << 1) | (1 << 3)   # shares the 1 as well -- not a wing
+  cand[40] = (1 << 3) | (1 << 5)   # what the wrong rule would strip
+  before = cand.dup
+
+  assert_false t.xy_wing(cand)
+  assert_equal(before, cand)
+end
+
+assert('xy_wing needs both pincers to SEE the pivot') do
+  t = Redoku::Sudoku::Techniques
+  cand = Array.new(81, 0)
+  # r0c4 is {1,3} and r8c8 is {2,3}: between them they look exactly like a
+  # wing around the {1,2} at r0c0 -- except r8c8 shares no unit with it, so
+  # the pivot cannot force it and the deduction does not exist. A version
+  # that scans every bi-value cell instead of walking the pivot's PEERS fires
+  # here and strips the 3 from r0c8, which sees both.
+  cand[0]  = (1 << 1) | (1 << 2)
+  cand[4]  = (1 << 1) | (1 << 3)
+  cand[80] = (1 << 2) | (1 << 3)   # r8c8: no row, column or box with r0c0
+  cand[8]  = (1 << 3) | (1 << 6)   # r0c8, what the wrong rule would strip
+  before = cand.dup
+
+  assert_false t.xy_wing(cand)
+  assert_equal(before, cand)
+end
+
+assert('a real board that needs the XY-wing is finished only with it') do
+  t = Redoku::Sudoku::Techniques
+  # The candidate-grid tests above prove the RULE. This proves it is REACHABLE
+  # through `solve` on a board a player could be handed, and that the board
+  # genuinely turns on it: hand `solve` every rule except this one and it
+  # stalls. Without that second assertion the first proves only that the
+  # repertoire finishes the board, which pointing might have done.
+  board = values_of(XY_WING_81)
+  without = []
+  t::ORDER.each { |name| without << name unless name == :xy_wing }
+  assert_false t.solves?(board, without)
+  assert_true t.solves?(board, t::ORDER)
+
+  # And the rule really is what fired -- once, on top of singles alone. This
+  # board needs no pointing, no pair and no X-wing, so nothing else can be
+  # credited with the work.
+  result = t.solve(board)
+  assert_true result[:solved]
+  assert_equal(:xy_wing, result[:hardest])
+  assert_equal(1, result[:counts][:xy_wing])
+  assert_false result[:counts].has_key?(:pointing)
+  assert_false result[:counts].has_key?(:naked_pair)
+  assert_false result[:counts].has_key?(:x_wing)
+end
+
 assert('Techniques.solve finishes a singles-only board and says so') do
   t = Redoku::Sudoku::Techniques
   g = Redoku::Sudoku::Grid
@@ -356,6 +478,7 @@ assert('Techniques.solve counts how often each rule was needed') do
   assert_false result[:counts].has_key?(:hidden_pair)
   assert_false result[:counts].has_key?(:hidden_triple)
   assert_false result[:counts].has_key?(:x_wing)
+  assert_false result[:counts].has_key?(:xy_wing)
 
   # Six holes, same accounting.
   six = t.solve(values_of(UNIQUE_81))
@@ -480,7 +603,8 @@ end
 assert('Techniques rank orders the rules cheapest first') do
   t = Redoku::Sudoku::Techniques
   assert_equal([:naked_single, :hidden_single, :pointing, :naked_pair,
-                :naked_triple, :hidden_pair, :hidden_triple, :x_wing],
+                :naked_triple, :hidden_pair, :hidden_triple, :x_wing,
+                :xy_wing],
                t::ORDER)
   # nil is cheaper than every real technique, so "nothing needed yet" never
   # beats a rule that was actually used.
@@ -497,6 +621,10 @@ assert('Techniques rank orders the rules cheapest first') do
   assert_true t.rank(:naked_triple) > t.rank(:naked_pair)
   assert_true t.rank(:hidden_triple) > t.rank(:hidden_pair)
   assert_true t.rank(:x_wing) > t.rank(:hidden_triple)
+  # And the XY-wing is dearer still: it is the only rule here that chains two
+  # deductions through a third cell, and both published graders rank it above
+  # the X-wing (HoDoKu 160 against 140, Sudoku Explainer 4.2 against 3.2).
+  assert_true t.rank(:xy_wing) > t.rank(:x_wing)
   # harder picks the more expensive of two, in either argument order.
   assert_equal(:x_wing, t.harder(:naked_single, :x_wing))
   assert_equal(:x_wing, t.harder(:x_wing, :naked_single))
@@ -647,7 +775,7 @@ assert('Techniques.solves? answers for a set of rules, not for all of them') do
   assert_true t.solves?(values_of(EASY_81), singles)
   # A finished board needs no rule at all, so even the empty set "solves" it.
   assert_true t.solves?(solved_values, [])
-  # MULTI_81 has three givens: nothing our eight rules know can force a cell.
+  # MULTI_81 has three givens: nothing our nine rules know can force a cell.
   assert_false t.solves?(values_of(MULTI_81), t::ORDER)
   assert_false t.solves?(values_of(MULTI_81), singles)
 

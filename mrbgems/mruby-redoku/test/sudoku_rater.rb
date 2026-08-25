@@ -42,9 +42,24 @@ assert('Rater weights rank locked candidates below the pairs') do
   # And the singles are cheaper than every eliminator.
   assert_true r::WEIGHT[:naked_single] < r::WEIGHT[:pointing]
   assert_true r::WEIGHT[:hidden_single] < r::WEIGHT[:pointing]
-  # X-wing is the dearest rule we implement.
+  # The XY-wing is the dearest rule we implement and the X-wing the next
+  # dearest -- the two that reason beyond a single unit, in the order both
+  # published graders put them (HoDoKu 140 then 160, Sudoku Explainer 3.2 then
+  # 4.2). The loop is what actually pins "dearest"; naming the runner-up as
+  # well is what stops a new rule being slotted in above X-wing unnoticed.
   r::WEIGHT.each_key do |name|
+    assert_true r::WEIGHT[name] <= r::WEIGHT[:xy_wing]
+  end
+  assert_true r::WEIGHT[:x_wing] < r::WEIGHT[:xy_wing]
+  r::WEIGHT.each_key do |name|
+    next if name == :xy_wing
     assert_true r::WEIGHT[name] <= r::WEIGHT[:x_wing]
+  end
+  # An unweighted rule must still be charged as the dearest KNOWN one, which
+  # is a claim about this table rather than about whatever number
+  # UNKNOWN_WEIGHT happens to hold today.
+  r::WEIGHT.each_key do |name|
+    assert_true r::WEIGHT[name] <= r::UNKNOWN_WEIGHT
   end
 end
 
@@ -147,6 +162,15 @@ assert('Rater demand sets are nested and cover exactly ORDER') do
   assert_equal(r::RULE_LEVEL[:naked_pair], r::RULE_LEVEL[:naked_triple])
   assert_equal(r::RULE_LEVEL[:naked_pair], r::RULE_LEVEL[:hidden_triple])
   assert_true r::RULE_LEVEL[:x_wing] > r::RULE_LEVEL[:hidden_triple]
+  # THE XY-WING SHARES THE X-WING'S RUNG rather than adding a sixth. That is
+  # the whole reason it was added: the top rung asked for an X-wing and
+  # X-wing-requiring boards turned up on about 2% of dig chains, so MASTER was
+  # a 1-in-50 lottery costing 6961 ms at the median. Widening the top set to
+  # "an X-wing OR an XY-wing" fixes availability without moving any boundary,
+  # and it keeps the ladder at five rungs -- which is what TIERS, DEMAND_RANGE
+  # and the header layout are all sized for.
+  assert_equal(r::RULE_LEVEL[:x_wing], r::RULE_LEVEL[:xy_wing])
+  assert_equal(r::DEMANDS.size - 1, r::RULE_LEVEL[:xy_wing])
 end
 
 assert('every demand set is a contiguous prefix of ORDER, which is what makes demand_of sound') do
@@ -186,6 +210,13 @@ assert('every demand set is a contiguous prefix of ORDER, which is what makes de
       assert_equal(i < n, set.include?(t::ORDER[i]))
       i += 1
     end
+    # The same property in the form the solver actually consumes, because
+    # mask_of is what demand_of hands to Techniques.solve: RULE_BIT gives rule
+    # k of ORDER the bit 1 << k, so a prefix of length n is the mask with its
+    # bottom n bits set and nothing above them. Today: 3, 7, 127, 511. A
+    # mask with a hole in it is a set that is not a prefix, and the downward
+    # break in demand_of stops being sound.
+    assert_equal((1 << n) - 1, t.mask_of(set))
   end
 end
 
@@ -278,7 +309,7 @@ assert('Rater.measure answers tier nil for a board our rules cannot finish') do
   r = Redoku::Sudoku::Rater
   # A CONTRACT CHANGE, and the reason every caller has to be read: today's
   # measure always named a tier, flooring a stall at :medium and letting guess
-  # points push it up. Under the no-guessing rule a board the eight rules
+  # points push it up. Under the no-guessing rule a board the nine rules
   # cannot finish is a REJECT -- not a hard puzzle, not a puzzle at all -- and
   # nil is how it says so. 199 of 4852 chain boards (4%) are rejects, and
   # because they crowd the chain floor, 109 of 500 chain FLOORS (22%) are.
@@ -368,6 +399,17 @@ assert('Rater classifies real boards by the weakest rule set that finishes them'
   assert_true t.solves?(xwing, r::DEMAND_SETS[3])
   assert_equal(:xwing, r.measure(xwing)[:demand])
   assert_equal(:master, r.measure(xwing)[:tier])
+
+  # The second board on the top rung, and the reason the rung is reachable:
+  # this one needs the XY-WING, not the X-wing. Both land on :master, which is
+  # the point -- widening the top SET rather than adding a sixth rung is what
+  # keeps the ladder five rungs long. Measured over 300 chains, this took the
+  # share of chains that can serve MASTER from 2 to 40.
+  xy = values_of(XY_WING_81)
+  assert_false t.solves?(xy, r::DEMAND_SETS[2])
+  assert_true t.solves?(xy, r::DEMAND_SETS[3])
+  assert_equal(:xwing, r.measure(xy)[:demand])
+  assert_equal(:master, r.measure(xy)[:tier])
 
   # And the ceiling really is a ceiling: however long these boards are, none
   # of them can be promoted past its class, and no singles-only board can

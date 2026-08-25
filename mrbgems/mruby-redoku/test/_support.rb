@@ -293,6 +293,29 @@ PAIR_81 =
   '..9.6...2' \
   '....12.5.'
 
+# Needs an XY-WING, and needs nothing else above a single: the full
+# repertoire MINUS xy_wing stalls on it, and the technique log is
+# {naked_single: 39, hidden_single: 13, xy_wing: 1}. One chained deduction is
+# the entire difference between a reject and a top-rung puzzle, which is why
+# this board is the fixture rather than a busier one -- five of the six
+# candidates vetted also needed pointing, pairs or an X-wing, and none of them
+# could show the rule doing the work on its own.
+#
+# It is a REJECT board rescued: before xy_wing, no set in our repertoire
+# finished it, so the generator discarded it. Provenance: the hardest
+# one-group rescue of seed 2020's chain floor, from the 300-chain
+# old-versus-new sweep (seeds 2000-2299). 29 clues, score 391.
+XY_WING_81 =
+  '.61...5.3' \
+  '....59.81' \
+  '..5..47..' \
+  '..32.7...' \
+  '....9....' \
+  '...5.61..' \
+  '..96..2..' \
+  '31.87....' \
+  '6.7...81.'
+
 # Needs an X-wing: every weaker set stalls on it. seed=107, 27 clues,
 # score 559.
 XWING_81 =
