@@ -862,7 +862,7 @@ module Redoku
       when :quit then quit
       when :back then acknowledge(:back) { close_menu }
       when :del then toggle_delete_mode
-      when :save then acknowledge(:save) { save_manual_copy }
+      when :save then acknowledge(:save, restore: false) { save_manual_copy }
       when :prev then acknowledge(:prev) { turn_page(-1) }
       when :next then acknowledge(:next) { turn_page(1) }
       else
@@ -978,13 +978,18 @@ module Redoku
     end
 
     # The SAVE action inside the menu: writes a manual copy of whatever is
-    # on the board. Refusals are the store's to report (no board, invalid
-    # record, cap of MANUAL_CAP reached) and are logged there; this side
-    # stays quiet about a nil answer because the reason is already on
-    # stderr. The autosave row keeps its own life regardless — a manual
-    # copy is a bookmark, not a replacement for the crash-safe singleton.
+    # on the board, then repaints the list — the new row IS the press's
+    # visible result, and a menu that stays stale after a save reads (and
+    # tested) as a button that did nothing. Refusals are the store's to
+    # report (no board, invalid record, cap of MANUAL_CAP reached) and are
+    # logged there; this side stays quiet about a nil answer because the
+    # reason is already on stderr, but it still repaints: restore: false in
+    # press_in_menu means this method owns putting the glass right on every
+    # path out of here, refusal included. The autosave row keeps its own
+    # life regardless — a manual copy is a bookmark, not a replacement for
+    # the crash-safe singleton.
     def save_manual_copy
-      return self unless @store
+      return refresh_menu unless @store
       id = @store.save_manual(@grid ? current_game_record : nil)
       if id && @current_save_id
         # The bookmark takes the ink with it, so loading it later restores
@@ -993,10 +998,11 @@ module Redoku
         @store.copy_strokes(@current_save_id, id)
       end
       log_line('saved manual copy ' + id.to_s) if id
+      refresh_menu
       self
     rescue StandardError => e
       log_line('manual save failed (' + e.message + ')')
-      self
+      refresh_menu
     end
 
     def page_count(size)

@@ -2177,6 +2177,42 @@ assert('SAVE writes a manual copy of the current game') do
   remove_app_db(path)
 end
 
+# True when any dark pixel sits inside a menu row's rect: the row is showing
+# text, not the blank white the empty list leaves behind.
+def menu_row_inked?(d, rect)
+  x, y, w, h = rect
+  py = y
+  while py < y + h
+    px = x
+    while px < x + w
+      g = d.gray_at(px, py)
+      return true if g && g < 128
+      px += 6
+    end
+    py += 3
+  end
+  false
+end
+
+assert('SAVE repaints the list so the new copy appears on the glass') do
+  path = games_store_db('save-refresh')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, d, = new_app(store: store)
+  app.new_puzzle
+
+  tap_button(app, :games)
+  second_row = Redoku::Layout.menu_row_rect(1)  # only the autosave exists yet
+  assert_equal false, menu_row_inked?(d, second_row)
+
+  tap_menu_action(app, :save)   # writes the manual copy AND must repaint
+
+  assert_equal :menu, app.screen
+  assert_equal true, menu_row_inked?(d, second_row)
+  store.close
+  remove_app_db(path)
+end
+
 # Plants `n` manual rows with DISTINCT pinned timestamps, so Store#games'
 # updated_at DESC order — and therefore which record sits at each list
 # position — is deterministic. Written raw rather than through save_manual,
