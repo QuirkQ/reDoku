@@ -448,3 +448,79 @@ assert('SPLASH_SCALE matches the header scale and fits the board') do
   # over a splash-sizing question it has nothing to do with.
   assert_true sw < bw
 end
+
+assert('the progress bar sits inside the splash, under its text') do
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  x, y, w, h = Redoku::Renderer.progress_rect
+  # Wholly inside board_rect, which is what lets draw_board's white fill erase
+  # it and flush_board cover it -- no second flush region, and no bar left
+  # behind on the finished puzzle.
+  assert_true x >= bx
+  assert_true y >= by
+  assert_true x + w <= bx + bw
+  assert_true y + h <= by + bh
+  # Below the splash text's box, not over it.
+  text_bottom = by + (bh - Redoku::Font::HEIGHT *
+                      Redoku::Renderer::SPLASH_SCALE) / 2 +
+                Redoku::Font::HEIGHT * Redoku::Renderer::SPLASH_SCALE
+  assert_true y >= text_bottom
+  # Centred horizontally on the board, like the text above it.
+  assert_equal(bx + bw - (x + w), x - bx)
+end
+
+assert('Renderer.progress_fill scales a fraction to pixels, monotonically') do
+  r = Redoku::Renderer
+  inner = r::PROGRESS_W - 2 * r::PROGRESS_BORDER
+  assert_equal(0, r.progress_fill(0, 10))
+  assert_equal(inner, r.progress_fill(10, 10))
+  assert_equal(inner / 2, r.progress_fill(5, 10))
+  # Integer arithmetic throughout: mrb_int is 32-bit on the device, and a bar
+  # is pixels, so there is nothing a Float would add but a rounding rule to
+  # get wrong.
+  assert_true r.progress_fill(1, 3) < r.progress_fill(2, 3)
+  # Degenerate inputs answer a drawable number rather than raising: this is
+  # called from inside a search, where a crash costs the player their puzzle.
+  assert_equal(0, r.progress_fill(0, 0))
+  assert_equal(0, r.progress_fill(-1, 10))
+  assert_equal(inner, r.progress_fill(11, 10))
+end
+
+assert('Renderer draws an outlined bar filled to the fraction it was given') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  x, y, w, h = Redoku::Renderer.progress_rect
+  b = Redoku::Renderer::PROGRESS_BORDER
+
+  r.draw_progress(0, 4)
+  # The frame is there even at zero, so an empty bar is visible as a bar
+  # rather than as nothing at all.
+  assert_equal(Redoku::Renderer::BLACK, d.gray_at(x + w / 2, y + 1))
+  assert_equal(Redoku::Renderer::BLACK, d.gray_at(x + 1, y + h / 2))
+  # ...and nothing is filled inside it.
+  assert_equal(Redoku::Renderer::WHITE, d.gray_at(x + b + 1, y + h / 2))
+
+  d.clear_calls
+  r.draw_progress(2, 4)
+  fill = Redoku::Renderer.progress_fill(2, 4)
+  # Filled from the left edge of the interior, up to `fill` and no further.
+  assert_equal(Redoku::Renderer::BLACK, d.gray_at(x + b + 1, y + h / 2))
+  assert_equal(Redoku::Renderer::BLACK, d.gray_at(x + b + fill - 1, y + h / 2))
+  assert_equal(Redoku::Renderer::WHITE, d.gray_at(x + b + fill + 1, y + h / 2))
+  # Every rect it drew is inside the bar: a bar that painted over the splash
+  # text would need a wider flush than flush_progress does.
+  assert_true d.painted_within?(x, y, w, h)
+end
+
+assert('the progress bar flushes as ink, not as chrome') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  r.draw_progress(1, 4)
+  r.flush_progress
+  x, y, w, h = Redoku::Renderer.progress_rect
+  # DU + FAST_DRAW, the same exception press_button makes and for the same
+  # reason: this is a two-level black-on-white repaint that happens about ten
+  # times per attempt budget and about twenty times over a whole press, and a
+  # GL16 chrome refresh each time would cost more than the search it reports on.
+  assert_equal([x, y, w, h, RM2::DU, RM2::FAST_DRAW], d.updates[0])
+  assert_equal(1, d.updates.size)
+end

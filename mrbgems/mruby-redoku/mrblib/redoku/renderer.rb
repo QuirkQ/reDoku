@@ -57,6 +57,55 @@ module Redoku
     # (test/renderer.rb), instead of trusted anew at every call site.
     SPLASH_TEXT = 'GENERATING...'
 
+    # THE PROGRESS BAR, and it is a real one: generation already loops over
+    # attempts, so a callback on completed work gives honest progress at no
+    # extra cost. What it means, stated plainly because a bar that means
+    # nothing is worse than no bar: work COMPLETED against work completed plus
+    # one more full attempt budget. It advances with every finished attempt,
+    # decelerates as a search runs long, and can never fill -- because a search
+    # that has not finished cannot promise it is about to. See App#show_progress
+    # for why that is the shape and not a percentage of a fixed total.
+    #
+    # WHAT THAT LOOKS LIKE IN THE COMMON CASE, said plainly because it is the
+    # case the player meets: an EASY press hits on its first attempt, so the bar
+    # goes to 1/(1+6) -- 14%, 87 px of 614 -- and is then replaced by the board.
+    # A short bar that vanishes, not a bar that fills. design 6.5 predicted "the
+    # bar jumps to full"; that was true of a denominator of `total`, and it is
+    # not true of this one. The trade was taken deliberately: never resetting
+    # across a retry matters more than finishing, because the retry case is the
+    # one where the player is actually waiting.
+    #
+    # Geometry is derived from the splash text's own box so the two stay
+    # centred together, and lives wholly inside board_rect so that draw_board's
+    # white fill erases it and flush_board covers it -- no second flush region,
+    # and no bar surviving onto the finished puzzle.
+    PROGRESS_W = 620
+    PROGRESS_H = 24
+    PROGRESS_GAP = 40
+    PROGRESS_BORDER = 3
+
+    def self.progress_rect
+      x, y, w, h = Layout.board_rect
+      th = Font::HEIGHT * SPLASH_SCALE
+      top = y + (h - th) / 2 + th + PROGRESS_GAP
+      [x + (w - PROGRESS_W) / 2, top, PROGRESS_W, PROGRESS_H]
+    end
+
+    # The filled width in pixels for a fraction given as two Integers. Integer
+    # arithmetic throughout, and the reason is the bar and not the toolchain:
+    # a bar is pixels, mrb_int is 32-bit on the device, and there is nothing a
+    # Float would add here but a rounding rule to get wrong. (String#% and
+    # `format` ARE available since 18cc2f5 declared mruby-sprintf; a percentage
+    # STRING is simply not what this returns.) Clamped at both ends and safe on
+    # a zero denominator, because this is called from inside a search where a
+    # raise costs the player their puzzle.
+    def self.progress_fill(num, den)
+      inner = PROGRESS_W - 2 * PROGRESS_BORDER
+      return 0 if den <= 0 || num <= 0
+      return inner if num >= den
+      (inner * num) / den
+    end
+
     def initialize(display)
       @d = display
     end
@@ -220,6 +269,33 @@ module Redoku
       self
     end
 
+    # The whole bar, frame and fill, repainted from scratch each time: 620x24
+    # is nothing to fill and it removes any question of a stale fill edge
+    # surviving a repaint.
+    def draw_progress(num, den)
+      x, y, w, h = Renderer.progress_rect
+      b = PROGRESS_BORDER
+      @d.fill_rect(x, y, w, h, WHITE)
+      @d.fill_rect(x, y, w, b, BLACK)                # top
+      @d.fill_rect(x, y + h - b, w, b, BLACK)        # bottom
+      @d.fill_rect(x, y, b, h, BLACK)                # left
+      @d.fill_rect(x + w - b, y, b, h, BLACK)        # right
+      fill = Renderer.progress_fill(num, den)
+      @d.fill_rect(x + b, y + b, fill, h - 2 * b, BLACK) if fill > 0
+      self
+    end
+
+    # DU + FAST_DRAW, the same exception to the chrome convention that
+    # press_button makes: this is two-level black on white, it happens about ten
+    # times per attempt budget and about twenty times over a whole press
+    # however long it runs (App::PROGRESS_STEP_PX explains why the total is
+    # bounded), and a GL16 each time would cost more than the search it
+    # reports on.
+    def flush_progress
+      x, y, w, h = Renderer.progress_rect
+      @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
+    end
+
     def flush_all
       @d.update(0, 0, Layout::SCREEN_W, Layout::SCREEN_H,
                 waveform: RM2::GC16, flags: RM2::SYNC)
@@ -282,8 +358,8 @@ module Redoku
     # draw_board and the per-cell restoration below — because a second copy of
     # this rule could disagree with the board it is supposed to be restoring.
     #
-    # `== 0`, not `.zero?`: Integer#zero? is mruby-numeric-ext, which this gem
-    # does not depend on, so it is absent from its mrbtest state.
+    # Every third boundary, counting from the board's own edge, which is why
+    # this is `% 3` and not a lookup.
     def boundary_weight(i)
       i % 3 == 0 ? Layout::BLOCK_LINE : Layout::CELL_LINE
     end
