@@ -8,6 +8,14 @@ MRUBY_REF    := 4.0.0
 RM2STUFF_REF := 451577081b9eaa3d582e50bbca8c4adfd4911b53
 PLATFORM     := linux/amd64
 
+# Pinned SQLite amalgamation for mrbgems/mruby-sqlite3 (M3a Task 0). The
+# download-page encoding is 3XXYY00, so 3.53.4 is 3530400; the checksum is
+# the SHA3-256 published on https://www.sqlite.org/download.html.
+SQLITE_VERSION ?= 3530400
+SQLITE_YEAR    ?= 2026
+SQLITE_SHA3_256 := 628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e
+SQLITE_ZIP     := tmp/sqlite/sqlite-amalgamation-$(SQLITE_VERSION).zip
+
 DOCKER_RUN := docker run --rm --platform $(PLATFORM) \
 	-v $(CURDIR):/work \
 	-v $(abspath $(MRUBY_DIR)):/mruby \
@@ -15,7 +23,7 @@ DOCKER_RUN := docker run --rm --platform $(PLATFORM) \
 
 RAKE := rake MRUBY_CONFIG=/work/build_config.rb MRUBY_BUILD_DIR=/work/build
 
-.PHONY: image build test rm2fb shell clean
+.PHONY: image build test rm2fb sqlite shell clean
 
 image:
 	docker build --platform $(PLATFORM) -t $(IMAGE) docker
@@ -32,6 +40,19 @@ tmp/mruby:
 tmp/rM2-stuff:
 	git clone https://github.com/QuirkQ/rM2-stuff.git $@
 	git -C $@ checkout $(RM2STUFF_REF)
+
+# Fetches the pinned SQLite amalgamation into tmp/sqlite/ and verifies the
+# SHA3-256 checksum published on the download page. Vendoring into
+# mrbgems/mruby-sqlite3/src/ is a manual copy step afterwards (see that
+# gem's README); rake never touches the network.
+sqlite: $(SQLITE_ZIP)
+
+# Note: verified with openssl, not shasum — BSD shasum has no SHA-3.
+$(SQLITE_ZIP):
+	mkdir -p tmp/sqlite
+	curl -fSL -o $@ \
+		https://www.sqlite.org/$(SQLITE_YEAR)/sqlite-amalgamation-$(SQLITE_VERSION).zip
+	test "$$(openssl dgst -sha3-256 $@ | sed 's/^.*= //')" = "$(SQLITE_SHA3_256)"
 
 # Cross-builds the rm2fb display server (swtcon mode) from the rM2-stuff
 # checkout, mirroring its CI: toltec toolchain via switch-arm.sh + the
