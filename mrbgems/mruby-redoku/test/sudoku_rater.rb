@@ -250,8 +250,8 @@ assert('Rater.tier_for lets the score speak only inside :singles') do
   assert_equal(:hard, r.tier_for(:locked, 1_000_000))
   assert_equal(:expert, r.tier_for(:subset, 0))
   assert_equal(:expert, r.tier_for(:subset, 1_000_000))
-  assert_equal(:master, r.tier_for(:xwing, 0))
-  assert_equal(:master, r.tier_for(:xwing, 1_000_000))
+  assert_equal(:master, r.tier_for(:advanced, 0))
+  assert_equal(:master, r.tier_for(:advanced, 1_000_000))
 
   # An unknown demand has no tier rather than a wrong one.
   assert_nil r.tier_for(:not_a_demand, 100)
@@ -287,7 +287,7 @@ assert('Rater.demand_of confirms the weakest set, because firing is not needing'
   easy = values_of(EASY_81)
   assert_equal(:singles, r.demand_of(easy, { naked_single: 2 }))
   # Hand it counts CLAIMING an X-wing fired on a board singles can finish: the
-  # upper bound says :xwing, the confirming solves walk it all the way back
+  # upper bound says :advanced, the confirming solves walk it all the way back
   # down to :singles. This is the assertion that pins "set inclusion, then
   # confirm" rather than "the hardest rule that fired".
   assert_equal(:singles, r.demand_of(easy, { x_wing: 1 }))
@@ -397,7 +397,7 @@ assert('Rater classifies real boards by the weakest rule set that finishes them'
   xwing = values_of(XWING_81)
   assert_false t.solves?(xwing, r::DEMAND_SETS[2])
   assert_true t.solves?(xwing, r::DEMAND_SETS[3])
-  assert_equal(:xwing, r.measure(xwing)[:demand])
+  assert_equal(:advanced, r.measure(xwing)[:demand])
   assert_equal(:master, r.measure(xwing)[:tier])
 
   # The second board on the top rung, and the reason the rung is reachable:
@@ -408,7 +408,7 @@ assert('Rater classifies real boards by the weakest rule set that finishes them'
   xy = values_of(XY_WING_81)
   assert_false t.solves?(xy, r::DEMAND_SETS[2])
   assert_true t.solves?(xy, r::DEMAND_SETS[3])
-  assert_equal(:xwing, r.measure(xy)[:demand])
+  assert_equal(:advanced, r.measure(xy)[:demand])
   assert_equal(:master, r.measure(xy)[:tier])
 
   # And the ceiling really is a ceiling: however long these boards are, none

@@ -81,6 +81,18 @@ module Redoku
       # nothing while unimplemented -- a rule that never fires never appears
       # in `counts` -- and having the weight ready is what makes adding the
       # rule a one-file change.
+      #
+      # HOW LITTLE OF THIS IS LOAD-BEARING, because a reader who does not know
+      # will be needlessly careful with it. Since the demand rework the score
+      # only ranks WITHIN :singles: it picks :easy against :medium and nothing
+      # else, because every other class is one rung wide (see DEMAND_RANGE and
+      # DEMAND_EDGES). A rule in the :locked, :subset or :advanced sets can
+      # therefore never move a tier by its weight, whatever the number -- so
+      # x_wing's 140 and xy_wing's 160 are here for TABLE CONSISTENCY, not for
+      # behaviour. The one place a high weight still does something real is
+      # Generator.harder?, which breaks ties between equal-tier rescue
+      # candidates by score. Retuning these numbers is safe; deleting one is
+      # not, because UNKNOWN_WEIGHT would then quietly price it.
       WEIGHT = {
         naked_single: 4,
         hidden_single: 14,
@@ -181,11 +193,13 @@ module Redoku
       # could not finish at all, and the XY-wing converts part of that pool
       # into certifiable top-tier boards instead of discarding it.
       #
-      # The demand's NAME is still :xwing, which is now a slight misnomer --
-      # it means "the two-unit-and-beyond rules". Left alone deliberately: the
-      # name is internal (TIERS supplies every label a player sees) and
-      # renaming it would churn DEMAND_RANGE, DEMAND_EDGES and four tests for
-      # no behaviour.
+      # THE CLASS IS CALLED :advanced, not :xwing, and the rename is the whole
+      # reason to mention it. It held one rule and was named after it, which
+      # stopped being true the moment it held two -- and it would have kept
+      # drifting, because this is the set every further rule joins. What the
+      # members have in common is not being a fish or being a wing but
+      # REASONING BEYOND A SINGLE UNIT, which is what the name now says.
+      # DEMANDS names are internal; TIERS supplies every label a player sees.
       #
       # The strongest set is Techniques::ORDER, SPELLED OUT rather than
       # referenced: mrblib loads in sorted-path order, so rater.rb loads
@@ -204,7 +218,7 @@ module Redoku
       ].freeze
 
       # The name of each set, in the same order.
-      DEMANDS = [:singles, :locked, :subset, :xwing].freeze
+      DEMANDS = [:singles, :locked, :subset, :advanced].freeze
 
       # Which rungs a demand class may occupy, as [first, last] indices into
       # TIERS. THIS IS THE FIX. The old TECHNIQUE_FLOOR could only ever RAISE
@@ -214,10 +228,10 @@ module Redoku
       # class sets a CEILING as well as a floor, so volume can no longer buy
       # cleverness.
       DEMAND_RANGE = {
-        singles: [0, 1].freeze,   # easy or medium, by score
-        locked:  [2, 2].freeze,
-        subset:  [3, 3].freeze,
-        xwing:   [4, 4].freeze
+        singles:  [0, 1].freeze,  # easy or medium, by score
+        locked:   [2, 2].freeze,
+        subset:   [3, 3].freeze,
+        advanced: [4, 4].freeze
       }.freeze
 
       # Score edges INSIDE a class's range: exactly one fewer than the range is

@@ -261,11 +261,12 @@ MULTI_81 =
 # below by the definition of its class -- the weakest DEMAND_SET that finishes
 # it -- and not by Rater.demand_of, so the test can fail the classifier.
 #
-# All three came from the same throwaway script: walk each seed's dig chain
-# from first_usable to the floor, measure every board, and keep the first one
-# of each demand class. The three below are the first :locked, :subset and
-# :xwing boards in seed order, which is why their seeds are so far apart --
-# :xwing is rare.
+# LOCKED_81, PAIR_81 and XWING_81 came from the same throwaway script: walk
+# each seed's dig chain from first_usable to the floor, measure every board,
+# and keep the first one of each demand class. They are the first :locked,
+# :subset and :advanced boards in seed order, which is why their seeds are so
+# far apart -- an X-wing board is rare. XY_WING_81 was mined separately, by a
+# different sweep, and is reproducible differently; see its own comment.
 
 # Needs pointing / box-line: singles alone stall on it. seed=1..400 walk,
 # seed=3, 28 clues, score 276.
@@ -302,9 +303,17 @@ PAIR_81 =
 # could show the rule doing the work on its own.
 #
 # It is a REJECT board rescued: before xy_wing, no set in our repertoire
-# finished it, so the generator discarded it. Provenance: the hardest
-# one-group rescue of seed 2020's chain floor, from the 300-chain
-# old-versus-new sweep (seeds 2000-2299). 29 clues, score 391.
+# finished it, so the generator discarded it. 29 clues, score 391.
+#
+# PROVENANCE, AND IT IS NOT A PLAIN CHAIN WALK -- do not try to re-derive it
+# by walking seed 2020's chain, because it is not ON that chain. It is a
+# RESCUE: seed 2020's chain floor with one removed symmetric group restored,
+# the same construction Generator.rescue_floor uses, taken from the 300-chain
+# old-versus-new sweep over seeds 2000-2299. That is deliberate rather than
+# convenient -- 22% of chain floors reject, and the rescue neighbourhood is
+# where the generator actually finds its top-rung boards (189 of the 810
+# stalling neighbours in that sweep became solvable), so a rescue board is the
+# representative sample, not an odd one.
 XY_WING_81 =
   '.61...5.3' \
   '....59.81' \
