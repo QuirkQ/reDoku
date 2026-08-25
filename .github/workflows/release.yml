@@ -1,0 +1,52 @@
+name: Release
+
+# release-please keeps a release PR up to date from conventional commits on
+# main. Merging that PR makes it tag a release, and the publish job below
+# then builds the rm2 binaries and attaches them to that release.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cross-compile rm2 binaries
+        run: make build
+
+      - name: Cross-compile rm2fb display server
+        run: make rm2fb
+
+      - name: Package release tarball
+        run: |
+          mkdir -p dist/redoku/bin
+          cp build/rm2/bin/redoku build/rm2/bin/mruby build/rm2/bin/mirb \
+            dist/redoku/bin/
+          cp build/rm2fb/dist/rm2fb_server_swtcon \
+            build/rm2fb/dist/rm2fbctl \
+            build/rm2fb/dist/librm2fb_client_swtcon.so \
+            dist/redoku/
+          tar -czf redoku-rm2.tar.gz -C dist redoku
+
+      - name: Upload to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" redoku-rm2.tar.gz --clobber
