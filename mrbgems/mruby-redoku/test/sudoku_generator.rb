@@ -370,7 +370,7 @@ assert('only easy walks the shallow end of the chain') do
 
   # The hard end of the same chain is the FLOOR, which is strictly deeper.
   # Measured on this seed: 26 clues against the shallow end's 45.
-  hard = gen.hard_end(solution, removals)
+  hard = gen.hard_end(solution, removals, :hard)
   assert_false hard[0].nil?
   assert_false hard[1].nil?
   assert_true Redoku::Sudoku::Rater.clue_count(hard[0]) < easy_clues
@@ -398,7 +398,7 @@ assert('the hard end of a chain is its floor, and its class never decreases') do
 
   floor = gen.board_at(solution, removals, removals.size)
   assert_false r.measure(floor)[:tier].nil?
-  out = gen.hard_end(solution, removals)
+  out = gen.hard_end(solution, removals, :hard)
   m = out[1]
   assert_false m.nil?
   # A solvable floor IS the hard end, untouched -- unconditionally, now that
@@ -448,7 +448,7 @@ assert('a rejected floor is rescued by restoring one symmetric group') do
   floor = gen.board_at(solution, removals, removals.size)
   assert_nil r.measure(floor)[:tier]
 
-  out = gen.rescue_floor(solution, removals, floor)
+  out = gen.rescue_floor(solution, removals, floor, :expert)
   assert_false out[0].nil?
   board = out[0]
   # Two more clues than the floor (one, if it was the centre group), and the
@@ -465,7 +465,70 @@ assert('a rejected floor is rescued by restoring one symmetric group') do
   assert_false out[1][:tier].nil?
   # ...and hard_end routes through the rescue rather than handing back the
   # reject, which is the only thing that connects this method to the search.
-  assert_equal(board, gen.hard_end(solution, removals)[0])
+  assert_equal(board, gen.hard_end(solution, removals, :expert)[0])
+end
+
+assert('a rescue serves the REQUEST, and only falls back to the ceiling') do
+  gen = Redoku::Sudoku::Generator
+  r = Redoku::Sudoku::Rater
+  # rescue_floor used to return the HARDEST solvable neighbour whatever was
+  # asked for. That was harmless while the hardest neighbour was usually the
+  # tier being requested, and it stopped being harmless once xy_wing widened
+  # the top rule set: neighbours that used to reject began classifying at the
+  # top level and outranking the level-2 board the request actually wanted, so
+  # deep_walk got a board harder than asked, could not return it, and paid up
+  # to MEASURE_BUDGET classifications in walk_up to find on the chain what the
+  # neighbourhood already held.
+  #
+  # WHAT THIS TEST IS AND IS NOT. It pins the CONTRACT -- serve the request,
+  # fall back to the ceiling -- and not a speed claim. Measured over 40 draws
+  # per rung on identical seeds, this change moved generation cost by nothing
+  # at all (:hard 1066 -> 1073 ms p50, :expert 1402 -> 1412). It was written
+  # believing it would fix the middle-rung regression and it does not; see
+  # Generator::ATTEMPTS for where that cost really went.
+  #
+  # REJECT_FLOOR_SEED's neighbourhood is what makes this testable without a
+  # guard: 26 neighbours, measured 4 :easy, 8 :medium, 5 :hard, 1 :expert and
+  # 8 rejects. So it holds a :hard board AND a strictly harder :expert one,
+  # which is exactly the shape the old code got wrong.
+  solution = gen.full_board(Redoku::Rng.new(REJECT_FLOOR_SEED))
+  chain = gen.dig_chain(solution, Redoku::Rng.new(REJECT_FLOOR_SEED))
+  removals = chain[0]
+  floor = gen.board_at(solution, removals, removals.size)
+  assert_nil r.measure(floor)[:tier]
+
+  # Asked for :hard, it answers :hard -- even though an :expert neighbour
+  # exists and the old code would have returned it. This is the assertion the
+  # fix is for, and it fails against the old rescue_floor.
+  hard = gen.rescue_floor(solution, removals, floor, :hard)
+  assert_false hard[0].nil?
+  assert_equal(:hard, hard[1][:tier])
+  # Premise, asserted rather than trusted: a strictly harder neighbour really
+  # is in reach, so answering :hard is a CHOICE and not the only option.
+  ceiling = gen.rescue_floor(solution, removals, floor, :master)
+  assert_false ceiling[0].nil?
+  assert_true r.rank(ceiling[1][:tier]) > r.rank(hard[1][:tier])
+
+  # Asked for something the neighbourhood cannot serve, it falls back to the
+  # CEILING. That is not a nicety: deep_walk dismisses a whole chain when the
+  # hard end is easier than the request, and that dismissal is only sound if
+  # the board it dismisses on is the hardest one available. So "hardest" has
+  # to survive precisely in the case where no neighbour matched.
+  assert_equal(:expert, ceiling[1][:tier])
+
+  # And the match is still a legal puzzle, not just a tier: symmetric,
+  # agreeing with the solution, and one group richer than the floor.
+  board = hard[0]
+  assert_true r.clue_count(board) > r.clue_count(floor)
+  81.times { |i| assert_equal(solution[i], board[i]) if board[i] != 0 }
+  81.times { |i| assert_equal(0, board[80 - i]) if board[i] == 0 }
+  assert_true Redoku::Sudoku::Solver.unique?(board)
+
+  # deep_walk therefore MATCHES at the hard end instead of walking up: the
+  # board it returns for :hard is the rescue itself.
+  deep = gen.deep_walk(solution, removals, chain[1], :hard)
+  assert_equal(:hard, deep[1][:tier])
+  assert_equal(board, deep[0])
 end
 
 assert('a chain with nothing our rules can finish yields nothing, not a bad puzzle') do
@@ -483,7 +546,7 @@ assert('a chain with nothing our rules can finish yields nothing, not a bad puzz
 
   floor = gen.board_at(solution, removals, removals.size)
   assert_nil r.measure(floor)[:tier]
-  out = gen.rescue_floor(solution, removals, floor)
+  out = gen.rescue_floor(solution, removals, floor, :hard)
   assert_nil out[0]
   assert_nil out[1]
 

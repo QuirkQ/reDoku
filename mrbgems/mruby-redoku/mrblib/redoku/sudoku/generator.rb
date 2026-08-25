@@ -136,6 +136,43 @@ module Redoku
       #
       # Adding a rung means adding an entry here. That is a real obligation the
       # three-tier design did not have, and it is unavoidable.
+      #
+      # RE-MEASURED AFTER xy_wing JOINED THE TOP RULE SET, 40 draws per rung on
+      # identical seeds (910-924 and 3000-3024), old engine reproduced in the
+      # same binary by making xy_wing decline:
+      #
+      #   hard    100% -> 100%    864 ->  1073 ms p50   (+24%)
+      #   expert   97% ->  95%   1094 ->  1412 ms p50   (+29%)
+      #   master   80% -> 100% 10794 ->  1206 ms p50    (-89%)
+      #
+      # MASTER is the point of the change and it is 9x faster with no miss
+      # left. The middle rungs got dearer, and the cause is NOT the rule's own
+      # cost -- Rater.measure is only 8% dearer per board (9439 -> 10207 us
+      # over the same 1123 floors and neighbours), of which the extra is one
+      # confirming solve on the 26 boards that used to reject. It splits in
+      # two, both measured:
+      #
+      #   MORE ATTEMPTS (hard 7.5 -> 8.5 mean, expert 11.8 -> 13.6). Chains
+      #   whose hard end matches the request one-for-one got rarer, because
+      #   boards moved UP: over 300 chains the hard-end class went singles
+      #   234 -> 214, locked 41 -> 31, subset 23 -> 15, top 2 -> 40. That is
+      #   the ladder classifying more boards correctly, not a defect -- the
+      #   middle rungs are genuinely rarer now -- so there is nothing here to
+      #   fix without redefining what those rungs mean.
+      #
+      #   DEARER ATTEMPTS (hard 139 -> 148 ms, expert 144 -> 166). The 8% per
+      #   board, plus walk_up running on far more chains: for a :hard request
+      #   it went from 25 chains in 300 to 55, and it costs up to
+      #   MEASURE_BUDGET classifications where a match costs one.
+      #
+      # The one lever left un-pulled, recorded rather than taken: walk_up
+      # scans linearly, and for :hard, :expert and :master the tier IS the
+      # demand class, which is monotone along the chain -- so those three
+      # could BISECT and pay about 4 classifications instead of 16. It is not
+      # done here because the class comment's "WALKED, NOT HALVED" rejects
+      # halving on the grounds that the SCORE is not monotone, and that
+      # objection is live for :medium, which shares the same walk. Splitting
+      # the walk by rung needs its own measurement and its own review.
       ATTEMPTS = { easy: 6, medium: 12, hard: 60, expert: 60,
                    master: 150 }.freeze
 
@@ -315,7 +352,7 @@ module Redoku
       # is over after ONE classification (p50 9 ms on top of the 47 ms dig).
       # Only a chain that can actually serve the request pays for a walk.
       def self.deep_walk(solution, removals, clues_after, tier)
-        out = hard_end(solution, removals)
+        out = hard_end(solution, removals, tier)
         board = out[0]
         m = out[1]
         # Nothing our rules can finish at the deep end, floor OR neighbourhood.
@@ -342,6 +379,14 @@ module Redoku
         #     the LAST removal is exactly board_at(k = size - 1)), so the
         #     rescue is at least as hard as it, and it dominates everything
         #     shallower.
+        #
+        #     THAT LEANS ON THE RESCUE BEING THE HARDEST NEIGHBOUR, which
+        #     since the request-first change it is only when NO neighbour
+        #     matched the request. That is exactly the case this line runs in:
+        #     a rescue that matched the request was returned by the `==` above
+        #     and never reaches here, so on this line the rescue is still the
+        #     neighbourhood's ceiling and the argument is untouched. See
+        #     rescue_floor.
         #   - The gap is the case where the floor AND the board above it both
         #     reject. Then the deepest solvable board on the chain need not be
         #     inside the neighbourhood at all, and nothing bounds it. Measured,
@@ -362,14 +407,20 @@ module Redoku
         up[1].nil? ? [board, m] : up
       end
 
-      # The hardest board this chain can offer: its floor, or -- if the floor
-      # is a board our rules cannot finish -- the hardest rescue from the
+      # The board this chain's deep end can offer for `tier`: its floor, or --
+      # if the floor is a board our rules cannot finish -- a rescue from the
       # floor's neighbourhood. [nil, nil] if there is no such board.
-      def self.hard_end(solution, removals)
+      #
+      # `tier` is only ever a PREFERENCE, and only reaches the rescue path: a
+      # solvable floor is returned with whatever class it has, because
+      # monotonicity says it is the hardest board on the chain and the caller
+      # needs that fact more than it needs a match. See rescue_floor for what
+      # the preference does and why it is not simply "the hardest".
+      def self.hard_end(solution, removals, tier)
         floor = board_at(solution, removals, removals.size)
         m = Rater.measure(floor)
         return [floor, m] unless m[:tier].nil?
-        rescue_floor(solution, removals, floor)
+        rescue_floor(solution, removals, floor, tier)
       end
 
       # A REJECTED FLOOR IS NOT A WASTED DIG. Restore any single removed group
@@ -402,20 +453,65 @@ module Redoku
       # on the chain -- restoring the last removal gives board_at(size - 1) --
       # and that one is what carries deep_walk's dismissal argument as far as
       # it goes. See there.
-      def self.rescue_floor(solution, removals, floor)
+      #
+      # WHICH NEIGHBOUR: THE REQUESTED TIER FIRST, THE HARDEST ONLY AS A
+      # FALLBACK. This method used to answer the hardest neighbour whatever was
+      # asked for, and that was a latent mismatch rather than a design: the
+      # search wants a board of tier T, and "hardest" only happens to be that
+      # while the neighbourhood's ceiling IS T. Adding xy_wing made the
+      # mismatch visible -- neighbours that used to reject began classifying in
+      # the TOP demand class, so a neighbourhood whose ceiling was :expert
+      # started holding a :master, and a request for :expert got handed the
+      # :master, which deep_walk cannot return. It then paid up to
+      # MEASURE_BUDGET classifications in walk_up to find on the chain what the
+      # neighbourhood was already holding.
+      #
+      # THIS IS A CORRECTNESS CHANGE, NOT A SPEED ONE, and that is worth
+      # stating plainly because it was first written believing the opposite.
+      # Measured over 40 draws per rung on identical seeds, preferring the
+      # match moved generation cost by NOTHING: :hard 1066 -> 1073 ms p50,
+      # :expert 1402 -> 1412, :master 1196 -> 1206, with attempts-per-request
+      # and ms-per-attempt both unchanged to the digit. The reason is that this
+      # path is only reached when a floor REJECTS (about 21% of chains) AND the
+      # neighbourhood ceiling has risen above the request, which is roughly 8%
+      # of attempts, and it saves walk_up's 16 classifications out of an
+      # attempt that already spent 27 on the neighbourhood. So keep it for what
+      # it does do -- hand back a board of the tier that was asked for, and
+      # stop the mismatch growing the next time the rule set does -- and see
+      # ATTEMPTS for where the middle-rung cost actually went.
+      #
+      # THE FALLBACK IS NOT A CONVENIENCE, it is what keeps deep_walk's
+      # dismissal sound. deep_walk writes off a whole chain when the hard end
+      # is EASIER than the request, and that is only licensed if the board it
+      # dismisses on is the hardest available. So the two cases divide exactly
+      # as they must: a match is returned and deep_walk never reaches the
+      # dismissal, and when there is no match the answer is the hardest
+      # neighbour, which is precisely the case the dismissal argument covers.
+      #
+      # Among several neighbours of the requested tier, `harder?` picks the
+      # highest-scoring one -- same tie-break as the ceiling search, and the
+      # same reason the walks run from the deep end: a tier should not ship its
+      # easy edge.
+      def self.rescue_floor(solution, removals, floor, tier)
         best = nil
         best_board = nil
+        match = nil
+        match_board = nil
         removals.each do |pair|
           board = floor.dup
           board[pair[0]] = solution[pair[0]]
           board[pair[1]] = solution[pair[1]]
           m = Rater.measure(board)
           next if m[:tier].nil?
+          if m[:tier] == tier && (match.nil? || harder?(m, match))
+            match = m
+            match_board = board
+          end
           next unless best.nil? || harder?(m, best)
           best = m
           best_board = board
         end
-        [best_board, best]
+        match.nil? ? [best_board, best] : [match_board, match]
       end
 
       # THE LAST RESORT ON A CHAIN, and the reason `generate` almost never
