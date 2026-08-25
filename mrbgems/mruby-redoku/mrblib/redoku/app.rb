@@ -39,6 +39,33 @@ module Redoku
     # second calibration of its own.
     PRESS_ACK_MS = 200
 
+    # How many times a generation that FAILED OUTRIGHT -- raised, or answered
+    # nil -- is tried before the board is left as it was. Deliberately small
+    # and deliberately BOUNDED, unlike a tier miss: an exception or an empty
+    # answer means the engine produced nothing, which is a fault rather than
+    # bad luck, and retrying a fault for ever would hang the game on a device
+    # whose only escape is the power button. Conflating the two paths is how an
+    # engine bug becomes an infinite loop.
+    GENERATE_TRIES = 3
+
+    # How far the progress bar's filled edge must move before it is worth a
+    # panel refresh. E-ink updates are not free -- DU + FAST_DRAW is the cheap
+    # two-level waveform and still costs tens of milliseconds -- and :master's
+    # budget fires the hook up to 150 times per round.
+    #
+    # 30 px of a 614 px interior is about 5%. Because the fraction is
+    # num/(num+total) rather than num/total, one full :master round only ever
+    # reaches 614*150/300 = 307 px, so a round costs about TEN paints, not
+    # twenty; and because the bar is monotone and asymptotic to 614 px, the
+    # whole press -- however many rounds it runs -- costs at most about twenty.
+    # MEASURED, not estimated: a full 150-attempt round paints exactly ten
+    # times (test/app.rb, 'the bar is painted at most once per visible step'),
+    # at attempts 8, 17, 27, 38, 51, 65, 81, 100, 122 and 149. Roughly a second
+    # of paint inside a search measured in seconds, and it does not grow with
+    # the tail. Painting per attempt instead would add 150 refreshes per round
+    # and could double a :hard dig.
+    PROGRESS_STEP_PX = 30
+
     # How long the pen may say nothing at all before its proximity latch is
     # treated as stale. @pen_near only ever becomes false because a packet
     # said so, and two documented things eat that packet: the display server
@@ -86,9 +113,28 @@ module Redoku
     # one deliberately not -- and a control structure needs a collaborator that
     # can be told to fail. It also keeps the suite off the real search, which
     # for :expert is measured in seconds.
+    #
+    # `log:` is where the generation report goes: which rung, how many rounds,
+    # how many attempts, how many milliseconds. That line is the ONLY way the
+    # real cost distribution on the device ever becomes visible -- every timing
+    # in the design document is a host figure times an assumption, because the
+    # tablet was unreachable when it was written. The game runs from a shell,
+    # so stderr is read.
+    #
+    # GUARDED AT EVERY USE (`@log.puts(...) if @log`), and the guard earns its
+    # keep for the ordinary reason rather than an exotic one: the tests pass
+    # `nil`, because a suite that logged by accident would print a generation
+    # report for every one of the sixty-odd App assertions. It is cheap
+    # insurance for a second reason too -- $stderr comes from mruby-io, which
+    # this gem does not DECLARE (see Global Constraint 1), so it is present here
+    # only by grace of `conf.gembox 'default'` in both build targets. It really
+    # is present in both, device and mrbtest alike (main.rb has written to it
+    # since M1), so this is not a workaround for a missing global; it is what
+    # lets one line of logging be switched off by a caller.
     def initialize(display, sources, renderer, waiter = RM2::Input,
                    signals = RM2, touch_sources: [], clock: RM2,
-                   rng: Rng.from_clock, generator: Sudoku::Generator)
+                   rng: Rng.from_clock, generator: Sudoku::Generator,
+                   log: $stderr)
       @d = display
       @sources = sources
       @touch = touch_sources
@@ -98,6 +144,7 @@ module Redoku
       @clock = clock
       @rng = rng
       @generator = generator
+      @log = log
       @difficulty = Sudoku::Rater::TIERS[0]
       # No puzzle until something asks for one. Generation is a search of tens
       # of milliseconds here and PLAN.md §7 budgets a few hundred on the
@@ -144,6 +191,11 @@ module Redoku
     def run
       @renderer.draw_all(@difficulty)
       @renderer.draw_splash
+      # The empty bar goes out on the SAME flush as the splash, so it costs no
+      # refresh of its own -- the player sees a bar waiting to move rather than
+      # one appearing from nowhere a second later.
+      reset_progress
+      @renderer.draw_progress(0, 1)
       @renderer.flush_all
       fill_board
       while @running
@@ -320,9 +372,15 @@ module Redoku
     # Public because it is what a New press does and what a test drives
     # directly; the dig itself is fill_board, which cycle_difficulty and run
     # also reach.
+    # An EMPTY BAR goes up with the splash, on the splash's own flush, for the
+    # same reason run does it: it costs no extra refresh, and a bar that
+    # appears from nowhere partway through a search reads worse than one that
+    # was always there waiting to move.
     def new_puzzle
       @ink_dirty = nil
       @renderer.draw_splash
+      reset_progress
+      @renderer.draw_progress(0, 1)
       @renderer.flush_board
       fill_board
       self
@@ -737,53 +795,190 @@ module Redoku
     #
     # WHAT THE HEADER SHOWS is settled here, and it shows the REQUESTED tier:
     # @difficulty is what cycle_difficulty advanced, what draw_header printed
-    # and what the generator was asked for. Generator.generate also reports
-    # the tier it ACTUALLY achieved, which really can differ — one measured
-    # solution in four yields no board harder than easy anywhere along its
-    # chain (see Generator#dig) — and that value is RECORDED in
-    # @achieved_tier rather than displayed.
+    # and what the generator was asked for. The header is the Level button's
+    # read-out, not a rating of the board — a label that followed the achieved
+    # tier would make the button unpredictable: ask for medium, get easy, the
+    # label reads EASY, so the next press reads EASY as the current tier and
+    # offers medium again, three presses stop visiting three labels, and HARD
+    # can become unreachable. Splitting the two apart into "the tier you asked
+    # for" and "the tier you got" is also what keeps M1's one-step-per-tap
+    # guarantee (test/app.rb, 'the acknowledgement runs each action exactly
+    # once') meaningful.
     #
-    # The reason is that the header is the Level button's read-out, not a
-    # rating of the board. @difficulty is the one piece of state Level cycles,
-    # so a label that followed the achieved tier would make the button
-    # unpredictable: ask for medium, get easy, and the label reads EASY — so
-    # the next press reads EASY as the current tier and offers medium again,
-    # three presses stop visiting three labels, and HARD can become
-    # unreachable. Splitting the two apart into "the tier you asked for" and
-    # "the tier you got" is also what keeps M1's one-step-per-tap guarantee
-    # (test/app.rb, 'the acknowledgement runs each action exactly once')
-    # meaningful.
+    # Under the retry-without-limit rule that gap has NARROWED to one case, and
+    # it is worth naming: a successful search only ever returns the tier that
+    # was asked for, so @achieved_tier now means "the tier of the board
+    # actually on the glass" and normally equals @difficulty. It differs only
+    # after a FAULT, when the previous puzzle is kept while the header has
+    # already been repainted with the new tier — a visible inconsistency,
+    # logged rather than papered over, and an M3 UI question (surface the
+    # achieved tier, or re-request) rather than something to fix here.
     #
-    # The counter-argument is real and worth writing down: the label then
-    # overstates a near miss, telling a player HARD over a board that rated
-    # medium. That is why the achieved tier is stored rather than discarded —
-    # M3 owns whether to surface it (a parenthetical in the header, a
-    # re-request, a menu), and it has the value to do so.
+    # THE NIL GUARD is required, not defensive: Generator.generate's "cannot
+    # return nil" was an undocumented invariant spread over four methods in two
+    # files, and the difficulty rework breaks it deliberately and re-establishes
+    # it in ONE place — generate's own comment, which names all three failures
+    # an attempt has to suffer (rejected floor, rejected neighbourhood,
+    # rejected shallow fallback) before it yields nothing.
+    #
+    # AND IT REPAINTS EITHER WAY, which reverses half of the guard that landed
+    # in 75eb7cf. That guard returned before the repaint so the splash stayed
+    # up, on the grounds that "nothing new was actually dug" and saying so is
+    # honest. It is not: e-ink holds the last image it was given, so a first
+    # generation that fails leaves GENERATING... on the panel for ever with
+    # nothing coming, which reads as a dead device rather than as an honest
+    # report. The half that stands is the other one — an unchanged board beats
+    # a wiped one (the stuck-RUBBER fix in 2bebc4e cites it by name as
+    # precedent for resolving corruption toward the non-destructive answer) —
+    # so a fault after a successful dig repaints the puzzle the player already
+    # had, and only a fault with nothing ever dug paints empty.
     def fill_board
-      puzzle = @generator.generate(@difficulty, @rng)
-      # Guarded, and the nil it guards for now really happens. `generate`
-      # answers nil when no attempt found a single board our nine rules can
-      # finish — under the no-guessing rule such a board is a REJECT rather
-      # than a hard puzzle, so there is nothing to hand back. This guard was
-      # written one commit ahead of that change, against the invariant the
-      # difficulty rework was expected to give up; the rework has now given it
-      # up. On a nil result the puzzle already on the board is kept as-is — an
-      # unchanged board beats a wiped one — and the caller's splash is left
-      # showing, which is honest: nothing new was actually dug.
-      #
-      # What it does NOT do yet is retry, or tell the player. That is Task 5's
-      # question and is deliberately not answered here.
-      return self if puzzle.nil?
-      @grid = puzzle[:grid]
-      # Kept, not used. M3's Check needs the answer and the generator has
-      # already paid for computing it, so throwing it away would mean digging
-      # a second time or solving the board again. Nothing in M2 reads it:
-      # there is no Check here, by scope.
-      @solution = puzzle[:solution]
-      @achieved_tier = puzzle[:tier]
+      found = search_for_puzzle
+      if found
+        @grid = found[:grid]
+        # Kept, not used. M3's Check needs the answer and the generator has
+        # already paid for computing it, so throwing it away would mean digging
+        # a second time or solving the board again. Nothing in M2 reads it:
+        # there is no Check here, by scope.
+        @solution = found[:solution]
+        @achieved_tier = found[:tier]
+      end
       @renderer.draw_board
-      @renderer.draw_puzzle(@grid)
+      # @grid is nil only when nothing has EVER been dug and this search
+      # produced nothing: paint the empty board anyway (see above).
+      @renderer.draw_puzzle(@grid) if @grid
       @renderer.flush_board
+      self
+    end
+
+    # Ask until the requested tier arrives, or until the engine has failed
+    # GENERATE_TRIES times. Returns the candidate, or nil.
+    #
+    # TWO PATHS, AND THEY MUST STAY DISTINCT:
+    #
+    #   TIER MISS — unbounded. The rung is rare (:master is available on 2% of
+    #   chains, measured 1.3% over 300) and every retry draws a FRESH solution,
+    #   so retrying resets the odds: the expected cost is about 1.06 full
+    #   budgets, not 1/0.06. There is no fallback to an easier tier and never a
+    #   wrong label. The tail is real, and the progress bar is what makes it
+    #   readable as work rather than as a hang.
+    #
+    #   FAULT (a raise, or a nil reply) — bounded. Both mean the engine
+    #   produced nothing at all, and retrying that for ever would spin on a bug
+    #   behind a splash screen, on a device whose only escape is the power
+    #   button.
+    #
+    # `faults` counts across the whole press rather than consecutively, and
+    # that is the deliberate reading: a fault is evidence of a bug, so three of
+    # them scattered through one long search are as much reason to stop as
+    # three in a row. Counting consecutively would let an engine that fails
+    # every other call retry for ever.
+    def search_for_puzzle
+      reset_progress
+      started = @clock.monotonic_ms
+      faults = 0
+      rounds = 0
+      while true
+        rounds += 1
+        out = attempt_generation
+        if out.nil?
+          faults += 1
+          if faults >= GENERATE_TRIES
+            log_line('generation gave up after ' + rounds.to_s +
+                     ' rounds; keeping the board')
+            return nil
+          end
+          next
+        end
+        # THE UNBOUNDED EDGE, and it is one line: a candidate of the wrong tier
+        # is dropped and the loop turns again, with no counter to stop it.
+        next unless out[:tier] == @difficulty
+        log_line('generated ' + out[:tier].to_s.upcase + ' in ' +
+                 rounds.to_s + ' rounds, ' + @progress_done.to_s +
+                 ' attempts, ' + (@clock.monotonic_ms - started).to_s + ' ms')
+        return out
+      end
+    end
+
+    # One call to the generator. nil for either kind of outright failure; the
+    # candidate otherwise, tier honest.
+    #
+    # The rescue is around the ENGINE, not around the painting: show_progress
+    # swallows its own display errors (see there), so a wedged panel cannot be
+    # mistaken for a broken dig and burn a generation try.
+    def attempt_generation
+      @generator.generate(@difficulty, @rng) do |done, total|
+        show_progress(done, total)
+      end
+    rescue StandardError => e
+      log_line('generation failed (' + e.message + ')')
+      nil
+    end
+
+    # The numerator and the throttle, zeroed once per PRESS rather than once
+    # per round — which is the whole of "the bar does not reset between
+    # retries". search_for_puzzle calls this before its loop, deliberately not
+    # inside it.
+    def reset_progress
+      @progress_done = 0
+      @progress_px = 0
+    end
+
+    # THE FRACTION, and why it is this shape.
+    #
+    # The design had App paint (retry_index * total + done) / (retry_cap *
+    # total), which needs a retry CAP — and decision 4 removed it, so that
+    # denominator does not exist. What survives of the requirement is the part
+    # that matters: the bar must not RESET between retries, because a long wait
+    # that starts over reads as a hang.
+    #
+    # So: numerator is every attempt completed since the press, across every
+    # retry; denominator is that plus one more full budget. The bar is
+    # monotone, never resets, decelerates as the search runs long, and never
+    # fills — which is honest, because a search that has not finished cannot
+    # promise it is about to. One full budget spent shows half; two shows two
+    # thirds. The board's arrival is the completion signal, and it costs no
+    # extra refresh.
+    #
+    # NEVER FILLS IS AN INVARIANT, NOT AN OBSERVATION: `num < num + total`
+    # holds for every `total >= 1`, so Renderer.progress_fill can never take
+    # its `num >= den` branch and return a full 614 px. Every attempt budget in
+    # Generator::ATTEMPTS is 6 or more, and DEFAULT_ATTEMPTS covers a tier the
+    # table has never heard of, so nothing reachable passes 0 here. A caller
+    # that ever did would fill the bar at the moment of least justification.
+    #
+    # `done` is IGNORED on purpose: it restarts at 1 for every retry, and the
+    # numerator must not. Counting the block's own calls is what makes
+    # monotonicity a property of the code rather than of the generator's
+    # bookkeeping.
+    #
+    # THE ONE ARITHMETIC BOUND, written down rather than clamped because it
+    # cannot be reached: @progress_done is the only unbounded counter in the
+    # game, and progress_fill computes 614 * num, which overflows the device's
+    # 32-bit mrb_int past about 3.5 million attempts. At :master's measured
+    # 8 ms an attempt that is roughly 97 hours of unbroken generation behind
+    # one splash. A clamp would be dead code guarding an impossibility.
+    #
+    # Display errors are swallowed here, exactly as show_press swallows them:
+    # the bar is a courtesy and the puzzle is the contract, and a raise from
+    # inside the search would otherwise be counted as a failed generation.
+    # @progress_px is advanced BEFORE the paint, so a panel that raises costs
+    # the bar one step rather than a retry storm against a wedged server.
+    def show_progress(_done, total)
+      @progress_done += 1
+      num = @progress_done
+      px = Renderer.progress_fill(num, num + total)
+      return self if px - @progress_px < PROGRESS_STEP_PX
+      @progress_px = px
+      @renderer.draw_progress(num, num + total)
+      @renderer.flush_progress
+      self
+    rescue StandardError
+      self
+    end
+
+    def log_line(text)
+      @log.puts('redoku: ' + text) if @log
       self
     end
 

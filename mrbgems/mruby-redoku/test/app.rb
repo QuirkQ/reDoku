@@ -321,14 +321,19 @@ class FakeGenerator
   end
 end
 
+# `log: nil` by default, not `log: FakeLog.new`: a suite that logged by
+# accident would print a generation report for every one of the sixty-odd App
+# assertions below, and $stderr really is live under `make test` (both build
+# targets call `conf.gembox 'default'`, which carries mruby-io). The tests that
+# care about the report pass their own recorder.
 def new_app(batches = [], rng: Redoku::Rng.new(GEN_SEED),
-            generator: FakeGenerator.new)
+            generator: FakeGenerator.new, log: nil)
   d = TestDisplay.new
   input = FakeInput.new(batches)
   signals = FakeSignals.new
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
                         FakeWaiter.new([input]), signals, rng: rng,
-                        generator: generator)
+                        generator: generator, log: log)
   [app, d, input, signals]
 end
 
@@ -336,7 +341,7 @@ end
 # control.
 def new_touch_app(pen_batches = [], touch_batches = [],
                   rng: Redoku::Rng.new(GEN_SEED),
-                  generator: FakeGenerator.new)
+                  generator: FakeGenerator.new, log: nil)
   d = TestDisplay.new
   pen = FakeInput.new(pen_batches)
   finger = FakeInput.new(touch_batches)
@@ -344,7 +349,7 @@ def new_touch_app(pen_batches = [], touch_batches = [],
   waiter = FakeWaiter.new([pen, finger])
   app = Redoku::App.new(d, [pen], Redoku::Renderer.new(d), waiter,
                         FakeSignals.new, touch_sources: [finger],
-                        clock: clock, rng: rng, generator: generator)
+                        clock: clock, rng: rng, generator: generator, log: log)
   [app, d, clock, waiter, pen, finger]
 end
 
@@ -785,29 +790,47 @@ assert('the action runs while the button is held down, not after it comes up') d
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
-                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED))
+                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED),
+                        log: nil)
   nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
   d.clear_calls
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
-  # THREE updates had reached the panel by the time the hold began: the press
-  # flash, the splash, and the board repaint carrying the new puzzle. Was two
-  # before M2, when New's whole action was one board repaint; the extra one is
-  # the splash, and it counts here for the same reason the others do — 200 ms
-  # is how long a press lasts, not a toll to charge before every action, so
-  # the work starts the moment the tap is recognised and the button stays down
-  # while it happens.
-  assert_equal [3], waiter.updates_at
+  # THE EXACT COUNTS BELOW ASSUME EXACTLY ONE BAR PAINT, and this line is the
+  # assumption rather than a comment about it. EASY hits on its first attempt
+  # on 500 of 500 measured chains, so the hook fires once; one paint follows
+  # iff that single step clears the throttle. Raise ATTEMPTS[:easy] to 60 and
+  # it does not (614/61 = 10 px), the bar paints ZERO times, and every count
+  # below is off by one for a reason nobody would find from the failure. So it
+  # fails here, with a reason.
+  assert_true Redoku::Renderer.progress_fill(
+    1, 1 + Redoku::Sudoku::Generator::ATTEMPTS[:easy]
+  ) >= Redoku::App::PROGRESS_STEP_PX
+
+  # FOUR updates had reached the panel by the time the hold began: the press
+  # flash, the splash, the progress bar moving DURING the dig, and the board
+  # repaint carrying the new puzzle. Was two before M2, when New's whole action
+  # was one board repaint, and three until the bar existed. The bar is the new
+  # one, and it counts here for the same reason the others do — 200 ms is how
+  # long a press lasts, not a toll to charge before every action, so the work
+  # starts the moment the tap is recognised and the button stays down while it
+  # happens.
+  assert_equal [4], waiter.updates_at
   bx, by, bw, bh = Redoku::Layout.board_rect
-  # Both halves of the action go out over board_rect with the chrome
-  # waveform: the splash first, then the finished puzzle. Same rect, because
+  # The splash goes out over board_rect with the chrome waveform, because
   # draw_splash paints exactly board_rect (see Renderer#draw_splash), which is
-  # what lets one flush_board cover either of them.
+  # what lets one flush_board cover it.
   assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
-  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
-  # press, splash, puzzle, release — and the release is after the hold.
-  assert_equal 4, d.updates.size
-  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[3]
+  # Then the bar moved WHILE the generator dug — asserted rather than skipped
+  # over, because it is the half of covering the pause a static splash cannot
+  # do, and this test is already the one that reads the sequence.
+  px, py, pw, ph = Redoku::Renderer.progress_rect
+  assert_equal [px, py, pw, ph, RM2::DU, RM2::FAST_DRAW], d.updates[2]
+  # ...then the finished puzzle, over board_rect again.
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[3]
+  # press, splash, bar, puzzle, release — and the release is after the hold.
+  assert_equal 5, d.updates.size
+  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW], d.updates[4]
 end
 
 assert('the acknowledgement runs each action exactly once') do
@@ -869,7 +892,8 @@ assert('a Level press whose flash is refused still cycles the difficulty') do
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
-                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED))
+                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED),
+                        log: nil)
   lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
   app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
   app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
@@ -884,20 +908,38 @@ assert('a Level press whose flash is refused still cycles the difficulty') do
   # Nothing reached the panel to hold or to put back, so neither happened.
   # The header, which is not a button, went out as usual.
   assert_equal [], waiter.calls
-  # Three updates where M1 had one: the header, then new_puzzle's splash and
-  # its finished board. The deaf display refuses only button rects, so all
-  # three land. The header is still FIRST and still GL16 — that is the M1
-  # decision this test exists for, and the two board flushes after it are the
-  # dig Level gained, not a change to it.
-  assert_equal 3, d.updates.size
+  # COUNTED BY REGION, not by total, and that is the change the progress bar
+  # forced. The deaf display refuses only button rects, and the bar lives
+  # inside board_rect, so the bar lands here too — but this test digs :medium
+  # at the production cap, where the bar paints once per VISIBLE STEP and a
+  # :medium search may take more than one attempt to hit. The total is
+  # therefore not a number this document can predict, while every claim the
+  # test actually makes still is. Same pattern as 'the acknowledgement runs
+  # each action exactly once' above: a tighter question than a bare total, not
+  # a looser one.
+  #
+  # The header is still FIRST and still GL16 — the M1 decision this test
+  # exists for — and there is still exactly one of it.
   hx = Redoku::Layout::HEADER_X
   hy = Redoku::Layout::HEADER_Y
   assert_equal RM2::GL16, d.updates[0][4]
-  assert_equal hx, d.updates[0][0]
-  assert_equal hy, d.updates[0][1]
+  assert_equal [hx, hy], [d.updates[0][0], d.updates[0][1]]
+  assert_equal 1, d.updates.reject { |u| u[0] != hx || u[1] != hy }.size
+  # Then exactly two board flushes: the splash and the finished puzzle. That is
+  # the dig Level gained, unchanged by the bar.
   bx, by, bw, bh = Redoku::Layout.board_rect
-  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
-  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
+  board = d.updates.reject { |u| u[0] != bx || u[1] != by }
+  assert_equal 2, board.size
+  board.each { |u| assert_equal [bx, by, bw, bh, RM2::GL16, 0], u }
+  # ...and the bar moved at least once, in the ink waveform, between them.
+  px, py, = Redoku::Renderer.progress_rect
+  bar = d.updates.reject { |u| u[0] != px || u[1] != py }
+  assert_true bar.size >= 1
+  bar.each { |u| assert_equal RM2::DU, u[4] }
+  # Nothing else reached the panel at all. This is what replaces the old
+  # `assert_equal 3, d.updates.size`: it still says "and nothing else",
+  # without hard-coding a number the bar controls.
+  assert_equal d.updates.size, 1 + board.size + bar.size
 end
 
 assert('a New press whose flash is refused still clears the ink') do
@@ -905,7 +947,8 @@ assert('a New press whose flash is refused still clears the ink') do
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d), waiter,
-                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED))
+                        FakeSignals.new, rng: Redoku::Rng.new(GEN_SEED),
+                        log: nil)
   app.handle_sample(pen_sample(300, 400, true))
   app.handle_sample(pen_sample(340, 440, true))
   app.handle_sample(pen_sample(340, 440, false))
@@ -914,12 +957,26 @@ assert('a New press whose flash is refused still clears the ink') do
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
   app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
   bx, by, bw, bh = Redoku::Layout.board_rect
-  # Two board flushes where M1 had one: the splash, then the board carrying
-  # the new puzzle. Both over board_rect with the chrome waveform, exactly as
-  # the single one was — the refused button flash still costs the player
-  # nothing, which is what this test is for.
-  assert_equal [[bx, by, bw, bh, RM2::GL16, 0],
-                [bx, by, bw, bh, RM2::GL16, 0]], d.updates
+  # Two board flushes with the bar moving between them, where M1 had one board
+  # flush and nothing else: the splash, the bar during the dig, then the board
+  # carrying the new puzzle. Both board flushes go over board_rect with the
+  # chrome waveform, exactly as the single one did — the refused button flash
+  # still costs the player nothing, which is what this test is for.
+  #
+  # COUNTED BY REGION rather than as one literal list, even though this test
+  # digs :easy and the literal could simply have grown a middle entry. The
+  # point is that the two refused-flash tests read alike and neither breaks the
+  # next time an attempt budget moves.
+  board = d.updates.reject { |u| u[0] != bx || u[1] != by }
+  assert_equal 2, board.size
+  board.each { |u| assert_equal [bx, by, bw, bh, RM2::GL16, 0], u }
+  px, py, = Redoku::Renderer.progress_rect
+  bar = d.updates.reject { |u| u[0] != px || u[1] != py }
+  assert_true bar.size >= 1
+  bar.each { |u| assert_equal RM2::DU, u[4] }
+  # And nothing else at all reached the panel — in particular no button rect,
+  # which is the whole subject of the test.
+  assert_equal d.updates.size, board.size + bar.size
   assert_nil app.ink_dirty
   assert_false app.grid.nil?
   assert_true app.running?
@@ -1526,8 +1583,20 @@ assert('the splash reaches the panel before generation starts') do
   input = FakeInput.new
   spy = SpyRng.new(d, GEN_SEED)
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
-                        FakeWaiter.new([input]), FakeSignals.new, rng: spy)
+                        FakeWaiter.new([input]), FakeSignals.new, rng: spy,
+                        log: nil)
   app.new_puzzle
+  # THE EXACT COUNTS BELOW ASSUME EXACTLY ONE BAR PAINT, and this line is the
+  # assumption rather than a comment about it. EASY hits on its first attempt
+  # on 500 of 500 measured chains, so the hook fires once; one paint follows
+  # iff that single step clears the throttle. Raise ATTEMPTS[:easy] to 60 and
+  # it does not (614/61 = 10 px), the bar paints ZERO times, and every count
+  # below is off by one for a reason nobody would find from the failure. So it
+  # fails here, with a reason.
+  assert_true Redoku::Renderer.progress_fill(
+    1, 1 + Redoku::Sudoku::Generator::ATTEMPTS[:easy]
+  ) >= Redoku::App::PROGRESS_STEP_PX
+
   # Exactly one update had reached the panel when the generator took its first
   # draw, and that update is the splash. Nought would mean the splash flush
   # had moved after the dig; more would mean something else is flushing in
@@ -1535,10 +1604,14 @@ assert('the splash reaches the panel before generation starts') do
   assert_equal 1, spy.updates_at_first_draw
   bx, by, bw, bh = Redoku::Layout.board_rect
   assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[0]
-  # ...and the board carrying the finished puzzle came after it, so the splash
-  # is a cover for the pause rather than the last word on it.
-  assert_equal 2, d.updates.size
-  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[1]
+  # Then the progress bar moved DURING the dig -- which is the other half of
+  # covering the pause, and the half a splash alone cannot do.
+  px, py, pw, ph = Redoku::Renderer.progress_rect
+  assert_equal [px, py, pw, ph, RM2::DU, RM2::FAST_DRAW], d.updates[1]
+  # ...and the board carrying the finished puzzle came last, so the splash is
+  # a cover for the pause rather than the last word on it.
+  assert_equal 3, d.updates.size
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
   assert_false app.grid.nil?
 end
 
@@ -1584,4 +1657,204 @@ assert('an App given no rng seeds itself from the clock') do
   app.new_puzzle
   assert_false app.grid.nil?
   assert_true Redoku::Sudoku::Solver.unique?(app.grid.values)
+end
+
+# --- generation: the two failure paths, and the bar that covers the tail.
+#
+# THE DISTINCTION THESE TESTS EXIST FOR: a tier MISS is bad luck and retries
+# without limit, while a FAULT -- a raise, or a nil reply -- is the engine
+# producing nothing at all and retries a bounded few times. Conflating them
+# turns an engine bug into an infinite loop behind a splash on a device whose
+# only escape is the power button.
+
+# Records the lines App writes about generation, so the attempt count can be
+# asserted rather than assumed. Stands in for $stderr.
+class FakeLog
+  attr_reader :lines
+
+  def initialize
+    @lines = []
+  end
+
+  def puts(line)
+    @lines << line
+    nil
+  end
+end
+
+# A generator that misses the requested tier a fixed number of times and then
+# hits it. The only way to drive App's unbounded retry without an unbounded
+# test: a real generator either succeeds by luck or hangs.
+class MissingGenerator < FakeGenerator
+  # `progress:` is threaded through rather than poked in from outside
+  # afterwards. An earlier draft did `gen.instance_variable_set(:@progress,
+  # true)`, which works (mruby-metaprog is declared) but is a test reaching
+  # around a collaborator's own constructor because that constructor forgot an
+  # argument. Fixing the interface is the cheaper repair.
+  def initialize(misses, progress: false)
+    super(progress: progress)
+    @misses = misses
+  end
+
+  def generate(tier, rng, attempts = nil, &block)
+    out = super(tier, rng, attempts, &block)
+    return out if @calls > @misses
+    # An honest reply naming a tier it ACTUALLY reached, which is what a missed
+    # request looks like: never a wrong label. NEVER the requested tier, which
+    # is why this is conditional -- an earlier draft always answered :easy, so a
+    # "miss" at the default difficulty of :easy was a HIT and every retry test
+    # built on it passed while turning the loop exactly once.
+    out.store(:tier, tier == :easy ? :medium : :easy)
+    out
+  end
+end
+
+# Cycles the difficulty until it reaches `tier`, which is how a player gets
+# there -- App has no setter, deliberately, because @difficulty is the Level
+# button's read-out.
+#
+# EACH CYCLE DIGS. cycle_difficulty ends in new_puzzle -> fill_board, so
+# walking :easy -> :master is FOUR generations, not a state change: with a
+# hitting FakeGenerator that is four cheap calls and four log lines, and a test
+# that wants exact counts has to install its real generator AFTERWARDS.
+#
+# `send`, not a public cycle_difficulty. Object#send is available (this gem
+# declares mruby-metaprog since 18cc2f5), so there is no reason to widen App's
+# API for a test.
+def difficulty_to(app, tier)
+  Redoku::Sudoku::Rater::TIERS.size.times do
+    return app if app.difficulty == tier
+    app.send(:cycle_difficulty)
+  end
+  raise "no such difficulty: #{tier}"
+end
+
+assert('a missed tier is asked for again, without limit') do
+  # Get to :master on a generator that HITS, so the four cycling digs do not
+  # land in the counts below, then swap in the misser and a fresh recorder.
+  # instance_variable_set rather than a public seam on App: this is a test
+  # reaching into a test's own subject for one line, not an API anyone ships.
+  app, = new_app(generator: FakeGenerator.new, log: FakeLog.new)
+  difficulty_to(app, :master)
+
+  gen = MissingGenerator.new(4)
+  log = FakeLog.new
+  app.instance_variable_set(:@generator, gen)
+  app.instance_variable_set(:@log, log)
+  app.new_puzzle
+
+  # Five rounds: four misses and the hit. No fallback to an easier tier and no
+  # wrong label -- the board on the glass is a MASTER board or the search is
+  # still running.
+  assert_equal(5, gen.calls)
+  assert_equal(:master, app.achieved_tier)
+  assert_false app.grid.nil?
+  # The rounds are logged, so the real distribution becomes visible in play
+  # instead of staying a bootstrap estimate.
+  assert_equal(1, log.lines.size)
+  assert_true log.lines[0].include?('MASTER')
+  assert_true log.lines[0].include?('5 rounds')
+end
+
+assert('a generation that raises is retried a few times, then the board is kept') do
+  # THE DISTINCTION THAT MATTERS. A tier miss is bad luck and retries for ever;
+  # an exception is a fault and must not, or an engine bug becomes a hang on a
+  # device whose only escape is the power button.
+  broken = FakeGenerator.new(fail_with: 'dig exploded')
+  log = FakeLog.new
+  app, = new_app(generator: broken, log: log)
+  app.new_puzzle          # nothing dug yet, so there is nothing to keep
+
+  assert_equal(Redoku::App::GENERATE_TRIES, broken.calls)
+  assert_nil app.grid
+  # THE LAST LINE IS THE GIVE-UP, NOT THE FAULT. attempt_generation logs one
+  # 'generation failed (...)' per fault and search_for_puzzle logs 'gave up'
+  # after the last of them, so 'dig exploded' is second from the end.
+  assert_equal(Redoku::App::GENERATE_TRIES + 1, log.lines.size)
+  assert_true log.lines[log.lines.size - 1].include?('gave up')
+  assert_true log.lines[log.lines.size - 2].include?('dig exploded')
+  log.lines.each_with_index do |line, i|
+    assert_true line.include?('dig exploded') if i < Redoku::App::GENERATE_TRIES
+  end
+
+  # And with a puzzle already on the board, THAT puzzle survives the fault --
+  # which is the half of the behaviour a fresh App cannot show.
+  app2, = new_app(generator: FakeGenerator.new, log: FakeLog.new)
+  app2.new_puzzle
+  before = app2.grid.givens_s
+  app2.instance_variable_set(:@generator, broken)
+  app2.send(:fill_board)
+  assert_equal(before, app2.grid.givens_s)
+end
+
+assert('a generator that finds nothing at all is treated as a fault, not as luck') do
+  # generate answers nil only when no attempt produced a single logically
+  # solvable board. That is the same kind of event as a raise -- the engine
+  # produced nothing -- so it takes the BOUNDED path. Retrying it for ever
+  # would leave a player staring at a splash.
+  empty = FakeGenerator.new(answer_nil: true)
+  log = FakeLog.new
+  app, d, = new_app(generator: empty, log: log)
+  app.new_puzzle
+  assert_equal(Redoku::App::GENERATE_TRIES, empty.calls)
+  # Nothing was ever dug, so there is no puzzle to keep -- and the board is
+  # painted empty rather than left showing the splash, which is where this
+  # differs from the guard that landed in 75eb7cf. See App#fill_board.
+  assert_nil app.grid
+  bx, by, bw, bh = Redoku::Layout.board_rect
+  assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[d.updates.size - 1]
+  # A nil reply is not an exception, so nothing logs a 'failed' line -- only the
+  # give-up. Worth pinning: it is what distinguishes the two bounded paths in
+  # the log a device run will actually produce.
+  assert_equal(1, log.lines.size)
+  assert_true log.lines[0].include?('gave up')
+end
+
+assert('the progress bar does not reset between retries') do
+  gen = MissingGenerator.new(2, progress: true)
+  d = TestDisplay.new
+  app = Redoku::App.new(d, [FakeInput.new], Redoku::Renderer.new(d),
+                        FakeWaiter.new([]), FakeSignals.new,
+                        rng: Redoku::Rng.new(GEN_SEED), generator: gen,
+                        log: nil)
+  app.new_puzzle
+
+  # Every bar repaint, in order, as the x-extent of its filled rect. A long
+  # wait that started over would read as a hang, and the top rung's tail is an
+  # expected path rather than an exception.
+  bx, by, = Redoku::Renderer.progress_rect
+  fills = []
+  d.rects.each do |x, y, w, _h, gray|
+    fills << w if gray == 0 && x == bx + Redoku::Renderer::PROGRESS_BORDER &&
+                  y == by + Redoku::Renderer::PROGRESS_BORDER
+  end
+  assert_true fills.size >= 2
+  i = 1
+  while i < fills.size
+    assert_true fills[i] >= fills[i - 1]
+    i += 1
+  end
+  # And it never claims to be finished, because it never is until the board
+  # replaces it.
+  assert_true fills[fills.size - 1] <
+              Redoku::Renderer::PROGRESS_W - 2 * Redoku::Renderer::PROGRESS_BORDER
+end
+
+assert('the bar is painted at most once per visible step') do
+  gen = FakeGenerator.new(progress: true, attempts: 150)
+  d = TestDisplay.new
+  app = Redoku::App.new(d, [FakeInput.new], Redoku::Renderer.new(d),
+                        FakeWaiter.new([]), FakeSignals.new,
+                        rng: Redoku::Rng.new(GEN_SEED), generator: gen,
+                        log: nil)
+  app.new_puzzle
+  # E-ink updates are not free: DU + FAST_DRAW is the cheap two-level
+  # waveform and still costs tens of milliseconds, and MASTER's budget fires
+  # the hook up to 150 times per round. Painting per attempt would add 150
+  # refreshes and could double a HARD dig.
+  bx, by, = Redoku::Renderer.progress_rect
+  bar = d.updates.reject { |u| u[0] != bx || u[1] != by }
+  assert_true bar.size <= 25
+  assert_true bar.size >= 2
+  bar.each { |u| assert_equal(RM2::DU, u[4]) }
 end
