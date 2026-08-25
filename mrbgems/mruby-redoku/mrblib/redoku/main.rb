@@ -2,6 +2,10 @@ module Redoku
   PEN_DEVICE = 'Wacom I2C Digitizer'.freeze
   TOUCH_DEVICE = 'pt_mt'.freeze
 
+  # Survives firmware updates (/home/root/redoku is install.sh's home too).
+  # Store creates the directory itself, so a fresh device needs nothing.
+  DB_PATH = '/home/root/redoku/games.db'.freeze
+
   USAGE = <<~TEXT
     usage: redoku [options]
 
@@ -81,8 +85,30 @@ module Redoku
       $stderr.puts "redoku: touchscreen unavailable (#{e.message})"
     end
 
-    App.new(display, inputs, Renderer.new(display),
-            touch_sources: touches).run
+    # Persistence is optional from the game's point of view: a missing or
+    # unopenable DB (unwritable /home/root, a file Store could not even
+    # quarantine) means the player plays on without saves, told why on
+    # stderr. It must never keep the board from starting.
+    store = nil
+    begin
+      store = Store.open(DB_PATH)
+    rescue StandardError => e
+      $stderr.puts "redoku: saves unavailable (#{e.message})"
+    end
+
+    begin
+      App.new(display, inputs, Renderer.new(display),
+              touch_sources: touches, store: store).run
+    ensure
+      # App's own shutdown already closed the store; this is the same
+      # belt-and-braces pass that closes the inputs and display below, for
+      # the path where run itself raised.
+      begin
+        store.close if store && !store.closed?
+      rescue StandardError
+        nil
+      end
+    end
 
     (inputs + touches).each { |input| input.close }
     display.close # closing the connection hands the panel back to xochitl

@@ -6,6 +6,21 @@ MRuby::Gem::Specification.new('mruby-redoku') do |spec|
   # Drawing and input go through the rm2fb client shim.
   spec.add_dependency('mruby-rm2', path: File.expand_path('../mruby-rm2', File.dirname(__FILE__)))
 
+  # Store (M3a) is Ruby over the SQLite3 binding, vendored next door. THE
+  # DEPENDENCY TRAP AGAIN, in its original form: without this line the gem's
+  # own mrbtest state holds no SQLite3 constant, so every Store test dies with
+  # NameError under `make test` while the shipped binary — which links the
+  # whole tree via build_config.rb — works on the device.
+  spec.add_dependency('mruby-sqlite3', path: File.expand_path('../mruby-sqlite3', File.dirname(__FILE__)))
+
+  # Store walks the filesystem itself: make_parent_dirs uses Dir.mkdir /
+  # Dir.exist? (mruby-dir), and open/quarantine use File.exist?, File.rename
+  # and File.dirname (mruby-io). Both ship in the default gembox; these
+  # declarations exist so THIS gem's mrbtest state holds them on its own
+  # account rather than by grace of a gembox it does not control.
+  spec.add_dependency('mruby-io',  core: 'mruby-io')
+  spec.add_dependency('mruby-dir', core: 'mruby-dir')
+
   # Font.draw walks label text with String#each_char, which is string-ext,
   # not core. A gem's mrbtest state holds only its declared dependencies, so
   # an undeclared gem raises NoMethodError under `make test` even though the

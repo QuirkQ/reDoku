@@ -99,7 +99,8 @@ module Redoku
     # `grid` is the puzzle on the board (nil until the first dig), `solution`
     # its answer and `achieved_tier` the tier the generator actually reached —
     # see fill_board for why the last of those is stored rather than shown.
-    attr_reader :difficulty, :ink_dirty, :grid, :solution, :achieved_tier
+    attr_reader :difficulty, :ink_dirty, :grid, :solution, :achieved_tier,
+                :current_save_id
 
     # `rng:` IS the boundary between a varying device and deterministic tests.
     # Its default reads the wall clock, so each launch deals a different
@@ -131,10 +132,16 @@ module Redoku
     # is present in both, device and mrbtest alike (main.rb has written to it
     # since M1), so this is not a workaround for a missing global; it is what
     # lets one line of logging be switched off by a caller.
+    #
+    # `store:` is the save database, injected like `generator:` for the same
+    # reason: tests use tmp files and fakes, never /home/root. It may be nil —
+    # main.rb passes nil when the DB could not be opened — and every use is
+    # guarded, because persistence is a courtesy and the puzzle is the
+    # contract: a broken store costs saves, never the game.
     def initialize(display, sources, renderer, waiter = RM2::Input,
                    signals = RM2, touch_sources: [], clock: RM2,
                    rng: Rng.from_clock, generator: Sudoku::Generator,
-                   log: $stderr)
+                   log: $stderr, store: nil)
       @d = display
       @sources = sources
       @touch = touch_sources
@@ -145,6 +152,7 @@ module Redoku
       @rng = rng
       @generator = generator
       @log = log
+      @store = store
       @difficulty = Sudoku::Rater::TIERS[0]
       # No puzzle until something asks for one. Generation is a search of tens
       # of milliseconds here and PLAN.md §7 budgets a few hundred on the
@@ -153,6 +161,10 @@ module Redoku
       @grid = nil
       @solution = nil
       @achieved_tier = nil
+      # The row the board on the glass came from: the autosave id after a dig
+      # or a resume, nil while nothing is saved. Manual saves are a Task 4
+      # flow; until then this only ever names an autosave row.
+      @current_save_id = nil
       @running = true
       @mode = nil       # :ink, :erase, :button, :none, or nil: no stroke open
       @last = nil       # previous point of this stroke
@@ -188,21 +200,36 @@ module Redoku
     # One paint, not two: new_puzzle's own splash flush would be a second
     # board refresh over a board that has this instant been painted with the
     # splash already on it, so fill_board is called directly instead.
+    #
+    # UNLESS there is an autosave to resume (M3a Task 3). Then the saved game
+    # comes back INSTEAD of the dig: chrome painted with the SAVED difficulty,
+    # the puzzle drawn on top exactly as handle_resume does after a suspend,
+    # one flush. Ink stays blank — strokes were never in the model — and that
+    # is silent on purpose, matching board-after-clear behaviour. The splash
+    # and the progress bar are generation UI; resuming digs nothing, so they
+    # do not belong on the panel.
     def run
-      @renderer.draw_all(@difficulty)
-      @renderer.draw_splash
-      # The empty bar goes out on the SAME flush as the splash, so it costs no
-      # refresh of its own -- the player sees a bar waiting to move rather than
-      # one appearing from nowhere a second later.
-      reset_progress
-      @renderer.draw_progress(0, 1)
-      @renderer.flush_all
-      fill_board
+      if restore_saved
+        @renderer.draw_all(@difficulty)
+        @renderer.draw_puzzle(@grid)
+        @renderer.flush_all
+      else
+        @renderer.draw_all(@difficulty)
+        @renderer.draw_splash
+        # The empty bar goes out on the SAME flush as the splash, so it costs no
+        # refresh of its own -- the player sees a bar waiting to move rather than
+        # one appearing from nowhere a second later.
+        reset_progress
+        @renderer.draw_progress(0, 1)
+        @renderer.flush_all
+        fill_board
+      end
       while @running
         step
         handle_resume if @signals.resumed?
         @running = false if @signals.terminated?
       end
+      shutdown_persistence
       self
     end
 
@@ -842,6 +869,9 @@ module Redoku
         # there is no Check here, by scope.
         @solution = found[:solution]
         @achieved_tier = found[:tier]
+        # The dig is durable before the board is even on the glass: a power
+        # cut an instant later resumes THIS puzzle, not a fresh search.
+        persist_autosave
       end
       @renderer.draw_board
       # @grid is nil only when nothing has EVER been dug and this search
@@ -980,6 +1010,104 @@ module Redoku
     def log_line(text)
       @log.puts('redoku: ' + text) if @log
       self
+    end
+
+    # --- persistence (M3a). Every path here is guarded: a store that is nil,
+    # closed or mid-failure costs saves and log lines, never the game.
+
+    # Brings the autosave back as the live game. False when there is nothing
+    # to resume or the record will not rebuild; the caller then digs a fresh
+    # puzzle, which is the same "an unchanged board beats a wiped one" trade
+    # in the destructive direction.
+    #
+    # Entries are replayed through set_entry rather than handed to the
+    # constructor so a future recognizer's saved entries land the same way
+    # live play does. A stored entry on a GIVEN cell is skipped, not raised:
+    # the store validated only shape, and one inconsistent cell must not
+    # forfeit the other eighty.
+    def restore_saved
+      return false unless @store
+      rec = @store.autosave
+      return false unless rec
+      grid = Sudoku::Grid.parse(rec[:givens])
+      i = 0
+      while i < Sudoku::Grid::CELLS
+        ch = rec[:entries][i]
+        grid.set_entry(i, ch.to_i) if ch != '.' && ch != '0' && !grid.given?(i)
+        i += 1
+      end
+      @grid = grid
+      @solution = values_of_board(rec[:solution])
+      @difficulty = rec[:difficulty]
+      @achieved_tier = rec[:achieved_tier]
+      @current_save_id = rec[:id]
+      log_line('resumed saved game ' + rec[:id].to_s)
+      true
+    rescue StandardError => e
+      log_line('could not restore saved game (' + e.message + ')')
+      @grid = nil
+      @solution = nil
+      @achieved_tier = nil
+      @current_save_id = nil
+      false
+    end
+
+    # Upserts the autosave row for the board on the glass. Called after every
+    # successful dig and again at shutdown; the row is a singleton, so each
+    # call replaces the last. A New or Level press therefore DISCARDS the old
+    # game deliberately — it overwrites the autosave and writes no manual
+    # copy — consistent with how New has always cleared the ink.
+    def persist_autosave
+      return self unless @store && @grid
+      @current_save_id = @store.save_autosave(current_game_record)
+      self
+    rescue StandardError => e
+      log_line('autosave failed (' + e.message + ')')
+      self
+    end
+
+    def current_game_record
+      { difficulty: @difficulty,
+        achieved_tier: @achieved_tier || @difficulty,
+        givens: @grid.givens_s,
+        entries: @grid.entries_s,
+        solution: board_of_values(@solution || []) }
+    end
+
+    # Runs exactly once, after the loop ends — however it ended. That is the
+    # whole of §11's SIGTERM requirement and the Quit button's alike, because
+    # both paths only ever set @running false: one shutdown, not two. The row
+    # is REFRESHED even though the last dig already wrote it, because the dig
+    # and the quit are separate events and the second write is what makes
+    # "crash between them" indistinguishable from "quit cleanly".
+    def shutdown_persistence
+      persist_autosave
+      @store.close if @store
+      self
+    rescue StandardError => e
+      log_line('save on exit failed (' + e.message + ')')
+      self
+    end
+
+    # The engine's values array as an 81-char board string. Grid#str_of is
+    # private and givens-shaped ('.' for empty), which is the right reading of
+    # a solution too — a complete board never holds a 0, but a FAULTED dig can
+    # leave @solution shorter than expected, and this renders '.'s there
+    # rather than raising out of a save path.
+    def board_of_values(values)
+      s = ''
+      values.each { |d| s = s + (d.nil? || d == 0 ? '.' : d.to_s) }
+      while s.size < 81
+        s = s + '.'
+      end
+      s[0, 81]
+    end
+
+    # The inverse, for a restored solution string.
+    def values_of_board(str)
+      out = []
+      str.each_char { |ch| out << (ch == '.' ? 0 : ch.to_i) }
+      out
     end
 
     # Grows the pending damage rect by the brush extent so every pixel the

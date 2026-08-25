@@ -327,13 +327,13 @@ end
 # targets call `conf.gembox 'default'`, which carries mruby-io). The tests that
 # care about the report pass their own recorder.
 def new_app(batches = [], rng: Redoku::Rng.new(GEN_SEED),
-            generator: FakeGenerator.new, log: nil)
+            generator: FakeGenerator.new, log: nil, store: nil)
   d = TestDisplay.new
   input = FakeInput.new(batches)
   signals = FakeSignals.new
   app = Redoku::App.new(d, [input], Redoku::Renderer.new(d),
                         FakeWaiter.new([input]), signals, rng: rng,
-                        generator: generator, log: log)
+                        generator: generator, log: log, store: store)
   [app, d, input, signals]
 end
 
@@ -1857,4 +1857,156 @@ assert('the bar is painted at most once per visible step') do
   assert_true bar.size <= 25
   assert_true bar.size >= 2
   bar.each { |u| assert_equal(RM2::DU, u[4]) }
+end
+
+# --- persistence (M3a Tasks 2 and 3). A real Store over real SQLite, in tmp
+# files; the dig stays a FakeGenerator deal. App takes `store:` exactly like
+# `generator:`, so these tests drive the same seam the device binary does.
+
+def app_store_db(name)
+  '/tmp/redoku_mrbtest_app_' + name + '.db'
+end
+
+def remove_app_db(path)
+  [path, path + '-journal'].each { |f| File.delete(f) if File.exist?(f) }
+end
+
+# Answers every call with a fault, so a test can prove that a broken store
+# costs saves and never the game.
+class ExplodingStore
+  def save_autosave(_game)
+    raise 'disk gone'
+  end
+
+  def autosave
+    nil
+  end
+
+  def closed?
+    false
+  end
+
+  def close
+    nil
+  end
+end
+
+assert('a successful dig writes an autosave row') do
+  path = app_store_db('dig')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, = new_app(store: store)
+  app.new_puzzle
+  rec = store.autosave
+  assert_false rec.nil?
+  assert_equal(app.grid.givens_s, rec[:givens])
+  assert_equal('.' * 81, rec[:entries])
+  assert_equal(:easy, rec[:difficulty])
+  assert_equal(app.achieved_tier, rec[:achieved_tier])
+  assert_equal(rec[:id], app.current_save_id)
+  store.close
+  remove_app_db(path)
+end
+
+assert('a failing store costs saves, not the game') do
+  app, = new_app(store: ExplodingStore.new)
+  app.new_puzzle
+  assert_false app.grid.nil?
+  assert_nil app.current_save_id
+end
+
+assert('an App without a store still digs') do
+  app, = new_app(store: nil)
+  app.new_puzzle
+  assert_false app.grid.nil?
+  assert_nil app.current_save_id
+end
+
+assert('quitting by button persists the autosave and closes the store') do
+  path = app_store_db('quit')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)
+  batches = [[pen_sample(qx + qw / 2, qy + qh / 2, true),
+              pen_sample(qx + qw / 2, qy + qh / 2, false)]]
+  app, = new_app(batches, store: store)
+  app.run
+  assert_false app.running?
+  # Shutdown ran inside run, after the loop — the same code a SIGTERM walks.
+  assert_true store.closed?
+
+  reopened = Redoku::Store.open(path, log: nil)
+  rec = reopened.autosave
+  assert_false rec.nil?
+  assert_equal(app.grid.givens_s, rec[:givens])
+  reopened.close
+  remove_app_db(path)
+end
+
+assert('SIGTERM persists the game and closes the store too') do
+  path = app_store_db('term')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, _d, _input, signals = new_app(store: store)
+  signals.terminated = true # one turn of the loop, then stop
+  app.run
+  assert_false app.running?
+  assert_true store.closed?
+
+  reopened = Redoku::Store.open(path, log: nil)
+  assert_false reopened.autosave.nil?
+  reopened.close
+  remove_app_db(path)
+end
+
+assert('New overwrites the autosave and writes no manual copy') do
+  path = app_store_db('new')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, = new_app(generator: FakeGenerator.new, store: store)
+  app.new_puzzle
+  press_new(app)
+  list = store.games
+  assert_equal(1, list.size)
+  assert_equal(:autosave, list[0][:kind])
+  assert_equal(app.grid.givens_s, store.autosave[:givens])
+  store.close
+  remove_app_db(path)
+end
+
+assert('a fresh App resumes the saved game instead of digging') do
+  path = app_store_db('resume')
+  remove_app_db(path)
+
+  store1 = Redoku::Store.open(path, log: nil)
+  gen1 = FakeGenerator.new
+  app1, _d1, _in1, signals1 = new_app(generator: gen1, store: store1)
+  app1.new_puzzle
+  signals1.terminated = true
+  app1.run
+  assert_true store1.closed?
+
+  store2 = Redoku::Store.open(path, log: nil)
+  gen2 = FakeGenerator.new
+  app2, d2, _in2, signals2 = new_app(generator: gen2, store: store2)
+  signals2.terminated = true
+  app2.run
+
+  # The SAME puzzle, tier for tier, dug ZERO times.
+  assert_equal(app1.grid.givens_s, app2.grid.givens_s)
+  assert_equal(app1.difficulty, app2.difficulty)
+  assert_equal(app1.achieved_tier, app2.achieved_tier)
+  assert_equal(0, gen2.calls)
+  assert_equal(app1.grid.givens_s[0], app2.grid.givens_s[0])
+  assert_equal(1, d2.updates.size)
+  assert_equal([0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                RM2::GC16, RM2::SYNC], d2.updates[0])
+  first_given = nil
+  Redoku::Sudoku::Grid::CELLS.times do |i|
+    first_given = i if first_given.nil? && app2.grid.given?(i)
+  end
+  assert_false first_given.nil?
+  assert_true d2.glyph_in_cell?(first_given)
+  assert_true store2.closed?
+  remove_app_db(path)
 end
