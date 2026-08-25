@@ -1,0 +1,13 @@
+# Dependabot is free for all GitHub repos (public and private).
+# With actions pinned to SHAs (see workflows), Dependabot still updates them:
+# it resolves the new version tag to a SHA and rewrites the version comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
