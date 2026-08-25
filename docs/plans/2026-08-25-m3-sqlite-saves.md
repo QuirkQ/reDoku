@@ -64,8 +64,10 @@ bin/redoku ── Redoku::App ── @store (Redoku::Store)  ── SQLite3::Dat
 - **What is saved:** `givens`, `entries`, `solution` (the Grid class's
   existing 81-char `[0-9.]` strings), requested difficulty, achieved tier,
   timestamps — and, since Task 6, the pen ink: every completed stroke is
-  journaled to a `strokes` table and replayed on resume/load. `entries` is
-  currently always 81 dots until the M3 recognizer lands — the schema is
+  journaled to a `strokes` table and replayed on resume/load. `entries` stays
+  81 dots until M3b's CHECK pass writes recognized digits into it (see
+  PLAN.md §6/§10: recognition is batch-at-CHECK since the 2026-08-25 gameplay
+  change, so this column becomes the persisted check verdict) — the schema is
   future-proofed for it regardless.
 
 ## Schema
@@ -321,8 +323,10 @@ The owner moved ink persistence from "out of scope / v2" into M3a.
 
 - ~~Persisting ink/strokes~~ — pulled INTO M3a as Task 6 by the owner's
   scope extension of 2026-08-25.
-- Saving recognizer entries meaningfully (arrives with the M3 recognizer; the
+- Saving recognizer entries meaningfully (arrives with M3b's CHECK pass; the
   column already exists).
+- Live per-stroke recognition — removed from M3 entirely by the owner's
+  2026-08-25 gameplay change (free draw + batch-at-CHECK); see PLAN.md §6.
 - Export/import of games, statistics, named saves, cloud anything.
 - A delete-all shortcut (ssh + removing the file covers it).
 

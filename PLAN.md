@@ -71,8 +71,13 @@ What that device run did **not** establish, and must not be read as saying:
   The one part of it that *is* measured on hardware is the digitizer reporting
   `BTN_TOOL_RUBBER` at all (§3).
 
-Next: Milestone 3 — the recognizer and the game proper. Erase is no longer part
-of it: the eraser end replaced §6's planned scribble gesture between M2 and M3.
+Next: Milestone 3 — the game proper. **The interaction model changed on
+2026-08-25, by owner decision:** the board is a free drawing surface first
+(notes, stencil work, candidate doodles — all persisted since M3a), and
+recognition is no longer a live per-stroke step. It runs once, as a batch,
+when the player presses CHECK on a board they believe is finished. Erase is no
+longer part of M3 either: the eraser end replaced §6's planned scribble
+gesture between M2 and M3.
 
 ---
 
@@ -291,31 +296,32 @@ also answer to a finger.
    target region (cell / button), and forwards to the active screen.
 2. Pen-down inside a cell starts `StrokeCapture`: points buffered, ink echoed
    immediately as `draw_line` + DU updates (small dirty rects per segment).
-3. Pen idle ≥ 500 ms after pen-up (or writing moves to another cell) →
-   strokes for that cell go to the recognizer.
-4. Recognizer verdict → cell ink region cleared, printed digit drawn (GL16),
-   or rejection feedback (§6).
-5. Buttons (New / Difficulty / Check / Quit) are tap targets for the pen and
-   for a finger alike: a tap = down+up on the same button with little
+3. Pen-up ends the stroke; it is journaled to the store (M3a's strokes table)
+   and nothing else happens. **There is no idle recognition timer.** The pen
+   writes; it does not negotiate with a recognizer mid-game. Ink is the
+   player's to use freely — answers, candidate notes, stencil marks — and is
+   persisted per game, replayed on resume/load.
+4. Buttons (New / Level / Games / Check / Quit) are tap targets for the pen
+   and for a finger alike: a tap = down+up on the same button with little
    movement. The finger's travel budget is the looser of the two (a fingertip
    rolls as it lands), and a touch contact is suppressed while the pen is in
    proximity and for ~500 ms after it leaves — otherwise the palm you write
    with would press Quit. A contact that began under the pen has to lift and
    press again before it counts, so a resting palm cannot fire a button just
    because the pen was set aside.
-6. **Every** button press is acknowledged at the button: it paints inverted
+5. **Every** button press is acknowledged at the button: it paints inverted
    in the ink waveform, the action runs while it is held down, and it paints
    back ~200 ms later (Quit is not painted back — it is leaving). Not
    optional polish: verified on the device, an action whose only visible
    result is elsewhere on the panel, or is pixel-identical to what was
    already there, reads as a button that did nothing at all.
-7. Proximity suppression is recoverable. The pen's proximity state is an
+6. Proximity suppression is recoverable. The pen's proximity state is an
    event latch, and a lost proximity-off packet — the display server drains
    the evdev backlog of a client it thaws, and `SYN_DROPPED` discards torn
    packets — would otherwise disable the touchscreen for the whole session.
    So a resume forgets it, and it also expires after ~1 s of complete pen
    silence.
-8. Touch events reach nothing else. A finger on the board does not ink, does
+7. Touch events reach nothing else. A finger on the board does not ink, does
    not select a cell, and does not disturb a pen stroke in progress.
 
 ### mruby build
@@ -337,11 +343,21 @@ Game Ruby code is compiled to `.mrb` bytecode and linked into the binary.
 
 ## 6. Handwriting recognition
 
+**Model change, 2026-08-25 (owner decision): recognition is batch-at-CHECK,
+not live.** During play the pen is a free pen — answers, notes, stencil work,
+whatever the player wants (§5). No strokes are recognized while the game runs;
+the 500 ms idle timer of the original design is gone, and with it the
+per-stroke recognition cost on the Cortex-A7 and an entire class of
+mid-writing rejection UX. When the player believes the board is finished they
+press CHECK; *then* every ink-marked cell is read once, compared against the
+stored solution, and marked right or wrong (§7). Same recognizer, one
+invocation instead of hundreds, and the code is simpler end to end.
+
 **Algorithm: $P point-cloud recognizer** (Vatavu/Anthony/Wobbrock).
 Chosen over $1 because it's inherently multi-stroke and stroke-order/direction
 invariant — people write 4, 5, 7 with varying stroke counts and orders.
 
-Pipeline per cell entry:
+Pipeline, run per inked cell when CHECK fires:
 
 1. Collect all strokes for the cell (a stroke belongs to the cell containing
    its bounding-box center; consecutive strokes in the same cell accumulate).
@@ -352,8 +368,12 @@ Pipeline per cell entry:
 3. Greedy cloud matching against templates for digits 1–9; score =
    inverse of best cloud distance.
 4. Accept if best score clears a confidence threshold **and** leads the
-   runner-up digit by a margin; else reject: flash the cell border (DU
-   invert-flash), clear the ink, let the user retry.
+   runner-up digit by a margin. A cell that fails both thresholds reads as
+   *not a confident answer*: it is marked wrong like any other mismatch — no
+   mid-game reject-flash exists any more, because nothing interrupts the
+   player while they draw. The recognized digit lands in the game record's
+   `entries` column (the column M3a future-proofed), so the check result is
+   itself persisted and re-checkable without re-recognizing.
 
 **Templates:** ship 3–5 authored samples per digit in `assets/templates/`
 (bootstrap set drawn during development). `redoku --record` runs on-device:
@@ -463,11 +483,15 @@ Pure Ruby, zero device dependencies (fully unit-testable on host).
     [`docs/design/difficulty-rating.md`](docs/design/difficulty-rating.md).**
     Read it before changing any constant in `Rater`; several of these numbers
     are counter-intuitive and were arrived at by being wrong first.
-- **Mistake checking** — the Check button compares entries against the stored
-  solution and marks wrong entries with a small corner ✕ (they stay until
-  edited). When the grid is full and correct, the win screen fires
-  automatically (full GC16 flash, "Solved — n mistakes checked", tap for new
-  puzzle).
+- **Mistake checking** — CHECK is the moment ink becomes an answer. Whatever
+  ink remains on the board when it is pressed *is* the player's solution
+  (the intended workflow: erase your scratch notes first, leave only digits);
+  §6's batch pass reads each inked cell into `entries`, and those entries are
+  compared against the stored solution. Wrong cells get a small corner ✕
+  (they stay until edited); right cells keep their ink untouched. When every
+  cell reads back correct, the win screen fires (full GC16 flash,
+  "Solved — n mistakes checked", tap for new puzzle). Re-checking after edits
+  re-recognizes only cells whose ink changed since the last CHECK.
 
 ## 8. Screen layout & rendering
 
@@ -669,29 +693,50 @@ next milestone reworks difficulty into five technique-gated tiers rather
 than patching these three bands; its own plan document is being written
 separately and is not restated here.
 
-**M3 — the game.** Recognizer + templates + `--record`; entries, Check,
-difficulty menu, win screen, state persistence. This is the "playable via SSH"
-release. Its persistence slice, **M3a**
-([plan](docs/plans/2026-08-25-m3-sqlite-saves.md)), landed first: SQLite
-saves, autosave + resume, and the GAMES menu are host-complete and
-suite-green; device verification (deploy, resume, battery-pull) is still
-pending as of 2026-08-25.
+**M3 — the game.** This is the "playable via SSH" release. On 2026-08-25,
+mid-milestone, the owner redefined how it plays: *"during the game you can
+basically free draw and use the stencil to take notes too. Then when you're
+done you can erase your notes, press a check button and then we can check."*
+The board is therefore a free drawing surface for the whole session — answers,
+candidate notes, stencil marks are all just ink, persisted per game — and the
+recognizer runs exactly once per CHECK press instead of continuously (§6).
+That trade was taken deliberately: less compute on the Cortex-A7, no
+mid-writing rejection UX to design or tune, and a smaller event loop. What it
+cost: nothing the owner wanted — live snapping of digits was the old plan's
+assumption, not a request.
+
+Split into two slices:
+
+- **M3a** ([plan](docs/plans/2026-08-25-m3-sqlite-saves.md)) — persistence and
+  the free-draw surface. Landed host-complete 2026-08-25: SQLite saves
+  (`games` + `strokes`, schema v2), autosave upsert with stable id, resume on
+  launch, GAMES menu (load / save / delete / paginate), and ink that survives
+  quit, relaunch and battery pull via the stroke journal. Device verification
+  (deploy, resume round-trip, battery-pull) still pending.
+- **M3b** — the check flow. Batch recognition at CHECK (§6), corner ✕ marks on
+  wrong cells, `entries` written from the verdicts, win screen on full-and-
+  correct, difficulty menu. Ships the digit templates and `redoku --record`;
+  the corpus test of §9 measures batch accuracy over whole boards rather than
+  live single-cell latency.
 
 **Erase is off that list, and was M3's before it.** The pen's own eraser end
 landed on main on 2026-08-24, between M2 and M3, and supersedes the
 scribble-out gesture M3 was going to have to detect and tune (§6 keeps the
-gesture on the record as a rejected alternative, with what killed it). Three
-consequences for M3 itself. Its recogniser gets *simpler*: with no erase
-gesture to spot, every stroke set in a cell is a digit attempt, and the
-misclassification risk between a scribble and a hurried digit never arises. Its
-budget loses the erase-gesture corpus (§9). And it inherits the primitive it
-was going to need anyway — `Renderer#redraw_cell`, "this cell, repainted from
-the model" — which is exactly the step that replaces a cell's raw ink with a
-printed digit. The one thing M3 must not inherit blindly is the waveform: the
-eraser flushes `DU`, which is two-level, so the first repaint that puts a
-player's `ENTRY_GRAY` entry back on the glass needs `GL16` for that region
-(`App#flush_ink` says so at the point of choice). Erase behaviour on the device
-is manual-verify only, permanently — see §9.
+gesture on the record as a rejected alternative, with what killed it). Under
+the new model the eraser is also how the player clears scratch notes before
+pressing CHECK — load-bearing for the intended workflow, not a nicety. Two
+consequences for M3b. Its recognizer pass gets *simpler*: with no erase
+gesture to spot, whatever ink sits in a cell at CHECK time is one answer
+attempt; there is no mid-play misclassification risk left to manage — an
+ambiguous cell simply marks wrong at check time. Its budget loses the
+erase-gesture corpus (§9). And it inherits the primitive it was going to need
+anyway — `Renderer#redraw_cell`, "this cell, repainted from the model" — which
+is exactly the step that paints a corner ✕ over an inked cell. The one thing
+M3b must not inherit blindly is the waveform: the eraser flushes `DU`, which
+is two-level, so any repaint that puts player ink or an `ENTRY_GRAY` mark back
+on the glass needs `GL16` for that region (`App#flush_ink` says so at the
+point of choice). Erase behaviour on the device is manual-verify only,
+permanently — see §9.
 
 **M4 — the hijack.** Decoy document (`tools/mkdecoy.rb` generates the PDF +
 `{uuid}.metadata`/`.content`, installed by script, one xochitl restart to
@@ -708,8 +753,10 @@ handing the panel back. Fallback if `IN_OPEN` proves noisy or
 cached-away on 3.27: watch the decoy's `.metadata` for `lastOpened` writes
 (`IN_CLOSE_WRITE`) instead — verified empirically in M4's first task.
 
-**v2 parking lot (explicitly out of scope):** pencil marks, recognizer
-calibration UI, statistics/timer, undo, landscape. ("Multiple saved puzzles"
+**v2 parking lot (explicitly out of scope):** live per-stroke digit
+recognition (the pre-2026-08-25 model — superseded by §6's batch-at-CHECK),
+pencil marks, recognizer calibration UI, statistics/timer, undo, landscape.
+("Multiple saved puzzles"
 left the lot for M3a — see
 [`docs/plans/2026-08-25-m3-sqlite-saves.md`](docs/plans/2026-08-25-m3-sqlite-saves.md).)
 
