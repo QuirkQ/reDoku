@@ -415,9 +415,12 @@ tiny dots (< 8 px path) are discarded as accidental touches.
 Pure Ruby, zero device dependencies (fully unit-testable on host).
 
 - **`Grid`** — 81 cells; each is a given, an entry, or empty. Serializes to a
-  string; game state persists as a few `key=value` lines plus that string in
-  `/home/root/redoku/state` (no JSON gem needed) so a SIGTERM/reboot resumes
-  the puzzle.
+  string; game state persists as SQLite rows (multiple saves, autosave +
+  manual) in `/home/root/redoku/games.db`. The original sketch — a few
+  `key=value` lines in `/home/root/redoku/state`, "no JSON gem needed" — was
+  superseded by M3a; see
+  [`docs/plans/2026-08-25-m3-sqlite-saves.md`](docs/plans/2026-08-25-m3-sqlite-saves.md)
+  for the design that shipped.
 - **`Solver`** — two solvers:
   - *Counting backtracker*: randomized order, early-exits at 2 solutions.
     Used for generation (uniqueness) and to store the solution for checking.
@@ -668,7 +671,11 @@ separately and is not restated here.
 
 **M3 — the game.** Recognizer + templates + `--record`; entries, Check,
 difficulty menu, win screen, state persistence. This is the "playable via SSH"
-release.
+release. Its persistence slice, **M3a**
+([plan](docs/plans/2026-08-25-m3-sqlite-saves.md)), landed first: SQLite
+saves, autosave + resume, and the GAMES menu are host-complete and
+suite-green; device verification (deploy, resume, battery-pull) is still
+pending as of 2026-08-25.
 
 **Erase is off that list, and was M3's before it.** The pen's own eraser end
 landed on main on 2026-08-24, between M2 and M3, and supersedes the
@@ -702,7 +709,9 @@ cached-away on 3.27: watch the decoy's `.metadata` for `lastOpened` writes
 (`IN_CLOSE_WRITE`) instead — verified empirically in M4's first task.
 
 **v2 parking lot (explicitly out of scope):** pencil marks, recognizer
-calibration UI, statistics/timer, undo, multiple saved puzzles, landscape.
+calibration UI, statistics/timer, undo, landscape. ("Multiple saved puzzles"
+left the lot for M3a — see
+[`docs/plans/2026-08-25-m3-sqlite-saves.md`](docs/plans/2026-08-25-m3-sqlite-saves.md).)
 
 ## 11. Error handling & edge cases
 

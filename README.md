@@ -99,6 +99,15 @@ bin/redoku play      # refresh the game binary from build/rm2/bin/, then run it
 The board appears on the e-ink panel and pen strokes leave ink inside it:
 `New` clears the ink, `Level` cycles the difficulty label, and `Quit`
 closes the display connection, which hands the screen back to xochitl.
+
+Every game is auto-saved the moment it is dealt (and again on quit), so a
+power loss or reboot resumes exactly where you left off. `GAMES` opens the
+saves list: tap a row to resume that game, arm `DEL` and tap a row to delete
+it, or press `SAVE` to keep a manual copy you can come back to later. Saves
+live in a SQLite database at `/home/root/redoku/games.db`, which survives
+firmware updates; removing it (or `bin/redoku uninstall --purge`) removes
+the saves with everything else.
+
 `play` only ever copies that one binary, so a rebuild reaches the device
 without disturbing the display server; `bin/redoku play --seconds 10`
 runs the game unattended for ten seconds instead of waiting for you,

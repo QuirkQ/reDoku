@@ -100,7 +100,7 @@ module Redoku
     # its answer and `achieved_tier` the tier the generator actually reached —
     # see fill_board for why the last of those is stored rather than shown.
     attr_reader :difficulty, :ink_dirty, :grid, :solution, :achieved_tier,
-                :current_save_id
+                :current_save_id, :screen
 
     # `rng:` IS the boundary between a varying device and deterministic tests.
     # Its default reads the wall clock, so each launch deals a different
@@ -166,6 +166,15 @@ module Redoku
       # flow; until then this only ever names an autosave row.
       @current_save_id = nil
       @running = true
+      # Which screen the presses belong to: :play is the board, :menu is the
+      # GAMES list (M3a). NOT @mode — that name has meant "what this stroke
+      # is doing" since M1 (:ink/:erase/:button/:none) and a second meaning
+      # on the same ivar would make every stroke decision read both. The
+      # plan document's "@mode (:play / :menu)" landed here as @screen for
+      # exactly that reason.
+      @screen = :play
+      @page = 0          # GAMES menu page, when the list spans several
+      @delete_mode = false # GAMES menu: next row tap deletes instead of loads
       @mode = nil       # :ink, :erase, :button, :none, or nil: no stroke open
       @last = nil       # previous point of this stroke
       @button = nil     # the button this stroke went down on, if any
@@ -427,6 +436,12 @@ module Redoku
     # cleared here rather than waited on.
     def handle_resume
       forget_input_state
+      # Repaint whatever screen the player was on: a SIGCONT that lands in
+      # the GAMES menu must bring the menu back, not the board underneath it.
+      if @screen == :menu
+        refresh_menu
+        return self
+      end
       @renderer.draw_all(@difficulty)
       # draw_all paints an EMPTY board, so the puzzle has to go back on top of
       # it: without this the first suspend and resume would silently wipe the
@@ -555,10 +570,12 @@ module Redoku
       @touch_last = [x, y]
       @touch_travel = 0
       @touch_blocked = touch_suppressed?
-      @touch_button = Layout.button_at(x, y)
+      @touch_button = target_at(x, y)
       # A finger on the board (or anywhere off a button) opens a stroke that
       # can only ever do nothing — the same :none the pen uses, and the
       # reason a finger cannot ink: nothing here consults Layout.cell_at.
+      # In the GAMES menu the board area means rows instead, so a finger can
+      # work the saves list exactly as the pen does.
       @touch_mode = @touch_button ? :button : :none
     end
 
@@ -593,7 +610,7 @@ module Redoku
     def touch_tap?(x, y)
       @touch_mode == :button && !@touch_blocked &&
         @touch_travel <= TOUCH_TAP_MAX_PATH &&
-        Layout.button_at(x, y) == @touch_button
+        target_at(x, y) == @touch_button
     end
 
     # @last and @travel are kept for every stroke, not only an inking one:
@@ -611,12 +628,16 @@ module Redoku
       @last = [x, y]
       @travel = 0
       @erased = nil
-      if Layout.cell_at(x, y)
+      if Layout.cell_at(x, y) && @screen == :play
         @button = nil
         @mode = erasing ? :erase : :ink
         erase_at(x, y)
       else
-        @button = Layout.button_at(x, y)
+        # Off the board — or ON it while the GAMES menu is up: the menu's
+        # rows are the board area's other meaning, and a screen that lists
+        # saves is no more a writing surface than the chrome is. The stroke
+        # latches whatever the current screen says this point means.
+        @button = target_at(x, y)
         @mode = @button ? :button : :none
       end
     end
@@ -704,15 +725,200 @@ module Redoku
     # Quit fires.
     def tap?(x, y)
       @mode == :button && @travel <= TAP_MAX_PATH &&
-        Layout.button_at(x, y) == @button
+        target_at(x, y) == @button
     end
 
-    def press(button)
-      case button
+    # What a press point means on the CURRENT screen: the chrome buttons in
+    # play mode; in the GAMES menu those same rects mean BACK/DEL/SAVE/QUIT,
+    # plus PREV/NEXT in the header band and one row per board band. Both
+    # stroke paths (pen and finger) ask this at pen-down and again at lift,
+    # so a stroke that slides to a different meaning cancels itself exactly
+    # as sliding off a button always has.
+    def target_at(x, y)
+      return Layout.button_at(x, y) if @screen == :play
+      menu_target_at(x, y)
+    end
+
+    def menu_target_at(x, y)
+      case Layout.button_at(x, y)
+      when :new   then return :back
+      when :level then return :del
+      when :games then return :save
+      when :quit  then return :quit
+      end
+      b = Layout.menu_button_at(x, y)
+      return b if b
+      # A plain Integer row index (0..8), or nil for dead space.
+      Layout.menu_row_at(x, y)
+    end
+
+    def press(target)
+      if @screen == :menu
+        press_in_menu(target)
+        return self
+      end
+      case target
       when :quit then quit
       when :level then acknowledge(:level) { cycle_difficulty }
       when :new then acknowledge(:new) { new_puzzle }
+      when :games then acknowledge(:games) { open_menu }
       end
+    end
+
+    # Menu presses. Every action repaints its own result (refresh_menu or a
+    # full play-mode repaint), which is why the repainting ones run inside
+    # acknowledge like every other press — and why the acknowledgement's
+    # restore half is what decides whether the flash survives its own
+    # action:
+    #
+    # - BACK/SAVE/PREV/NEXT come back up, because their actions repaint
+    #   regions that include their buttons but no button pass repaints them;
+    # - a ROW stays down (restore: false): loading a save repaints everything
+    #   anyway, and deleting repaints the menu — either way the inverted row
+    #   it flashed is gone under the repaint, and painting it "back" would
+    #   flush stale pixels over whatever the action just put there.
+    #
+    # DEL acknowledges nothing: its feedback is PERSISTENT, not transient —
+    # the armed state is the label sitting inverted (draw_menu_buttons), and
+    # refresh_menu paints exactly that. A press-flash under it would be two
+    # inversions racing to one panel, and a release would un-arm the mode on
+    # the glass while it stayed armed in the model.
+    #
+    # An unknown target cannot reach here (both stroke paths latch nil for
+    # dead space and nil never presses), so the case simply falls through.
+    def press_in_menu(target)
+      case target
+      when :quit then quit
+      when :back then acknowledge(:back) { close_menu }
+      when :del then toggle_delete_mode
+      when :save then acknowledge(:save) { save_manual_copy }
+      when :prev then acknowledge(:prev) { turn_page(-1) }
+      when :next then acknowledge(:next) { turn_page(1) }
+      else
+        return unless target.is_a?(Integer)
+        acknowledge(target, restore: false) { row_chosen(target) }
+      end
+    end
+
+    # --- the GAMES menu (M3a). State: @screen, @page, @delete_mode. Every
+    # transition repaints its own result, and every store touch goes through
+    # the same guarded seam as the autosave paths: persistence is a
+    # courtesy, so a store that raises or answers empty costs menu rows and
+    # log lines, never the game.
+
+    def open_menu
+      @screen = :menu
+      @page = 0
+      @delete_mode = false
+      refresh_menu
+      self
+    end
+
+    def close_menu
+      @screen = :play
+      @page = 0
+      @delete_mode = false
+      @renderer.draw_all(@difficulty)
+      @renderer.draw_puzzle(@grid) if @grid
+      @renderer.flush_all
+      self
+    end
+
+    # The one way the menu reaches glass: read the list, paint everything,
+    # one GC16. Re-reading Store#games per refresh rather than caching is
+    # deliberate — the list only changes through this UI, but "only" is
+    # doing real work there, and the query costs microseconds against an
+    # e-ink refresh measured in tenths.
+    def refresh_menu
+      @renderer.draw_games_menu(games_list, @page, @delete_mode)
+      @renderer.flush_all
+      self
+    rescue StandardError => e
+      log_line('could not show saved games (' + e.message + ')')
+      close_menu
+      self
+    end
+
+    def games_list
+      return [] unless @store
+      @store.games
+    end
+
+    # Page turns clamp instead of wrapping: a list of two pages that walks
+    # NEXT, NEXT would otherwise fling the player from the last row back to
+    # the first past three dead screens' worth of flicker.
+    def turn_page(step)
+      pages = page_count(games_list.size)
+      page = @page + step
+      return self if page < 0 || page >= pages
+      @page = page
+      refresh_menu
+      self
+    end
+
+    def toggle_delete_mode
+      @delete_mode = !@delete_mode
+      refresh_menu
+      self
+    end
+
+    # The tapped row: delete it in delete mode (one tap spends the mode —
+    # arm, tap, done — because a second deliberate gesture is what stands
+    # between a stray finger and someone's save), otherwise load it. A nil
+    # row (a page whose tail the deletion above just shortened) does
+    # nothing; the refresh below still runs for the delete path.
+    def row_chosen(index)
+      game = games_list[index]
+      if @delete_mode
+        @store.delete(game[:id]) if game && @store
+        @delete_mode = false
+        pages = page_count(games_list.size)
+        @page = pages - 1 if @page >= pages
+        refresh_menu
+      elsif game
+        load_game(game[:id])
+      end
+      self
+    end
+
+    # Loads a save and returns to the board. A record that fails validation
+    # (Store#load already skipped-and-logged it) leaves the menu up rather
+    # than dumping the player onto an unchanged board with no explanation:
+    # the menu is where they can pick another save.
+    def load_game(id)
+      rec = @store ? @store.load(id) : nil
+      return self unless rec
+      return self unless adopt_record(rec)
+      @screen = :play
+      @page = 0
+      @delete_mode = false
+      @renderer.draw_all(@difficulty)
+      @renderer.draw_puzzle(@grid)
+      @renderer.flush_all
+      log_line('loaded saved game ' + id.to_s)
+      self
+    end
+
+    # The SAVE action inside the menu: writes a manual copy of whatever is
+    # on the board. Refusals are the store's to report (no board, invalid
+    # record, cap of MANUAL_CAP reached) and are logged there; this side
+    # stays quiet about a nil answer because the reason is already on
+    # stderr. The autosave row keeps its own life regardless — a manual
+    # copy is a bookmark, not a replacement for the crash-safe singleton.
+    def save_manual_copy
+      return self unless @store
+      id = @store.save_manual(@grid ? current_game_record : nil)
+      log_line('saved manual copy ' + id.to_s) if id
+      self
+    rescue StandardError => e
+      log_line('manual save failed (' + e.message + ')')
+      self
+    end
+
+    def page_count(size)
+      count = size / Renderer::MENU_ROWS
+      count += 1 if size % Renderer::MENU_ROWS > 0
+      count == 0 ? 1 : count
     end
 
     # Quit is the one press that is not put back up. Its action is to
@@ -1029,6 +1235,18 @@ module Redoku
       return false unless @store
       rec = @store.autosave
       return false unless rec
+      return false unless adopt_record(rec)
+      log_line('resumed saved game ' + rec[:id].to_s)
+      true
+    end
+
+    # Makes a validated Store record the live game — givens onto a fresh
+    # Grid, entries replayed over it, tier and solution back as they were.
+    # Shared by resume-on-launch (restore_saved) and by loading a save out
+    # of the GAMES menu (load_game), which is the whole point: a record is
+    # either good enough to play from or it is refused whole, never half-
+    # adopted. False (with the board left as it was) on any failure.
+    def adopt_record(rec)
       grid = Sudoku::Grid.parse(rec[:givens])
       i = 0
       while i < Sudoku::Grid::CELLS
@@ -1041,7 +1259,6 @@ module Redoku
       @difficulty = rec[:difficulty]
       @achieved_tier = rec[:achieved_tier]
       @current_save_id = rec[:id]
-      log_line('resumed saved game ' + rec[:id].to_s)
       true
     rescue StandardError => e
       log_line('could not restore saved game (' + e.message + ')')

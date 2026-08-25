@@ -26,18 +26,37 @@ module Redoku
     BTN_ROW1_Y = BOARD_Y + BOARD_W + 80  # 1540
     BTN_ROW2_Y = BTN_ROW1_Y + BTN_H + 20 # 1700
 
-    # Quit sits alone on the second row so a mis-aimed tap cannot end the
-    # game while reaching for New or Level.
+    # GAMES opens the saves menu (M3a), and shares row 2 with QUIT. The
+    # original rule stands with one more button in play: the destructive
+    # button stays at the FAR end of its row — two full widths away from New
+    # and Level, and across a dead gap from Games — so a mis-aimed tap still
+    # cannot end the game while reaching for anything else.
     # Each row is frozen too, not just the outer array: `buttons` hands the
     # shared array out, so a mutable row would be editable process-wide.
     BUTTONS = [
       [:new,   BOARD_X,                          BTN_ROW1_Y, BTN_W, BTN_H].freeze,
       [:level, BOARD_X + BTN_W + BTN_GAP,        BTN_ROW1_Y, BTN_W, BTN_H].freeze,
+      [:games, BOARD_X,                          BTN_ROW2_Y, BTN_W, BTN_H].freeze,
       [:quit,  BOARD_X + 2 * (BTN_W + BTN_GAP),  BTN_ROW2_Y, BTN_W, BTN_H].freeze
     ].freeze
 
+    # PREV / NEXT page the saves list (M3a) from the header band's right
+    # end, clear of the GAMES title at HEADER_X (scale-8 'GAMES' ends at
+    # x 304; PREV starts at 992). Sized to their LABEL_SCALE labels: 'PREV'
+    # is 115 px wide at scale 5, leaving 17 px of margin inside each rect.
+    MENU_BTN_W = 150
+    MENU_BTN_H = 56 # exactly the header band, HEADER_Y..HEADER_Y + 56
+    MENU_PREV_X = BOARD_X + BOARD_W - 2 * MENU_BTN_W - 40 # 992
+    MENU_NEXT_X = BOARD_X + BOARD_W - MENU_BTN_W - 20     # 1162
+
     HEADER_X = BOARD_X
     HEADER_Y = 60
+
+    MENU_BUTTONS = [
+      [:prev, MENU_PREV_X, HEADER_Y, MENU_BTN_W, MENU_BTN_H].freeze,
+      [:next, MENU_NEXT_X, HEADER_Y, MENU_BTN_W, MENU_BTN_H].freeze
+    ].freeze
+
     TITLE_SCALE = 8
     LABEL_SCALE = 5
     BUTTON_LABEL_SCALE = 6
@@ -75,6 +94,38 @@ module Redoku
         px >= x && px < x + w && py >= y && py < y + h
       end
       hit && hit[0]
+    end
+
+    # --- the GAMES menu (M3a). Rows tile the board area exactly as cells
+    # do — BOARD_W / CELL = 9 of them — and PREV/NEXT live in the header
+    # band. Hit-tests mirror button_at / button_rect one for one.
+
+    def self.menu_button_rect(name)
+      found = MENU_BUTTONS.find { |b| b[0] == name }
+      found && found[1, 4]
+    end
+
+    def self.menu_button_at(px, py)
+      hit = MENU_BUTTONS.find do |_name, x, y, w, h|
+        px >= x && px < x + w && py >= y && py < y + h
+      end
+      hit && hit[0]
+    end
+
+    # The menu row (0..8) containing a screen point, or nil off the board.
+    # Whole-board rows: a tap anywhere in the row's 140 px band hits it,
+    # which is the tolerance a list wants.
+    def self.menu_row_at(px, py)
+      return nil if px < BOARD_X || px >= BOARD_X + BOARD_W
+      return nil if py < BOARD_Y || py >= BOARD_Y + BOARD_W
+      (py - BOARD_Y) / CELL
+    end
+
+    def self.menu_row_rect(n)
+      unless n >= 0 && n < SIZE
+        raise ArgumentError, "menu row out of range: #{n}"
+      end
+      [BOARD_X, BOARD_Y + n * CELL, BOARD_W, CELL]
     end
   end
 end

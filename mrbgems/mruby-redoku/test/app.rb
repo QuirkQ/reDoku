@@ -723,7 +723,7 @@ assert('the Quit acknowledgement is held on the panel before the loop stops') do
 end
 
 assert('every button acknowledges its press, at the button, for the same 200 ms') do
-  [:new, :level, :quit].each do |name|
+  [:new, :level, :games, :quit].each do |name|
     d = TestDisplay.new
     input = FakeInput.new
     waiter = TimelineWaiter.new([input], d)
@@ -2008,5 +2008,212 @@ assert('a fresh App resumes the saved game instead of digging') do
   assert_false first_given.nil?
   assert_true d2.glyph_in_cell?(first_given)
   assert_true store2.closed?
+  remove_app_db(path)
+end
+
+# --- the GAMES menu (M3a Task 4). Driven through real taps on real rects,
+# exactly like every button test above, against a real Store over a tmp DB
+# where one is needed. The renderer's own suite covers what the menu looks
+# like; these cover what it DOES.
+
+def game_record(givens, tier, entries = '.' * 81)
+  { difficulty: tier, achieved_tier: tier,
+    givens: givens, entries: entries, solution: SOLVED_81 }
+end
+
+def tap_pen_at(app, x, y)
+  app.handle_sample(pen_sample(x, y, true))
+  app.handle_sample(pen_sample(x, y, false))
+  app
+end
+
+def tap_button(app, name)
+  x, y, w, h = Redoku::Layout.button_rect(name)
+  tap_pen_at(app, x + w / 2, y + h / 2)
+end
+
+# A GAMES-menu action taps the play-mode button whose rect it shares
+# (geometry never moves between modes — see App#menu_target_at).
+def tap_menu_action(app, name)
+  chrome = { back: :new, del: :level, save: :games }
+  tap_button(app, chrome[name])
+end
+
+def tap_menu_row(app, n)
+  x, y, w, h = Redoku::Layout.menu_row_rect(n)
+  tap_pen_at(app, x + w / 2, y + h / 2)
+end
+
+def games_store_db(name)
+  '/tmp/redoku_mrbtest_menu_' + name + '.db'
+end
+
+assert('pressing GAMES opens the saves menu') do
+  app, d, = new_app
+  gx, gy, gw, gh = Redoku::Layout.button_rect(:games)
+  d.clear_calls
+  tap_button(app, :games)
+  assert_equal :menu, app.screen
+  # Press flash at the button, then the whole-screen GC16 the menu arrives
+  # in — the same full paint a mode change deserves.
+  assert_equal [gx, gy, gw, gh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                RM2::GC16, RM2::SYNC], d.updates[1]
+end
+
+assert('BACK leaves the menu and repaints the board') do
+  app, d, = new_app
+  tap_button(app, :games)
+  assert_equal :menu, app.screen
+  d.clear_calls
+  tap_menu_action(app, :back)
+  assert_equal :play, app.screen
+  # BACK's action is close_menu: press flash first, then a full play-mode
+  # repaint, and the release flash lands on a button that is NEW again by
+  # the time it flushes.
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                RM2::GC16, RM2::SYNC], d.updates[1]
+  nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
+  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW],
+               d.updates[d.updates.size - 1]
+end
+
+assert('the GAMES menu is not a writing surface') do
+  app, d, = new_app
+  tap_button(app, :games)
+  d.clear_calls
+  app.handle_sample(pen_sample(300, 400, true))
+  app.handle_sample(pen_sample(340, 440, true))
+  app.handle_sample(pen_sample(380, 480, false))
+  # The board area means rows while the menu is up, so pen strokes there
+  # are taps-or-drags on the list, never ink — and never erasure either.
+  assert_equal [], d.lines
+  assert_nil app.ink_dirty
+  assert_equal :menu, app.screen
+end
+
+assert('tapping a row loads that game and returns to the board') do
+  path = games_store_db('load')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  # cell 0 is blank in EASY_81, so its entry is one this load can replay
+  entries = '1' + '.' * 80
+  id = store.save_manual(game_record(EASY_81, :easy, entries))
+  app, d, = new_app(store: store)
+  assert_nil app.grid
+
+  tap_button(app, :games)
+  tap_menu_row(app, 0)
+
+  assert_equal :play, app.screen
+  assert_false app.grid.nil?
+  assert_equal EASY_81, app.grid.givens_s
+  assert_equal id, app.current_save_id
+  assert_equal :easy, app.difficulty
+  assert_equal 1, app.grid.value_at(0)      # the entry came back too
+  assert_false app.grid.given?(0)
+  # The load announces itself with a full repaint, like every other return
+  # to the board.
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                RM2::GC16, RM2::SYNC], d.updates[d.updates.size - 1]
+  store.close
+  remove_app_db(path)
+end
+
+assert('DEL arms, and the next row tap deletes instead of loading') do
+  path = games_store_db('del')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id1 = store.save_manual(game_record(EASY_81, :easy))
+  store.save_manual(game_record(UNIQUE_81, :easy))
+  app, d, = new_app(store: store)
+
+  tap_button(app, :games)
+  lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
+  d.clear_calls
+  tap_menu_action(app, :del)
+  assert_equal :menu, app.screen
+  # The armed state IS the label sitting inverted, painted by refresh_menu
+  # itself — persistent feedback, not a transient flash.
+  assert_equal 0, d.gray_at(lx + 10, ly + lh / 2)
+
+  tap_menu_row(app, 0)
+  list = store.games
+  # One save is gone. WHICH one is not pinned: both rows were written in
+  # the same second, so their updated_at tie leaves the order Store#games
+  # answers legitimately free — the subject here is the deletion, not the
+  # sort.
+  assert_equal 1, list.size
+  survivor = store.load(list[0][:id])
+  assert_true list[0][:id] == id1 || survivor[:givens] == UNIQUE_81
+  # One tap spent the mode: the label came back up...
+  assert_equal 255, d.gray_at(lx + 10, ly + lh / 2)
+  # ...and the player is still in the menu, looking at what is left.
+  assert_equal :menu, app.screen
+  store.close
+  remove_app_db(path)
+end
+
+assert('SAVE writes a manual copy of the current game') do
+  path = games_store_db('save')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, = new_app(store: store)
+  app.new_puzzle
+  givens_before = app.grid.givens_s
+
+  tap_button(app, :games)
+  tap_menu_action(app, :save)
+
+  manual = store.games.select { |g| g[:kind] == :manual }
+  assert_equal 1, manual.size
+  rec = store.load(manual[0][:id])
+  assert_equal givens_before, rec[:givens]
+  assert_equal app.difficulty, rec[:difficulty]
+  # The autosave singleton keeps its own life beside the bookmark.
+  assert_false store.autosave.nil?
+  assert_equal :menu, app.screen
+  store.close
+  remove_app_db(path)
+end
+
+assert('PREV/NEXT appear for a long list and page two loads its rows') do
+  path = games_store_db('page')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  ids = []
+  10.times { |i|
+    ids << store.save_manual(
+      game_record(i.even? ? EASY_81 : UNIQUE_81, :easy))
+  }
+  app, d, = new_app(store: store)
+
+  tap_button(app, :games)
+  nx, ny, nw, nh = Redoku::Layout.menu_button_rect(:next)
+  assert_equal 0, d.gray_at(nx, ny)             # NEXT framed: 10 > 9 per page
+  assert_equal 0, app.instance_variable_get(:@page)
+
+  tap_pen_at(app, nx + nw / 2, ny + nh / 2)     # onto page two
+  assert_equal 1, app.instance_variable_get(:@page)
+
+  tap_menu_row(app, 0)                          # list position 10
+  assert_equal :play, app.screen
+  assert_true ids.include?(app.current_save_id)
+  rec = store.load(app.current_save_id)
+  assert_equal rec[:givens], app.grid.givens_s
+  store.close
+  remove_app_db(path)
+end
+
+assert('an empty list ignores row taps and stays in the menu') do
+  path = games_store_db('empty')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, = new_app(store: store)
+  tap_button(app, :games)
+  tap_menu_row(app, 4)
+  assert_equal :menu, app.screen
+  assert_true app.running?
+  store.close
   remove_app_db(path)
 end

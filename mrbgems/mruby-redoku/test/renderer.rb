@@ -524,3 +524,136 @@ assert('the progress bar flushes as ink, not as chrome') do
   assert_equal([x, y, w, h, RM2::DU, RM2::FAST_DRAW], d.updates[0])
   assert_equal(1, d.updates.size)
 end
+
+# --- the GAMES menu (M3a). Rows, pagination visibility, the DEL inversion,
+# and every string the menu can print pinned against the font's glyph set.
+
+def game_meta(id, tier)
+  { id: id, kind: :manual, difficulty: tier, achieved_tier: tier,
+    updated_at: 1787668200 }
+end
+
+def menu_ink_in?(d, x, y, w, h)
+  d.rects.any? do |rx, ry, rw, rh, gray|
+    next false if gray == 255
+    rx >= x && ry >= y && rx + rw <= x + w && ry + rh <= y + h
+  end
+end
+
+assert('Renderer.format_stamp renders epochs by hand, correctly') do
+  # Pinned against values computed independently of the algorithm under
+  # test, chosen to exercise what a hand-rolled calendar usually gets
+  # wrong: epoch zero, the 400-year leap rule (2000-02-29), the century
+  # that is NOT leap (2100-01-01), year padding, and both sides of a day
+  # boundary.
+  {
+    0 => '1970-01-01 00:00',
+    951782400 => '2000-02-29 00:00',
+    1234567890 => '2009-02-13 23:31',
+    1787668199 => '2026-08-25 14:29',
+    1787668200 => '2026-08-25 14:30',
+    2145916800 => '2038-01-01 00:00',
+    4102444800 => '2100-01-01 00:00'
+  }.each do |epoch, want|
+    assert_equal want, Redoku::Renderer.format_stamp(epoch)
+  end
+end
+
+assert('every character the GAMES menu can print has a glyph') do
+  # Font.draw silently draws NOTHING for an unknown character, so every
+  # literal AND every dynamically composed string is walked here. A tier
+  # added later with a character the font lacks fails HERE rather than
+  # painting blank rows on the device.
+  literals = ['GAMES', 'PREV', 'NEXT', 'NO SAVED GAMES'] +
+             Redoku::Renderer::MENU_CHROME_LABELS.values
+  stamps = [0, 951782400, 1787668200, 4102444800].map do |e|
+    Redoku::Renderer.format_stamp(e)
+  end
+  Redoku::Sudoku::Rater::TIERS.each do |tier|
+    stamps << '10 ' + tier.to_s.upcase + ' ' +
+              Redoku::Renderer.format_stamp(1787668200)
+  end
+  (literals + stamps).each do |s|
+    s.each_char do |ch|
+      assert_true !Redoku::Font::GLYPHS[ch].nil?,
+                  "no glyph for #{ch.inspect} in #{s.inspect}"
+    end
+  end
+end
+
+assert('draw_games_menu shows the empty state and no pagination') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  r.draw_games_menu([], 0, false)
+  px, py, pw, ph = Redoku::Layout.menu_button_rect(:prev)
+  # 'NO SAVED GAMES' at the splash scale: 14 glyphs, 664 px wide, centred
+  # in the 1260 px board — so its first N starts at x 370, y 200 + 602.
+  assert_equal 0, d.gray_at(370, 802)
+  assert_equal 0, d.gray_at(370 + 4 * 8, 802) # N's right stem
+  # One page or fewer: no PREV/NEXT anywhere — the header's white fill is
+  # the last word in those rects.
+  assert_equal 255, d.gray_at(px + pw / 2, py + ph / 2)
+  nx, ny, nw, nh = Redoku::Layout.menu_button_rect(:next)
+  assert_equal 255, d.gray_at(nx + 5, ny + 5)
+  assert_false menu_ink_in?(d, px, py, pw, ph), 'PREV should be absent'
+  assert_false menu_ink_in?(d, nx, ny, nw, nh), 'NEXT should be absent'
+end
+
+assert('draw_games_menu lists one page of rows without pagination') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  list = (1..3).map { |i| game_meta(i, :medium) }
+  r.draw_games_menu(list, 0, false)
+  # Three rows on a three-row list: ink inside rows 0 and 2, none in the
+  # bands past the list's end.
+  x, y, w, h = Redoku::Layout.menu_row_rect(0)
+  assert_true menu_ink_in?(d, x, y, w, h), 'row 0 missing'
+  x8, y8, w8, h8 = Redoku::Layout.menu_row_rect(8)
+  assert_false menu_ink_in?(d, x8, y8, w8, h8), 'row 8 should be empty'
+  # Each row reads 'N TIER stamp': the leading digit sits ROW_PAD px into
+  # the board, vertically centred ((140 - 42) / 2 = 49 into the band).
+  # Row 0 prints '1 MEDIUM ...'; its '1' is lit at glyph column 2.
+  ty = y + 49
+  assert_equal 0, d.gray_at(x + Redoku::Renderer::ROW_PAD + 2 * 6, ty)
+  px, py, pw, ph = Redoku::Layout.menu_button_rect(:prev)
+  assert_false menu_ink_in?(d, px, py, pw, ph), 'PREV should be absent'
+end
+
+assert('draw_games_menu paginates and shows PREV/NEXT only when needed') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  list = (1..12).map { |i| game_meta(i, :easy) }
+
+  r.draw_games_menu(list, 0, false)
+  px, py, pw, ph = Redoku::Layout.menu_button_rect(:prev)
+  assert_equal 0, d.gray_at(px, py)              # PREV framed
+  nx, ny, nw, _nh = Redoku::Layout.menu_button_rect(:next)
+  assert_equal 0, d.gray_at(nx + nw - 1, ny)     # NEXT framed
+  assert_true menu_ink_in?(d, px, py, pw, ph), 'PREV missing'
+  # Page 0 fills all nine rows; row 0 is list position 1.
+  x, y, w, h = Redoku::Layout.menu_row_rect(0)
+  assert_true menu_ink_in?(d, x, y, w, h)
+
+  d.clear_calls # the second paint starts from a clean sheet, so "row 3 is
+  r.draw_games_menu(list, 1, false) # bare" means THIS paint put no ink there
+  # Page 1 holds positions 10..12: rows 0..2 inked, rows 3..8 bare.
+  assert_true menu_ink_in?(d, x, y, w, h)
+  xr, yr, wr, hr = Redoku::Layout.menu_row_rect(3)
+  assert_false menu_ink_in?(d, xr, yr, wr, hr), 'page 1 should stop at row 2'
+end
+
+assert('draw_games_menu relabels the chrome and inverts DEL when armed') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  list = [game_meta(1, :easy)]
+
+  r.draw_games_menu(list, 0, false)
+  bx, by, bw, bh = Redoku::Layout.button_rect(:new)
+  assert_equal 255, d.gray_at(bx + 10, by + bh / 2) # BACK: white paper
+  lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
+  assert_equal 255, d.gray_at(lx + 10, ly + lh / 2) # DEL: white paper
+
+  r.draw_games_menu(list, 0, true)
+  assert_equal 0, d.gray_at(lx + 10, ly + lh / 2)   # armed: inverted
+  assert_equal 255, d.gray_at(lx, ly)               # border reads white
+end

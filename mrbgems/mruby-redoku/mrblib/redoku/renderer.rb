@@ -49,6 +49,36 @@ module Redoku
     # Redoku::Sudoku` at load, not at some later call.
     SPLASH_SCALE = Layout::TITLE_SCALE
 
+    # --- the GAMES menu (M3a). MENU_ROWS is how many saves one page lists:
+    # the board area tiles into exactly as many 140 px rows as it does cell
+    # rows, because menu_row_rect shares the board's own arithmetic. Referenced
+    # at load time like SPLASH_SCALE above — layout.rb sorts before
+    # renderer.rb in mrblib's load order ('l' < 'r').
+    MENU_ROWS = Layout::BOARD_W / Layout::CELL
+
+    # Row labels print at the button label's scale: '10 MASTER 2026-08-25
+    # 09:05' is 26 glyphs, 774 px at scale 6, inside a 1260 px row with room
+    # to spare; scale 8 would need 1240 px and leave no margin.
+    ROW_SCALE = Layout::BUTTON_LABEL_SCALE
+    ROW_PAD = 40 # left inset of a row's text inside the board
+
+    # Pinned strings for the same reason SPLASH_TEXT is: Font.draw silently
+    # draws NOTHING for a character it has no glyph for, so each literal the
+    # menu can print is pinned here once and glyph-asserted together
+    # (test/renderer.rb) instead of trusted at every call site. The chrome
+    # relabels (BACK / DEL / SAVE) are drawn over the play-mode buttons'
+    # rects while the menu is up; PREV/NEXT name their own Layout buttons.
+    MENU_TITLE_TEXT = 'GAMES'
+    MENU_EMPTY_TEXT = 'NO SAVED GAMES'
+
+    # What the play-mode buttons MEAN while the menu is up. Geometry never
+    # moves — Layout.button_at still answers :new over the BACK rect — so
+    # App routes presses through this same mapping, and flash_button needs
+    # it to find the rect an action name flashes.
+    MENU_CHROME_LABELS = {
+      new: 'BACK', level: 'DEL', games: 'SAVE', quit: 'QUIT'
+    }.freeze
+
     # The exact status text shown while the generator digs. A constant
     # rather than a caller-supplied literal because Font.draw silently draws
     # NOTHING for a character it has no glyph for — a lowercase letter or a
@@ -104,6 +134,44 @@ module Redoku
       return 0 if den <= 0 || num <= 0
       return inner if num >= den
       (inner * num) / den
+    end
+
+    # An epoch as 'YYYY-MM-DD HH:MM', for the GAMES menu's rows. BY HAND,
+    # and deliberately: strftime is not among our declared dependencies, and
+    # the font holds the digits, '-' and ':' this needs and nothing more.
+    # The calendar half is Howard Hinnant's civil-from-days (public domain),
+    # which turns a day count straight into (y, m, d) with no leap-year case
+    # of its own to get wrong — verified in test/renderer.rb against epochs
+    # chosen to exercise the 400-year rule (2000-02-29), the non-rule
+    # centuries, and both sides of a day boundary.
+    #
+    # UTC, not local time: epoch arithmetic knows no zone, and pulling in
+    # mruby-time's localtime for a list label would buy a timezone the rM2
+    # does not have set anyway. The stamp orders saves and dates them; it
+    # does not promise wall-clock.
+    def self.format_stamp(epoch)
+      days = epoch / 86400
+      secs = epoch % 86400
+      hh = secs / 3600
+      mm = (secs % 3600) / 60
+      z = days + 719468
+      era = (z >= 0 ? z : z - 146096) / 146097
+      doe = z - era * 146097
+      yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+      y = yoe + era * 400
+      doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+      mp = (5 * doy + 2) / 153
+      d = doy - (153 * mp + 2) / 5 + 1
+      m = mp < 10 ? mp + 3 : mp - 9
+      y += 1 if m <= 2
+      pad(y, 4) + '-' + pad(m, 2) + '-' + pad(d, 2) + ' ' +
+        pad(hh, 2) + ':' + pad(mm, 2)
+    end
+
+    def self.pad(v, width)
+      s = v.to_s
+      s = '0' + s while s.size < width
+      s
     end
 
     def initialize(display)
@@ -269,6 +337,33 @@ module Redoku
       self
     end
 
+    # The whole GAMES screen in one paint: header (title + pagination),
+    # the board area tiled into save rows (or the empty state), and the
+    # chrome relabelled BACK / DEL / SAVE / QUIT. `list` is Store#games'
+    # metadata — id, kind, difficulty, achieved_tier, updated_at — ordered
+    # by updated_at DESC; `page` indexes it in MENU_ROWS-sized pages;
+    # `delete_mode` holds the DEL button inverted.
+    #
+    # A FULL-screen paint rather than a region patch, on purpose: a menu is
+    # a mode change the player reads as one event, and one GC16 SYNC costs
+    # what a single chrome refresh does. Every caller flushes with
+    # flush_all, so nothing here has to agree with anything about which
+    # regions changed — there are no stale-pixel corners to reason about,
+    # unlike the board repaints where that reasoning is half the code.
+    #
+    # PREV/NEXT appear ONLY when the list actually spans more than one page:
+    # controls for a second page that does not exist would be a lie about
+    # the content, and e-ink holds an image for free so there is no cost to
+    # their absence. Pressing either at a page boundary is a no-op (App's
+    # turn_page), not a visibility change.
+    def draw_games_menu(list, page, delete_mode)
+      @d.fill_rect(0, 0, Layout::SCREEN_W, Layout::SCREEN_H, WHITE)
+      draw_menu_header(list)
+      draw_game_rows(list, page)
+      draw_menu_buttons(delete_mode)
+      self
+    end
+
     # The whole bar, frame and fill, repainted from scratch each time: 620x24
     # is nothing to fill and it removes any question of a stale fill edge
     # surviving a repaint.
@@ -347,10 +442,41 @@ module Redoku
     # convention, over the same rect, and the flash is therefore symmetric.
     # A press arriving in a tenth of a second and a release fading back over
     # a GL16's half second would not read as one gesture.
+    #
+    # `name` is whatever App pressed — a chrome button (:new..:quit), a
+    # menu action (:back/:del/:save) whose rect is the play-mode button it
+    # shares, :prev/:next, or an Integer menu row (M3a). rect_of resolves
+    # all of them; a name nothing answers for raises here rather than
+    # drawing nowhere, because a press acknowledged at no particular place
+    # is a bug worth seeing immediately.
     def flash_button(name, ink, paper)
-      x, y, w, h = Layout.button_rect(name)
-      draw_button(name, x, y, w, h, ink, paper)
+      x, y, w, h = rect_of(name)
+      draw_button(name, x, y, w, h, ink, paper, label_of(name))
       @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
+    end
+
+    # The rect a press target flashes. Menu actions sit on the play-mode
+    # buttons they relabel (MENU_CHROME_LABELS), so BACK inverts the same
+    # 400x140 rect NEW does — geometry never moves between modes, which is
+    # what lets Layout.button_at stay static while meaning changes.
+    def rect_of(target)
+      case target
+      when Integer then Layout.menu_row_rect(target)
+      when :prev   then Layout.menu_button_rect(:prev)
+      when :next   then Layout.menu_button_rect(:next)
+      when :back   then Layout.button_rect(:new)
+      when :del    then Layout.button_rect(:level)
+      when :save   then Layout.button_rect(:games)
+      else Layout.button_rect(target)
+      end
+    end
+
+    # The text a flash paints: a row has none worth printing (its own load
+    # or delete repaints the screen inside the acknowledgement), everything
+    # else prints its name — or its menu label, when the target IS a
+    # relabelled play-mode button.
+    def label_of(target)
+      MENU_CHROME_LABELS[target] || target.to_s.upcase
     end
 
     # The weight draw_board gives boundary `i` (0..9): every third boundary is
@@ -406,20 +532,93 @@ module Redoku
        Layout::BOARD_W, Font::HEIGHT * Layout::TITLE_SCALE]
     end
 
+    # --- the GAMES menu's three regions, in draw_games_menu's order.
+
+    # Title at the header origin (where REDOKU sits in play mode — the menu
+    # replaces the whole screen, so the player is never reading both at
+    # once), pagination at the far end only when more than one page exists.
+    def draw_menu_header(list)
+      x, y, w, h = header_rect
+      @d.fill_rect(x, y, w, h, WHITE)
+      Font.draw(@d, MENU_TITLE_TEXT, Layout::HEADER_X, Layout::HEADER_Y,
+                Layout::TITLE_SCALE, BLACK)
+      return unless list.size > MENU_ROWS
+      draw_button(:prev, *Layout.menu_button_rect(:prev))
+      draw_button(:next, *Layout.menu_button_rect(:next))
+    end
+
+    # The board area as a white field, then either the empty state centred
+    # where the splash sits (a full-board-width message in the splash's own
+    # scale) or up to MENU_ROWS rows from `page`'s slice of `list`.
+    #
+    # Each row reads `N TIER YYYY-MM-DD HH:MM` — position in the WHOLE list
+    # (stable across pages), the tier the saved board actually reached,
+    # and the hand-formatted last-write time. The tier is the achieved one
+    # rather than the requested for the same reason fill_board keeps both:
+    # it is what the board on that save's glass was.
+    def draw_game_rows(list, page)
+      bx, by, bw, bh = Layout.board_rect
+      @d.fill_rect(bx, by, bw, bh, WHITE)
+      if list.empty?
+        tx, ty = centered_origin(MENU_EMPTY_TEXT, SPLASH_SCALE, bx, by, bw, bh)
+        Font.draw(@d, MENU_EMPTY_TEXT, tx, ty, SPLASH_SCALE, BLACK)
+        return
+      end
+      i = 0
+      while i < MENU_ROWS
+        index = page * MENU_ROWS + i
+        break if index >= list.size
+        draw_game_row(index, list[index])
+        i += 1
+      end
+    end
+
+    # One row: text left-aligned ROW_PAD px inside the board, vertically
+    # centred in its 140 px band. Left-aligned rather than centred because
+    # a column of ragged-centred stamps reads as noise; the leading number
+    # gives the eye a fixed rail.
+    def draw_game_row(index, game)
+      _x, y, _w, h = Layout.menu_row_rect(index % MENU_ROWS)
+      label = (index + 1).to_s + ' ' + game[:achieved_tier].to_s.upcase +
+              ' ' + Renderer.format_stamp(game[:updated_at])
+      ty = y + (h - Font::HEIGHT * ROW_SCALE) / 2
+      Font.draw(@d, label, Layout::BOARD_X + ROW_PAD, ty, ROW_SCALE, BLACK)
+    end
+
+    # The chrome with its menu meanings painted on: BACK over New's rect,
+    # DEL over Level's (inverted while delete mode is armed — the inversion
+    # IS the armed state, and it persists until the next row tap spends it),
+    # SAVE over Games', QUIT unchanged.
+    def draw_menu_buttons(delete_mode)
+      Layout.buttons.each do |name, x, y, w, h|
+        label = MENU_CHROME_LABELS[name]
+        if name == :level && delete_mode
+          draw_button(name, x, y, w, h, WHITE, BLACK, label)
+        else
+          draw_button(name, x, y, w, h, BLACK, WHITE, label)
+        end
+      end
+    end
+
     # `ink` and `paper` swap for the pressed state (flash_button). They are
     # the only two grays a button uses, so one pair of arguments inverts the
     # whole thing — frame and label included — with no second code path.
-    def draw_button(name, x, y, w, h, ink = BLACK, paper = WHITE)
+    # `label` overrides the name-derived text: the GAMES menu draws BACK /
+    # DEL / SAVE over the play-mode buttons' rects (draw_menu_buttons), and
+    # a flash of one of those actions has to paint what the button says,
+    # not what it is called underneath.
+    def draw_button(name, x, y, w, h, ink = BLACK, paper = WHITE,
+                    label = nil)
       @d.fill_rect(x, y, w, h, paper)
       @d.fill_rect(x, y, w, BUTTON_BORDER, ink)              # top
       @d.fill_rect(x, y + h - BUTTON_BORDER, w, BUTTON_BORDER, ink) # bottom
       @d.fill_rect(x, y, BUTTON_BORDER, h, ink)              # left
       @d.fill_rect(x + w - BUTTON_BORDER, y, BUTTON_BORDER, h, ink) # right
 
-      label = name.to_s.upcase
+      text = label || name.to_s.upcase
       scale = Layout::BUTTON_LABEL_SCALE
-      lx, ly = centered_origin(label, scale, x, y, w, h)
-      Font.draw(@d, label, lx, ly, scale, ink)
+      lx, ly = centered_origin(text, scale, x, y, w, h)
+      Font.draw(@d, text, lx, ly, scale, ink)
     end
 
     # Where to put `text` at `scale` so it lands centred inside the rect
