@@ -337,6 +337,46 @@ assert('a future schema version is still renamed aside') do
   File.delete(File.join(File.dirname(path), bad)) unless bad.nil?
 end
 
+assert('quarantine takes sidecars along and never overwrites an earlier bad copy') do
+  path = store_db('quarantine_sidecars')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  store.close
+  # Two quarantines driven back to back, each with a database AND a fake hot
+  # journal planted beside it — the state a crash mid-write leaves. Whether
+  # both land inside one wall-clock second decides whether the second copy
+  # is named .bad-<epoch>-2 or carries a fresh epoch; either way BOTH must
+  # survive, and no sidecar may remain beside where the fresh db will live.
+  dir = File.dirname(path)
+  prefix = File.basename(path) + '.bad-'
+
+  File.open(path, 'w') { |f| f.write('first casualty') }
+  File.open(path + '-journal', 'w') { |f| f.write('first hot journal') }
+  store.send(:quarantine, 'test one')
+  File.open(path, 'w') { |f| f.write('second casualty') }
+  File.open(path + '-journal', 'w') { |f| f.write('second hot journal') }
+  store.send(:quarantine, 'test two')
+
+  names = Dir.entries(dir).select { |n| n.start_with?(prefix) }
+  dbs = names.reject { |n|
+    n.end_with?('-journal') || n.end_with?('-wal') || n.end_with?('-shm')
+  }
+  sides = names.select { |n| n.end_with?('-journal') }
+  assert_equal(2, dbs.size)     # neither bad copy was overwritten
+  assert_equal(2, sides.size)   # both journals travelled with their db
+  contents = dbs.map { |n| File.read(File.join(dir, n)) }.sort
+  assert_equal(['first casualty', 'second casualty'], contents)
+  journals = sides.map { |n| File.read(File.join(dir, n)) }.sort
+  assert_equal(['first hot journal', 'second hot journal'], journals)
+  # Nothing sidecar-shaped left next to the path a fresh db will take: a hot
+  # journal recovered against the NEW file would resurrect rolled-back writes.
+  assert_false(File.exist?(path + '-journal'))
+  assert_false(File.exist?(path + '-wal'))
+  assert_false(File.exist?(path + '-shm'))
+  dbs.each { |n| File.delete(File.join(dir, n)) }
+  sides.each { |n| File.delete(File.join(dir, n)) }
+end
+
 assert('strokes round-trip through journal and read-back, across reopen') do
   path = store_db('stroke_roundtrip')
   remove_store_db(path)
@@ -476,6 +516,45 @@ assert('copy_strokes clones a game\'s ink onto its manual copy') do
   assert_equal(96, got[1][:color])
   # The source keeps its own copy.
   assert_equal(2, store.strokes(src).size)
+  store.close
+  remove_store_db(path)
+end
+
+assert('a many-subpath stroke over the point cap round-trips truncated') do
+  path = store_db('stroke_truncate')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_autosave(store_game)
+  cap = Redoku::Store::MAX_STROKE_POINTS
+  # App counts SEGMENTS against the cap while the encoded text also carries a
+  # head point per subpath, so three subpaths of 1000 points each pass capture
+  # and arrive here over the line. The stroke must come back truncated to the
+  # cap — a prefix of what was sent — never refused whole.
+  subs = []
+  n = 0
+  3.times do
+    sub = []
+    1000.times do
+      sub << [n % 1000, (n * 7) % 1000]
+      n += 1
+    end
+    subs << sub
+  end
+  assert_true(n > cap)
+
+  assert_true(store.journal_stroke(id, 0, 4, subs))
+  got = store.strokes(id)
+  assert_equal(1, got.size)
+  back = got[0][:subpaths]
+  flat = []
+  back.each { |s| s.each { |pt| flat << pt } }
+  assert_equal(cap, flat.size)
+  want = []
+  subs.each { |s| s.each { |pt| want << pt } }
+  assert_equal(want[0, cap], flat)          # exactly the first `cap` points
+  assert_equal(subs[0], back[0])            # whole subpaths stay whole...
+  assert_equal(subs[1], back[1])
+  assert_equal(cap - 2000, back[2].size)    # ...and the tail is cut mid-path
   store.close
   remove_store_db(path)
 end

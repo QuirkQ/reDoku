@@ -936,11 +936,16 @@ module Redoku
 
     # The tapped row: delete it in delete mode (one tap spends the mode —
     # arm, tap, done — because a second deliberate gesture is what stands
-    # between a stray finger and someone's save), otherwise load it. A nil
-    # row (a page whose tail the deletion above just shortened) does
-    # nothing; the refresh below still runs for the delete path.
+    # between a stray finger and someone's save), otherwise load it.
+    # `index` is PAGE-LOCAL (0..8, what Layout.menu_row_at answers); the list
+    # is not, so it is resolved against the full games_list through the page
+    # offset — tapping row 0 of the second page must reach list position 9,
+    # not 0. Out of range (a page whose tail a deletion just shortened) is a
+    # no-op, never a crash; the refresh below still runs for the delete path.
     def row_chosen(index)
-      game = games_list[index]
+      list = games_list
+      pos = @page * Renderer::MENU_ROWS + index
+      game = pos >= 0 && pos < list.size ? list[pos] : nil
       if @delete_mode
         @store.delete(game[:id]) if game && @store
         @delete_mode = false
@@ -1385,7 +1390,11 @@ module Redoku
     # copy — consistent with how New has always cleared the ink.
     def persist_autosave
       return self unless @store && @grid
-      @current_save_id = @store.save_autosave(current_game_record)
+      # Kept, not overwritten: a save that fails (store answers nil) leaves
+      # the previous id standing, so strokes keep landing on the row they
+      # belong to instead of being orphaned as journal-less.
+      id = @store.save_autosave(current_game_record)
+      @current_save_id = id if id
       self
     rescue StandardError => e
       log_line('autosave failed (' + e.message + ')')

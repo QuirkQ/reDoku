@@ -352,12 +352,19 @@ module Redoku
         sub.each do |pt|
           return nil unless pt.is_a?(Array) && pt.size == 2 &&
                             pt_in_span?(pt[0]) && pt_in_span?(pt[1])
+          # Truncate at the cap rather than refuse: App counts SEGMENTS while
+          # this count includes each subpath's head point, so a many-subpath
+          # stroke can pass capture legitimately over the line. Dropping its
+          # tail keeps the part that was recorded; refusing whole would make
+          # the stroke vanish from every reload.
+          break if total >= MAX_STROKE_POINTS
           total += 1
           strs << pt[0].to_s + ',' + pt[1].to_s
         end
-        parts << strs.join(' ')
+        parts << strs.join(' ') unless strs.empty?
+        break if total >= MAX_STROKE_POINTS
       end
-      return nil if total > MAX_STROKE_POINTS
+      return nil if parts.empty?
       parts.join('|')
     end
 
@@ -426,6 +433,14 @@ module Redoku
       row ? row[0] : 0
     end
 
+    # Moves an unusable database out of the way and lets a fresh one take
+    # its place. The rollback-journal / WAL / SHM sidecars travel WITH it,
+    # onto the same .bad stem: a hot journal left beside the fresh file
+    # would be recovered into it on the next open, resurrecting the very
+    # writes we are quarantining. The bad-copy name is collision-proof:
+    # two quarantines inside one second share an epoch stamp, so the loop
+    # walks .bad-<epoch>, .bad-<epoch>-2, ... until a free name is found —
+    # a second damaged file must never overwrite the first one's evidence.
     def quarantine(reason)
       begin
         @db.close if @db && !@db.closed?
@@ -433,8 +448,17 @@ module Redoku
         nil
       end
       @db = nil
-      bad = @path + '.bad-' + Time.now.to_i.to_s
-      File.rename(@path, bad) if File.exist?(@path)
+      stamp = Time.now.to_i.to_s
+      stem = @path + '.bad-' + stamp
+      n = 1
+      while File.exist?(stem)
+        n += 1
+        stem = @path + '.bad-' + stamp + '-' + n.to_s
+      end
+      ['-journal', '-wal', '-shm'].each do |side|
+        File.rename(@path + side, stem + side) if File.exist?(@path + side)
+      end
+      File.rename(@path, stem) if File.exist?(@path)
       log_line('save database unusable (' + reason + '); moved aside')
     rescue StandardError => e
       log_line('could not move damaged save database aside (' +

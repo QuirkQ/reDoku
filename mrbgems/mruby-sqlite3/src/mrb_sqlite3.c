@@ -247,6 +247,11 @@ mrb_sqlite3_database_execute(mrb_state *mrb, mrb_value self) {
     mrb_iv_set(mrb, c, mrb_intern_lit(mrb, "eof"), mrb_false_value());
     return c;
   }
+  /* Invariant: the block must never raise. A Ruby exception unwinds past
+   * this C frame without reaching the sqlite3_finalize below, leaking the
+   * statement; the statement is finalized only on normal return. Every
+   * Ruby caller in this tree (Redoku::Store) yields blocks that cannot
+   * raise. */
   while ((r = sqlite3_step(stmt)) == SQLITE_ROW) {
     int ai = mrb_gc_arena_save(mrb);
     args[0] = row_to_value(mrb, stmt);

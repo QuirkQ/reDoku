@@ -2177,30 +2177,90 @@ assert('SAVE writes a manual copy of the current game') do
   remove_app_db(path)
 end
 
-assert('PREV/NEXT appear for a long list and page two loads its rows') do
+# Plants `n` manual rows with DISTINCT pinned timestamps, so Store#games'
+# updated_at DESC order — and therefore which record sits at each list
+# position — is deterministic. Written raw rather than through save_manual,
+# whose rows would all land inside one second and leave the sort free.
+def plant_manual_rows(path, n)
+  seeder = Redoku::Store.open(path, log: nil)
+  seeder.close
+  raw = SQLite3::Database.open(path)
+  boards = [EASY_81, UNIQUE_81]
+  dots = '.' * 81
+  n.times do |i|
+    ts = 1000 + i
+    raw.execute(
+      'INSERT INTO games (kind, difficulty, achieved_tier, givens, entries, ' \
+      "solution, created_at, updated_at) VALUES ('manual', 'easy', 'easy', " \
+      "'#{boards[i % 2]}', '#{dots}', '#{SOLVED_81}', #{ts}, #{ts})")
+  end
+  raw.close
+end
+
+assert('PREV/NEXT appear for a long list and page two loads EXACTLY its rows') do
   path = games_store_db('page')
   remove_app_db(path)
+  plant_manual_rows(path, 11)          # page one: 9 rows, page two: 2
   store = Redoku::Store.open(path, log: nil)
-  ids = []
-  10.times { |i|
-    ids << store.save_manual(
-      game_record(i.even? ? EASY_81 : UNIQUE_81, :easy))
-  }
+  ordered = store.games                # position p holds the 10-p th plant
+  assert_equal(11, ordered.size)
   app, d, = new_app(store: store)
 
   tap_button(app, :games)
   nx, ny, nw, nh = Redoku::Layout.menu_button_rect(:next)
-  assert_equal 0, d.gray_at(nx, ny)             # NEXT framed: 10 > 9 per page
-  assert_equal 0, app.instance_variable_get(:@page)
+  assert_equal 0, d.gray_at(nx, ny)             # NEXT framed: 11 > 9 per page
 
   tap_pen_at(app, nx + nw / 2, ny + nh / 2)     # onto page two
-  assert_equal 1, app.instance_variable_get(:@page)
+  assert_equal(1, app.instance_variable_get(:@page))
 
-  tap_menu_row(app, 0)                          # list position 10
+  # The row shows list position 9 (page offset 1 * 9 rows + row 0), and the
+  # load must reach exactly that record — not position 0 of the full list,
+  # which is what a page-local index into games_list would fetch.
+  tap_menu_row(app, 0)
   assert_equal :play, app.screen
-  assert_true ids.include?(app.current_save_id)
-  rec = store.load(app.current_save_id)
-  assert_equal rec[:givens], app.grid.givens_s
+  assert_equal(ordered[9][:id], app.current_save_id)
+  assert_equal(store.load(ordered[9][:id])[:givens], app.grid.givens_s)
+
+  # Row 1 of the same page is position 10, not 9 again.
+  tap_button(app, :games)                       # reopens at @page = 0
+  tap_pen_at(app, nx + nw / 2, ny + nh / 2)
+  tap_menu_row(app, 1)
+  assert_equal :play, app.screen
+  assert_equal(ordered[10][:id], app.current_save_id)
+  assert_equal(store.load(ordered[10][:id])[:givens], app.grid.givens_s)
+  assert_true store.load(ordered[10][:id])[:givens] !=
+              store.load(ordered[9][:id])[:givens]      # pinned, not luck
+  store.close
+  remove_app_db(path)
+end
+
+assert("DEL on page two deletes EXACTLY the row it shows, not page one's") do
+  path = games_store_db('del_page')
+  remove_app_db(path)
+  plant_manual_rows(path, 11)
+  store = Redoku::Store.open(path, log: nil)
+  ordered = store.games
+  app, = new_app(store: store)
+
+  tap_button(app, :games)
+  nx, ny, nw, nh = Redoku::Layout.menu_button_rect(:next)
+  tap_pen_at(app, nx + nw / 2, ny + nh / 2)     # onto page two
+
+  # An out-of-range tap (this page shows only two of MENU_ROWS rows) is a
+  # no-op: still in the menu, nothing deleted.
+  tap_menu_row(app, 5)
+  assert_equal :menu, app.screen
+  assert_equal(11, store.games.size)
+
+  tap_menu_action(app, :del)                    # arm DEL
+  tap_menu_row(app, 0)                          # displays list position 9
+  left = store.games
+  assert_equal(10, left.size)
+  # Position 9 went — not position 0, which a page-local index would have
+  # hit, and not its neighbour either.
+  assert_true(left.none? { |g| g[:id] == ordered[9][:id] })
+  assert_true(left.any? { |g| g[:id] == ordered[0][:id] })
+  assert_true(left.any? { |g| g[:id] == ordered[8][:id] })
   store.close
   remove_app_db(path)
 end
@@ -2405,8 +2465,175 @@ assert('resume-on-launch brings the ink back with the board') do
                  Redoku::App::INK_WIDTH, Redoku::App::INK_GRAY],
                 [pts[1][0], pts[1][1], pts[2][0], pts[2][1],
                  Redoku::App::INK_WIDTH, Redoku::App::INK_GRAY]], d2.lines
-  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
-                RM2::GC16, RM2::SYNC], d2.updates[0]
+   assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                 RM2::GC16, RM2::SYNC], d2.updates[0]
   store2.close
   remove_app_db(path)
+end
+
+# A store whose autosave upsert fails ONCE on command — answering nil, the
+# way the real Store does for an invalid record or a database error — then
+# behaves. Everything else delegates to the real store it wraps, so strokes
+# and reads stay real.
+class FailOnceAutosaveStore
+  attr_accessor :fail_next
+
+  def initialize(real)
+    @real = real
+    @fail_next = false
+  end
+
+  def save_autosave(game)
+    return nil if @fail_next
+    @real.save_autosave(game)
+  end
+
+  def autosave
+    @real.autosave
+  end
+
+  def journal_stroke(id, color, width, subpaths)
+    @real.journal_stroke(id, color, width, subpaths)
+  end
+
+  def strokes(id)
+    @real.strokes(id)
+  end
+
+  def clear_strokes(id)
+    @real.clear_strokes(id)
+  end
+
+  def closed?
+    @real.closed?
+  end
+
+  def close
+    @real.close
+  end
+end
+
+assert('a failed autosave keeps the current save id and the stroke journal on it') do
+  path = app_store_db('flaky')
+  remove_app_db(path)
+  real = Redoku::Store.open(path, log: nil)
+  flaky = FailOnceAutosaveStore.new(real)
+  app, d, = new_app(store: flaky)
+  app.new_puzzle
+  sid = app.current_save_id
+  assert_false sid.nil?
+
+  flaky.fail_next = true
+  press_new(app)                 # the dig's autosave comes back nil
+  # The old id stands rather than being overwritten with nil: a nil here
+  # would orphan every later stroke onto no row at all.
+  assert_equal(sid, app.current_save_id)
+
+  flaky.fail_next = false
+  draw_ink_stroke(app, d)        # journals against the RETAINED row...
+  assert_equal(1, real.strokes(sid).size)
+
+  press_new(app)                 # ...and a subsequent save succeeds onto it
+  assert_equal(sid, real.autosave[:id])
+  assert_equal(sid, app.current_save_id)
+  draw_ink_stroke(app, d)        # this one lands too (the dig cleared before)
+  assert_equal(1, real.strokes(sid).size)
+  real.close
+  remove_app_db(path)
+end
+
+assert('a stroke drawn on a loaded manual save lands on that row and survives reopen') do
+  path = stroke_app_db('manual_current')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_manual(game_record(EASY_81, :easy))
+  app, d, = new_app(store: store)
+
+  tap_button(app, :games)
+  tap_menu_row(app, 0)
+  assert_equal(id, app.current_save_id)   # the MANUAL row is current now
+
+  pts = draw_ink_stroke(app, d)
+  got = store.strokes(id)
+  assert_equal(1, got.size)
+  assert_equal([[pts[0], pts[1], pts[2]]], got[0][:subpaths])
+
+  # And it is really in the file, not just this session's memory.
+  store.close
+  reopened = Redoku::Store.open(path, log: nil)
+  got = reopened.strokes(id)
+  assert_equal(1, got.size)
+  assert_equal([[pts[0], pts[1], pts[2]]], got[0][:subpaths])
+  reopened.close
+  remove_app_db(path)
+end
+
+assert('an entry stored on a given cell is skipped; every other entry restores') do
+  path = games_store_db('given_entry')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  pristine = Redoku::Sudoku::Grid.parse(EASY_81)
+  given = nil
+  Redoku::Sudoku::Grid::CELLS.times do |i|
+    given = i if given.nil? && pristine.given?(i)
+  end
+  entries = '.' * 81
+  entries[0] = '1'       # cell 0 is blank in EASY_81: a legal stored entry
+  entries[given] = '9'   # impossible on a given: skipped, never fatal
+  store.save_manual(game_record(EASY_81, :easy, entries))
+
+  app, = new_app(store: store)
+  tap_button(app, :games)
+  tap_menu_row(app, 0)
+
+  assert_equal :play, app.screen
+  assert_equal(1, app.grid.value_at(0))                    # restored
+  assert_true(app.grid.given?(given))
+  assert_equal(pristine.value_at(given), app.grid.value_at(given)) # untouched
+  store.close
+  remove_app_db(path)
+end
+
+assert('SAVE at the manual cap refuses through the menu with a logged warning') do
+  path = games_store_db('save_cap')
+  remove_app_db(path)
+  store_log = FakeLog.new
+  store = Redoku::Store.open(path, log: store_log)
+  50.times { |i|
+    store.save_manual(game_record(i.even? ? EASY_81 : UNIQUE_81, :easy))
+  }
+  app, = new_app(log: FakeLog.new, store: store)
+  app.new_puzzle
+
+  tap_button(app, :games)
+  tap_menu_action(app, :save)
+
+  manuals = store.games.select { |g| g[:kind] == :manual }
+  assert_equal(Redoku::Store::MANUAL_CAP, manuals.size)
+  assert_equal :menu, app.screen
+  assert_true app.running?
+  warned = store_log.lines.select { |l|
+    l.include?('cap of ' + Redoku::Store::MANUAL_CAP.to_s)
+  }
+  assert_equal(1, warned.size)
+  store.close
+  remove_app_db(path)
+end
+
+assert('BACK out and reopening the menu clears the armed DEL state') do
+  lx, ly, lw, lh = Redoku::Layout.button_rect(:level)  # DEL shares its rect
+  app, d, = new_app
+  tap_button(app, :games)
+  tap_menu_action(app, :del)
+  assert_equal(0, d.gray_at(lx + 10, ly + lh / 2))     # armed: label inverted
+  assert_true(app.instance_variable_get(:@delete_mode))
+
+  tap_menu_action(app, :back)
+  assert_equal :play, app.screen
+  tap_button(app, :games)
+  assert_equal :menu, app.screen
+  # The armed state did not survive the round trip: one gesture must never
+  # arm deletion across a menu the player left and came back to.
+  assert_false(app.instance_variable_get(:@delete_mode))
+  assert_equal(255, d.gray_at(lx + 10, ly + lh / 2))   # label back up
 end
