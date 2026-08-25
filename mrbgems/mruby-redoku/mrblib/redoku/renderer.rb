@@ -248,6 +248,33 @@ module Redoku
       self
     end
 
+    # Replays journaled pen ink onto the shared buffer: the same draw_line
+    # calls live drawing made, in the same order, at the same width and
+    # gray, from panel ("screen") coordinates stored per stroke (M3a Task 6).
+    # This is the repaint half of stroke persistence — resume-on-launch,
+    # load-from-menu, BACK out of the menu and SIGCONT all come through here,
+    # always BETWEEN the model paints and the flush, so one GC16 carries
+    # puzzle and ink to the glass together.
+    #
+    # `strokes` is App's in-memory journal ({color:, width:, subpaths:}),
+    # already validated by the store; subpaths replay as connected polylines,
+    # never bridging the gap where a stroke left the board.
+    def draw_ink(strokes)
+      strokes.each do |stroke|
+        color = stroke[:color]
+        width = stroke[:width]
+        stroke[:subpaths].each do |sub|
+          i = 1
+          while i < sub.size
+            @d.draw_line(sub[i - 1][0], sub[i - 1][1],
+                         sub[i][0], sub[i][1], width, color)
+            i += 1
+          end
+        end
+      end
+      self
+    end
+
     # One cell, repainted from the model: white paper, the grid lines that
     # touch it, and its digit if `grid` has one. This is what ERASING means
     # here. Ink is drawn straight into the shared framebuffer (App#ink_to →

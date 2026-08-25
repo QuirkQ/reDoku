@@ -12,15 +12,38 @@ module Redoku
   #
   # There is no Regexp in this build (no regexp gem in the default gembox),
   # so board strings are validated by hand rather than with /\A[0-9.]{81}\z/.
+  # Schema v2 adds the stroke journal (Task 6): one row per completed pen
+  # ink stroke, belonging to its game row and dying with it (the FK is real
+  # — foreign_keys is turned ON per connection in SCHEMA_SQL, because SQLite
+  # enforcement is off by default and off PER CONNECTION at that). Points are
+  # stored as TEXT in panel ("screen") coordinates — the frame Renderer
+  # repaints from — encoded 'x,y x,y|x,y' : points joined by spaces, a '|'
+  # between subpaths where the stroke left the board and came back. Text, not
+  # BLOB, deliberately: the binding binds Strings as text, and its reader
+  # truncates TEXT columns at the first NUL byte (mrb_sqlite3.c uses
+  # mrb_str_new_cstr for SQLITE_TEXT), so a binary encoding could not
+  # round-trip through it.
+  #
+  # Caps keep a pathological session from bloating the file for ever:
+  # STROKES_CAP rows per game (oldest dropped, logged) and MAX_STROKE_POINTS
+  # recorded points per stroke (App stops recording past it; live ink keeps
+  # flowing either way).
   class Store
-    VERSION = 1
+    VERSION = 2
     MANUAL_CAP = 50
+    STROKES_CAP = 2000
+    MAX_STROKE_POINTS = 2048
 
     BOARD_CHARS = '0123456789.'
 
+    # A replayed draw_line coordinate must fit what Display#draw_line accepts
+    # (RM2_MAX_SPAN in src/display.c); Pen.to_screen cannot leave the panel,
+    # but the validator reads back rows the store did not write.
+    PTS_MAX = 65_535
+
     SCHEMA_SQL = <<~SQL
       PRAGMA synchronous = FULL;
-      PRAGMA user_version = 1;
+      PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS games (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         kind          TEXT    NOT NULL CHECK (kind IN ('autosave','manual')),
@@ -33,24 +56,45 @@ module Redoku
         updated_at    INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_games_updated ON games(updated_at DESC);
+      CREATE TABLE IF NOT EXISTS strokes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+        seq        INTEGER NOT NULL,
+        color      INTEGER NOT NULL,
+        width      INTEGER NOT NULL,
+        pts        TEXT    NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_strokes_game ON strokes(game_id, seq);
     SQL
 
     FULL_COLS =
       'id, kind, difficulty, achieved_tier, givens, entries, solution, ' \
       'created_at, updated_at'
 
-    def self.open(path, log: $stderr)
-      new(path, log)
+    def self.open(path, log: $stderr, stroke_cap: STROKES_CAP)
+      new(path, log, stroke_cap)
     end
 
-    def initialize(path, log)
+    def initialize(path, log, stroke_cap)
       @path = path
       @log = log
       @db = nil
+      # Injectable for the same reason `log:` is: the cap is real policy that
+      # a test must be able to exercise without writing 2000 rows through
+      # synchronous=FULL first.
+      @stroke_cap = stroke_cap > 0 ? stroke_cap : 1
       self.class.make_parent_dirs(File.dirname(path))
       open_database
     end
 
+    # Upserts the singleton autosave row, KEEPING ITS ID once it exists
+    # (UPDATE in place rather than the v1 delete-and-reinsert). The id is
+    # what the stroke journal hangs off, and a clean-quit autosave refresh
+    # would otherwise cascade every journaled stroke of the session into
+    # the void. A New press still discards deliberately — App clears that
+    # game's strokes itself (see App#fill_board), and this method stays a
+    # pure upsert.
     def save_autosave(game)
       vals = normalize(game)
       unless vals
@@ -58,17 +102,28 @@ module Redoku
         return nil
       end
       now = Time.now.to_i
+      id = nil
       begin
         @db.transaction
-        @db.execute('DELETE FROM games WHERE kind = ?', ['autosave'])
-        insert_row('autosave', vals, now)
+        rows = @db.execute("SELECT id FROM games WHERE kind = 'autosave'")
+        if rows.empty?
+          insert_row('autosave', vals, now)
+          id = @db.last_insert_rowid
+        else
+          id = rows[0][0]
+          @db.execute(
+            'UPDATE games SET difficulty = ?, achieved_tier = ?, ' \
+            'givens = ?, entries = ?, solution = ?, updated_at = ? ' \
+            'WHERE id = ?',
+            [vals[0], vals[1], vals[2], vals[3], vals[4], now, id])
+        end
         @db.commit
       rescue StandardError => e
         rollback_quietly
         log_line('autosave failed (' + e.message + ')')
         return nil
       end
-      @db.last_insert_rowid
+      id
     end
 
     def autosave
@@ -108,6 +163,87 @@ module Redoku
         return nil
       end
       @db.last_insert_rowid
+    end
+
+    # --- the stroke journal (Task 6). One INSERT per completed stroke, no
+    # transaction ceremony: SQLite's own autocommit gives the write its
+    # durability against synchronous=FULL, which is the same crash-safe bar
+    # the autosave holds. The seq and the cap check each cost one indexed
+    # query against a table that stays small by construction.
+
+    # Appends one stroke for `game_id`. `subpaths` is an array of arrays of
+    # [x, y] panel points (one array per uninterrupted run of the stroke);
+    # false on any refusal, logged. The stroke must outlive the game row it
+    # belongs to — the FK cascade sees to that — so a nil id refuses.
+    def journal_stroke(game_id, color, width, subpaths)
+      return false unless game_id
+      encoded = self.class.encode_pts(subpaths)
+      unless encoded
+        log_line('refused to journal a stroke: bad points')
+        return false
+      end
+      begin
+        seq = @db.execute(
+          'SELECT COALESCE(MAX(seq), 0) + 1 FROM strokes WHERE game_id = ?',
+          [game_id])[0][0]
+        @db.execute(
+          'INSERT INTO strokes (game_id, seq, color, width, pts, ' \
+          'created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          [game_id, seq, color, width, encoded, Time.now.to_i])
+      rescue StandardError => e
+        log_line('stroke journal failed (' + e.message + ')')
+        return false
+      end
+      enforce_stroke_cap(game_id)
+      true
+    end
+
+    # Every journaled stroke of a game, oldest first, decoded and validated.
+    # A corrupt row is skipped and logged, never raised — unchanged ink
+    # beats a wiped board, same rule as the game rows above.
+    def strokes(game_id)
+      return [] unless game_id
+      rows = @db.execute(
+        'SELECT color, width, pts FROM strokes ' \
+        'WHERE game_id = ? ORDER BY seq ASC, id ASC', [game_id])
+      out = []
+      rows.each do |color, width, pts|
+        subpaths = self.class.decode_pts(pts)
+        if subpaths.nil? || !int?(color) || color < 0 || color > 255 ||
+           !int?(width) || width < 1
+          log_line('skipped corrupt stroke row for game ' + game_id.to_s)
+          next
+        end
+        out << { color: color, width: width, subpaths: subpaths }
+      end
+      out
+    rescue StandardError => e
+      log_line('could not read strokes (' + e.message + ')')
+      []
+    end
+
+    def clear_strokes(game_id)
+      return false unless game_id
+      @db.execute('DELETE FROM strokes WHERE game_id = ?', [game_id])
+      true
+    rescue StandardError => e
+      log_line('could not clear strokes (' + e.message + ')')
+      false
+    end
+
+    # A manual copy takes the ink with it, so loading either restores the
+    # same board AND the same marks on it.
+    def copy_strokes(from_id, to_id)
+      return false unless from_id && to_id
+      @db.execute(
+        'INSERT INTO strokes (game_id, seq, color, width, pts, created_at) ' \
+        'SELECT ?, seq, color, width, pts, ? FROM strokes WHERE game_id = ? ' \
+        'ORDER BY seq ASC, id ASC', [to_id, Time.now.to_i, from_id])
+      enforce_stroke_cap(to_id)
+      true
+    rescue StandardError => e
+      log_line('could not copy strokes (' + e.message + ')')
+      false
     end
 
     def games
@@ -183,13 +319,95 @@ module Redoku
 
     private
 
+    # Keeps one game's journal bounded: past the cap, the OLDEST strokes go
+    # (they are the ones the player is least likely to still be looking at)
+    # and the fact is logged. Called after each append, where it normally
+    # costs one COUNT and deletes nothing.
+    def enforce_stroke_cap(game_id)
+      count = @db.execute(
+        'SELECT COUNT(*) FROM strokes WHERE game_id = ?', [game_id])[0][0]
+      excess = count - @stroke_cap
+      return if excess <= 0
+      @db.execute(
+        'DELETE FROM strokes WHERE id IN (SELECT id FROM strokes ' \
+        'WHERE game_id = ? ORDER BY seq ASC, id ASC LIMIT ?)',
+        [game_id, excess])
+      log_line('dropped ' + excess.to_s + ' oldest stroke(s) for game ' +
+               game_id.to_s + ': cap of ' + @stroke_cap.to_s + ' reached')
+    rescue StandardError => e
+      log_line('stroke cap check failed (' + e.message + ')')
+    end
+
+    # --- the points codec. 'x,y x,y|x,y': points space-joined inside a
+    # subpath, subpaths '|'-joined. Panel coordinates, integers only — no
+    # sign, no decimals, nothing the parser has to guess about.
+
+    def self.encode_pts(subpaths)
+      return nil unless subpaths.is_a?(Array) && !subpaths.empty?
+      total = 0
+      parts = []
+      subpaths.each do |sub|
+        return nil unless sub.is_a?(Array) && !sub.empty?
+        strs = []
+        sub.each do |pt|
+          return nil unless pt.is_a?(Array) && pt.size == 2 &&
+                            pt_in_span?(pt[0]) && pt_in_span?(pt[1])
+          total += 1
+          strs << pt[0].to_s + ',' + pt[1].to_s
+        end
+        parts << strs.join(' ')
+      end
+      return nil if total > MAX_STROKE_POINTS
+      parts.join('|')
+    end
+
+    def self.decode_pts(s)
+      return nil unless s.is_a?(String) && !s.empty?
+      subpaths = []
+      s.split('|').each do |part|
+        sub = []
+        part.split(' ').each do |pair|
+          xy = pair.split(',')
+          return nil unless xy.size == 2 &&
+                            unsigned_int?(xy[0]) && unsigned_int?(xy[1])
+          x = xy[0].to_i
+          y = xy[1].to_i
+          return nil unless pt_in_span?(x) && pt_in_span?(y)
+          sub << [x, y]
+        end
+        return nil if sub.empty?
+        subpaths << sub
+      end
+      subpaths.empty? ? nil : subpaths
+    end
+
+    def self.pt_in_span?(v)
+      v.is_a?(Integer) && v >= 0 && v <= PTS_MAX
+    end
+
+    def self.unsigned_int?(s)
+      return false unless s.is_a?(String) && !s.empty?
+      s.each_char { |ch| return false unless ch >= '0' && ch <= '9' }
+      true
+    end
+
+    def int?(v)
+      v.is_a?(Integer)
+    end
+
     def open_database
       existed = File.exist?(@path)
       @db = SQLite3::Database.open(@path)
       if existed
         begin
+          # 0 is a brand-new file (or one a crash left before the first
+          # write); 1 is the v1 layout, which migrates by simply running the
+          # v2 DDL — CREATE TABLE IF NOT EXISTS strokes adds exactly what v1
+          # lacks and touches nothing else, so every saved game survives.
+          # Anything GREATER than VERSION belongs to a future build we
+          # cannot second-guess: rename aside per the prime directive.
           version = read_version
-          if version != 0 && version != VERSION
+          if version > VERSION
             quarantine('unexpected schema version ' + version.to_s)
             @db = SQLite3::Database.open(@path)
           end
@@ -199,6 +417,7 @@ module Redoku
         end
       end
       @db.exec(SCHEMA_SQL)
+      @db.exec('PRAGMA user_version = ' + VERSION.to_s)
     end
 
     def read_version

@@ -2217,3 +2217,196 @@ assert('an empty list ignores row taps and stays in the menu') do
   store.close
   remove_app_db(path)
 end
+
+# --- stroke persistence (M3a Task 6). Ink is journaled per completed
+# stroke, replayed on every repaint, and dies with its game row. Driven the
+# same way as every test above: real samples through handle_sample, a real
+# Store over a tmp DB.
+
+def stroke_app_db(name)
+  '/tmp/redoku_mrbtest_strokes_' + name + '.db'
+end
+
+# Draws one three-sample ink stroke and returns the screen points it produced.
+def draw_ink_stroke(app, d)
+  s1 = pen_sample(300, 400, true)
+  s2 = pen_sample(340, 440, true)
+  s3 = pen_sample(340, 440, false) # lift: repeats the position
+  app.handle_sample(s1)
+  app.handle_sample(s2)
+  app.handle_sample(s3)
+  [screen_of(s1), screen_of(s2), screen_of(s3)]
+end
+
+assert('a completed ink stroke is journaled to the store immediately') do
+  path = stroke_app_db('journal')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, d, = new_app(store: store)
+  app.new_puzzle
+  sid = app.current_save_id
+  assert_false sid.nil?
+
+  pts = draw_ink_stroke(app, d)
+
+  got = store.strokes(sid)
+  assert_equal 1, got.size
+  assert_equal Redoku::App::INK_GRAY, got[0][:color]
+  assert_equal Redoku::App::INK_WIDTH, got[0][:width]
+  # Replay data identical to what was drawn: same points, same order — the
+  # closing zero-length segment records its (repeated) endpoint like any
+  # other sample, which replays as a line of no length.
+  assert_equal [[pts[0], pts[1], pts[2]]], got[0][:subpaths]
+
+  # A stroke drawn BEFORE any dig exists buffers in memory only...
+  app2, d2, = new_app(store: store)
+  draw_ink_stroke(app2, d2)
+  assert_equal 1, app2.ink_strokes.size
+  assert_equal [], store.strokes(nil)
+
+  # ...and dies with the unsaved board at the first dig, exactly as its ink
+  # died on the glass under the splash.
+  app2.new_puzzle
+  assert_equal [], app2.ink_strokes
+  assert_false app2.current_save_id.nil?
+  assert_equal [], store.strokes(app2.current_save_id)
+  store.close
+  remove_app_db(path)
+end
+
+assert('a stroke that left the board journals two subpaths') do
+  path = stroke_app_db('gap')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, d, = new_app(store: store)
+  app.new_puzzle
+  s1 = pen_sample(300, 400, true)
+  s2 = pen_sample(340, 440, true)
+  s3 = pen_sample(340, 1600, true)  # dragged off the board
+  s4 = pen_sample(380, 480, true)   # back on
+  s5 = pen_sample(400, 500, false)  # lifted on the board
+  [s1, s2, s3, s4].each { |s| app.handle_sample(s) }
+  app.handle_sample(s5)
+  p1 = screen_of(s1)
+  p2 = screen_of(s2)
+  p4 = screen_of(s4)
+  p5 = screen_of(s5)
+  got = store.strokes(app.current_save_id)
+  assert_equal 1, got.size
+  # The off-board excursion is a GAP: two subpaths, and replay must never
+  # bridge it.
+  subs = got[0][:subpaths]
+  assert_equal 2, subs.size
+  assert_equal [p1, p2], subs[0]
+  assert_equal p4, subs[1][0]
+  assert_equal p5, subs[1][1]
+  store.close
+  remove_app_db(path)
+end
+
+assert('New clears the persisted strokes along with the ink') do
+  path = stroke_app_db('new_clears')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, d, = new_app(store: store)
+  app.new_puzzle
+  sid = app.current_save_id
+  draw_ink_stroke(app, d)
+  assert_equal 1, store.strokes(sid).size
+
+  press_new(app)
+  assert_equal sid, app.current_save_id   # stable id, fresh board
+  assert_equal [], app.ink_strokes
+  assert_equal [], store.strokes(sid)
+
+  # And a Level press is a New underneath, so it clears too.
+  draw_ink_stroke(app, d)
+  press_level(app)
+  assert_equal [], store.strokes(app.current_save_id)
+  store.close
+  remove_app_db(path)
+end
+
+assert('SAVE copies the strokes into the manual copy') do
+  path = stroke_app_db('save_copies')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, d, = new_app(store: store)
+  app.new_puzzle
+  pts = draw_ink_stroke(app, d)
+
+  tap_button(app, :games)
+  tap_menu_action(app, :save)
+
+  manual = store.games.select { |g| g[:kind] == :manual }
+  assert_equal 1, manual.size
+  got = store.strokes(manual[0][:id])
+  assert_equal 1, got.size
+  assert_equal [[pts[0], pts[1], pts[2]]], got[0][:subpaths]
+  # The autosave keeps its own copy too.
+  assert_equal 1, store.strokes(app.current_save_id).size
+  store.close
+  remove_app_db(path)
+end
+
+assert('loading a save replays its ink onto the board') do
+  path = stroke_app_db('load_replay')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_manual(game_record(EASY_81, :easy))
+  store.journal_stroke(id, Redoku::App::INK_GRAY, Redoku::App::INK_WIDTH,
+                       [[[200, 300], [220, 320]], [[240, 340], [260, 360]]])
+  app, d, = new_app(store: store)
+
+  tap_button(app, :games)
+  d.clear_calls
+  tap_menu_row(app, 0)
+
+  assert_equal :play, app.screen
+  assert_equal id, app.current_save_id
+  assert_equal 1, app.ink_strokes.size
+  # The replay went through the SAME painter live drawing uses: one polyline
+  # per subpath, at the journal's width and gray — and never a segment
+  # bridging the gap between the two subpaths.
+  assert_equal [[200, 300, 220, 320, Redoku::App::INK_WIDTH,
+                 Redoku::App::INK_GRAY],
+                [240, 340, 260, 360, Redoku::App::INK_WIDTH,
+                 Redoku::App::INK_GRAY]], d.lines
+  store.close
+  remove_app_db(path)
+end
+
+assert('resume-on-launch brings the ink back with the board') do
+  path = stroke_app_db('resume_ink')
+  remove_app_db(path)
+
+  store1 = Redoku::Store.open(path, log: nil)
+  app1, d1, _in1, signals1 = new_app(store: store1)
+  app1.new_puzzle
+  pts = draw_ink_stroke(app1, d1)
+  signals1.terminated = true
+  app1.run   # SIGTERM path: refreshes the autosave row, keeps the strokes
+  assert_true store1.closed?
+
+  store2 = Redoku::Store.open(path, log: nil)
+  app2, d2, _in2, signals2 = new_app(store: store2)
+  signals2.terminated = true
+  d2.clear_calls
+  app2.run
+
+  # Same puzzle AND the same marks on it, replayed before the single GC16.
+  assert_equal app1.grid.givens_s, app2.grid.givens_s
+  assert_equal 1, app2.ink_strokes.size
+  assert_equal [[pts[0], pts[1], pts[2]]],
+               app2.ink_strokes[0][:subpaths]
+  # The replayed polyline: the real segment and the closing zero-length one,
+  # exactly as live drawing drew them.
+  assert_equal [[pts[0][0], pts[0][1], pts[1][0], pts[1][1],
+                 Redoku::App::INK_WIDTH, Redoku::App::INK_GRAY],
+                [pts[1][0], pts[1][1], pts[2][0], pts[2][1],
+                 Redoku::App::INK_WIDTH, Redoku::App::INK_GRAY]], d2.lines
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                RM2::GC16, RM2::SYNC], d2.updates[0]
+  store2.close
+  remove_app_db(path)
+end

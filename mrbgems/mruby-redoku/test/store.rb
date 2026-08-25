@@ -45,7 +45,7 @@ assert('save_autosave round-trips through load and autosave') do
   remove_store_db(path)
 end
 
-assert('save_autosave upserts one singleton row') do
+assert('save_autosave upserts one singleton row, keeping its id') do
   path = store_db('upsert')
   remove_store_db(path)
   store = Redoku::Store.open(path, log: nil)
@@ -55,7 +55,10 @@ assert('save_autosave upserts one singleton row') do
   assert_equal(1, list.size)
   assert_equal(:autosave, list[0][:kind])
   assert_equal(UNIQUE_81, store.autosave[:givens])
-  assert_true(second != first)
+  # The id is STABLE across upserts (v2): the stroke journal hangs off it,
+  # and a clean-quit refresh of the autosave row must not cascade the whole
+  # session's strokes away.
+  assert_equal(first, second)
   store.close
   remove_store_db(path)
 end
@@ -264,4 +267,215 @@ assert('opening a store creates missing parent directories') do
   Dir.delete(nested)
   Dir.delete(base + '/a')
   Dir.delete(base)
+end
+
+# --- the stroke journal (Task 6). Same discipline as above: real SQLite in
+# tmp files, one DB per assertion.
+
+def stroke_subpaths
+  # Two subpaths, as a stroke that left the board and came back records:
+  # [[300,400],[320,420],[340,440]] then a gap, then [[360,460],[380,480]].
+  [[[300, 400], [320, 420], [340, 440]],
+   [[360, 460], [380, 480]]]
+end
+
+assert('a v1 database migrates to v2 in place, games intact') do
+  path = store_db('migrate_v1')
+  remove_store_db(path)
+  raw = SQLite3::Database.open(path)
+  raw.execute(
+    'CREATE TABLE IF NOT EXISTS games (' \
+    'id INTEGER PRIMARY KEY AUTOINCREMENT,' \
+    "kind TEXT NOT NULL CHECK (kind IN ('autosave','manual'))," \
+    'difficulty TEXT NOT NULL, achieved_tier TEXT NOT NULL,' \
+    'givens TEXT NOT NULL, entries TEXT NOT NULL, solution TEXT NOT NULL,' \
+    'created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)')
+  raw.execute('CREATE INDEX IF NOT EXISTS idx_games_updated ' \
+              'ON games(updated_at DESC)')
+  raw.execute("INSERT INTO games (kind, difficulty, achieved_tier, givens, " \
+              "entries, solution, created_at, updated_at) VALUES " \
+              "('manual', 'easy', 'easy', '#{EASY_81}', '#{DOTS81}', " \
+              "'#{SOLVED_81}', 1, 2)")
+  raw.execute('PRAGMA user_version = 1')
+  raw.close
+
+  store = Redoku::Store.open(path, log: nil)
+  list = store.games
+  # The saved game survived untouched.
+  assert_equal(1, list.size)
+  assert_equal(EASY_81, store.load(list[0][:id])[:givens])
+  # The new table is there and empty for this game.
+  assert_equal([], store.strokes(list[0][:id]))
+  store.close
+
+  raw = SQLite3::Database.open(path)
+  version = raw.execute('PRAGMA user_version')[0][0]
+  raw.close
+  assert_equal(Redoku::Store::VERSION, version)
+  remove_store_db(path)
+end
+
+assert('a future schema version is still renamed aside') do
+  path = store_db('future_version')
+  remove_store_db(path)
+  seeder = Redoku::Store.open(path, log: nil)
+  seeder.save_autosave(store_game)
+  seeder.close
+  raw = SQLite3::Database.open(path)
+  raw.execute('PRAGMA user_version = 99')
+  raw.close
+
+  store = Redoku::Store.open(path, log: nil)
+  assert_equal(0, store.games.size)   # fresh DB took its place
+  names = Dir.entries(File.dirname(path))
+  bad = nil
+  prefix = File.basename(path) + '.bad-'
+  names.each { |n| bad = n if n.start_with?(prefix) }
+  assert_false(bad.nil?)
+  store.close
+  remove_store_db(path)
+  File.delete(File.join(File.dirname(path), bad)) unless bad.nil?
+end
+
+assert('strokes round-trip through journal and read-back, across reopen') do
+  path = store_db('stroke_roundtrip')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_autosave(store_game)
+
+  assert_true(store.journal_stroke(id, 0, 4, stroke_subpaths))
+  got = store.strokes(id)
+  assert_equal(1, got.size)
+  assert_equal(0, got[0][:color])
+  assert_equal(4, got[0][:width])
+  assert_equal(stroke_subpaths, got[0][:subpaths])
+
+  # Second stroke appends after the first, in order.
+  assert_true(store.journal_stroke(id, 96, 2, [[[500, 500], [510, 520]]]))
+  got = store.strokes(id)
+  assert_equal(2, got.size)
+  assert_equal([[[500, 500], [510, 520]]], got[1][:subpaths])
+
+  # And it all survives close/reopen.
+  store.close
+  reopened = Redoku::Store.open(path, log: nil)
+  got = reopened.strokes(id)
+  assert_equal(2, got.size)
+  assert_equal(stroke_subpaths, got[0][:subpaths])
+  assert_equal([[[500, 500], [510, 520]]], got[1][:subpaths])
+  reopened.close
+  remove_store_db(path)
+end
+
+assert('a corrupt stroke row is skipped, its valid neighbours survive') do
+  path = store_db('corrupt_stroke')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_autosave(store_game)
+  store.journal_stroke(id, 0, 4, [[[1, 2], [3, 4]]])
+  store.close
+
+  raw = SQLite3::Database.open(path)
+  # Garbage where points belong...
+  raw.execute("INSERT INTO strokes (game_id, seq, color, width, pts, " \
+              "created_at) VALUES (#{id}, 90, 0, 4, 'not points at all', 1)")
+  # ...coordinates out of draw_line's span...
+  raw.execute("INSERT INTO strokes (game_id, seq, color, width, pts, " \
+              "created_at) VALUES (#{id}, 91, 0, 4, '70000,0|0,0', 1)")
+  # ...and an absurd brush width.
+  raw.execute("INSERT INTO strokes (game_id, seq, color, width, pts, " \
+              "created_at) VALUES (#{id}, 92, 0, 0, '1,2', 1)")
+  raw.close
+
+  store = Redoku::Store.open(path, log: nil)
+  got = store.strokes(id)
+  assert_equal(1, got.size)
+  assert_equal([[[1, 2], [3, 4]]], got[0][:subpaths])
+  store.close
+  remove_store_db(path)
+end
+
+assert('garbage never reaches the journal; a nil game refuses') do
+  path = store_db('stroke_refuse')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_autosave(store_game)
+  assert_false(store.journal_stroke(nil, 0, 4, stroke_subpaths))
+  assert_false(store.journal_stroke(id, 0, 4, []))
+  assert_false(store.journal_stroke(id, 0, 4, [[]]))
+  assert_false(store.journal_stroke(id, 0, 4, [['x', 1]]))
+  assert_false(store.journal_stroke(id, 0, 4, [[[300]]]))
+  assert_false(store.journal_stroke(id, 0, 4, 'not subpaths'))
+  assert_equal([], store.strokes(id))
+  store.close
+  remove_store_db(path)
+end
+
+assert('the stroke cap drops the oldest strokes and keeps appending') do
+  path = store_db('stroke_cap')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil, stroke_cap: 3)
+  id = store.save_autosave(store_game)
+  4.times do |i|
+    assert_true(store.journal_stroke(id, 0, 4, [[[i, i], [i + 1, i + 1]]]))
+  end
+  got = store.strokes(id)
+  assert_equal(3, got.size)
+  # The FIRST stroke went; the newest three remain.
+  assert_equal([[[1, 1], [2, 2]]], got[0][:subpaths])
+  assert_equal([[[3, 3], [4, 4]]], got[2][:subpaths])
+  store.close
+  remove_store_db(path)
+end
+
+assert('clear_strokes empties one game\'s journal and no one else\'s') do
+  path = store_db('stroke_clear')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  a = store.save_autosave(store_game)
+  b = store.save_manual(store_game(UNIQUE_81))
+  store.journal_stroke(a, 0, 4, [[[1, 1], [2, 2]]])
+  store.journal_stroke(b, 0, 4, [[[3, 3], [4, 4]]])
+  assert_true(store.clear_strokes(a))
+  assert_equal([], store.strokes(a))
+  assert_equal(1, store.strokes(b).size)
+  store.close
+  remove_store_db(path)
+end
+
+assert('deleting a game takes its strokes with it — the cascade fires') do
+  # THE PROOF THE IMPLEMENTATION RELIES ON: foreign key enforcement is OFF
+  # by default in SQLite and is turned ON per connection inside SCHEMA_SQL.
+  # If that pragma ever stopped reaching the C binding, this assertion is
+  # what turns red instead of the device silently growing orphan rows.
+  path = store_db('stroke_cascade')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_manual(store_game)
+  store.journal_stroke(id, 0, 4, stroke_subpaths)
+  assert_equal(1, store.strokes(id).size)
+  assert_true(store.delete(id))
+  assert_equal([], store.strokes(id))
+  store.close
+  remove_store_db(path)
+end
+
+assert('copy_strokes clones a game\'s ink onto its manual copy') do
+  path = store_db('stroke_copy')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  src = store.save_autosave(store_game)
+  store.journal_stroke(src, 0, 4, stroke_subpaths)
+  store.journal_stroke(src, 96, 2, [[[9, 9], [8, 8]]])
+  dst = store.save_manual(store_game)
+  assert_true(dst != src)
+  assert_true(store.copy_strokes(src, dst))
+  got = store.strokes(dst)
+  assert_equal(2, got.size)
+  assert_equal(stroke_subpaths, got[0][:subpaths])
+  assert_equal(96, got[1][:color])
+  # The source keeps its own copy.
+  assert_equal(2, store.strokes(src).size)
+  store.close
+  remove_store_db(path)
 end

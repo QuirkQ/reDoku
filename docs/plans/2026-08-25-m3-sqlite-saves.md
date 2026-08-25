@@ -63,15 +63,15 @@ bin/redoku ── Redoku::App ── @store (Redoku::Store)  ── SQLite3::Dat
   have needed them.
 - **What is saved:** `givens`, `entries`, `solution` (the Grid class's
   existing 81-char `[0-9.]` strings), requested difficulty, achieved tier,
-  timestamps. **Ink is not saved**: strokes are ephemeral marks on the
-  framebuffer with no model behind them yet; stroke journaling stays v2.
-  `entries` is currently always 81 dots until the M3 recognizer lands — the
-  schema is future-proofed for it regardless.
+  timestamps — and, since Task 6, the pen ink: every completed stroke is
+  journaled to a `strokes` table and replayed on resume/load. `entries` is
+  currently always 81 dots until the M3 recognizer lands — the schema is
+  future-proofed for it regardless.
 
 ## Schema
 
 ```sql
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;   -- v1 was the games table alone
 
 CREATE TABLE IF NOT EXISTS games (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,29 +85,54 @@ CREATE TABLE IF NOT EXISTS games (
   updated_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_games_updated ON games(updated_at DESC);
+CREATE TABLE IF NOT EXISTS strokes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  seq        INTEGER NOT NULL,      -- draw order within one game
+  color      INTEGER NOT NULL,      -- gray value (0..255)
+  width      INTEGER NOT NULL,      -- brush px (INK_WIDTH today)
+  pts        TEXT    NOT NULL,      -- 'x,y x,y|x,y' panel points; see Task 6
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strokes_game ON strokes(game_id, seq);
 ```
 
-- `autosave`: at most one row, upserted. Holds the game in progress.
-- `manual`: explicit saves from the SAVE flow / menu, capped at 50.
+- `autosave`: at most one row, upserted. Holds the game in progress. Since
+  Task 6 the upsert keeps the row's ID stable (UPDATE in place once it
+  exists), because the stroke journal hangs off that id and a clean-quit
+  refresh must not cascade the session's strokes away.
+- `manual`: explicit saves from the SAVE flow / menu, capped at 50. SAVE
+  copies the source game's strokes with it (Task 6).
 - On read, every row is validated (lengths, `[0-9.]` charset, difficulty in
-  TIERS) before use; a bad row is skipped and logged — *an unchanged board
-  beats a wiped one*, same rule as §11's signal handling.
+  TIERS; stroke rows re-parsed and bounds-checked) before use; a bad row is
+  skipped and logged — *an unchanged board beats a wiped one*, same rule as
+  §11's signal handling.
 - If the DB file is corrupt on open: rename aside to `games.db.bad-<epoch>`,
   recreate empty, log. **The game must never refuse to start because of its
-  save file.**
+  save file.** A FUTURE `user_version` we do not know still renames aside;
+  a v1 file migrates in place by simply running the v2 DDL (CREATE TABLE IF
+  NOT EXISTS adds exactly what v1 lacks), so no saved game is lost.
+- `PRAGMA foreign_keys = ON` runs per connection inside the schema script:
+  SQLite's FK enforcement is off by default AND off per connection, so the
+  CASCADE behind "delete a game, its ink goes too" has to be switched on
+  every time the database opens. A store test proves the cascade fires.
 
 ## Store API
 
 ```ruby
 Redoku::Store.open(path)   # mkdir -p parent; create schema; check user_version
 # instance:
-#   save_autosave(game) -> id        # upserts the singleton autosave row
+#   save_autosave(game) -> id        # upserts the singleton autosave row, id stable
 #   autosave            -> hash|nil  # full game record
 #   save_manual(game)   -> id|nil    # nil when grid nil, db error, or cap reached (logged)
 #   games               -> [{id:, kind:, difficulty:, achieved_tier:, updated_at:}, ...]
 #                                   ordered by updated_at DESC — metadata only, no puzzle strings
 #   load(id)            -> hash|nil  # full record, validated
 #   delete(id)          -> true|false
+#   journal_stroke(game_id, color, width, subpaths) -> bool
+#   strokes(game_id)    -> [{color:, width:, subpaths:}, ...]  # validated, oldest first
+#   clear_strokes(game_id) -> bool
+#   copy_strokes(from_id, to_id) -> bool
 #   close
 # game hash: {difficulty:, achieved_tier:, givens:, entries:, solution:}
 ```
@@ -194,8 +219,8 @@ row survives process restart.
 - [ ] In `App#run`: if `store.autosave` exists, restore it — rebuild Grid via
       `Grid.parse` on givens, replay entries with `set_entry`, set achieved
       tier, skip the dig — and repaint. Splash/dig only when there is none.
-- [ ] Ink stays blank after resume (not persisted); note in the splash text?
-      No — silent, matches board-after-clear behavior.
+      ~~Ink stays blank after resume~~ — superseded by Task 6: saved ink
+      replays before the opening flush.
 - [ ] Test: app-level test with a tmp-path store — dig → quit → new App →
       same givens/tier restored.
 
@@ -235,11 +260,67 @@ row survives process restart.
       dig → quit → relaunch resumes; save three games, list, load each,
       delete one; pull battery mid-game → relaunch resumes.
 
+## Task 6 — Ink/stroke persistence *(added 2026-08-25, scope extension)*
+**Status: implemented host-side (`make test` green); device pass pending
+Task 5's on-device verification sweep.**
+
+The owner moved ink persistence from "out of scope / v2" into M3a.
+
+- [x] **Schema v2** via `PRAGMA user_version`: the `strokes` table above.
+      Migration: a v1 file upgrades in place by running the v2 DDL —
+      `CREATE TABLE IF NOT EXISTS strokes` adds exactly what v1 lacks, so
+      every saved game survives (tested). A FUTURE unknown version still
+      renames aside per the prime directive (tested).
+- [x] **What a stroke is:** the ordered points of one completed pen ink
+      stroke in PANEL ("screen") coordinates — the frame Renderer repaints
+      from, so replay is literally the same `draw_line` calls live drawing
+      made, at the stroke's own gray (`color`) and brush `width`. The eraser
+      is not journaled: it never draws ink, it repaints cells from the model,
+      so a reload restores erased cells correctly by simply not having those
+      strokes. Encoding: TEXT `'x,y x,y|x,y'` — points space-joined inside a
+      subpath, subpaths '|'-joined where the stroke left the board and came
+      back (replay must never bridge that gap). Text rather than BLOB
+      deliberately: the binding binds Strings as text and reads TEXT columns
+      with `mrb_str_new_cstr`, which truncates at the first NUL byte — a
+      binary encoding could not round-trip through this binding.
+- [x] **Journal timing:** each completed stroke INSERTs immediately at pen
+      lift (`App#close_ink_capture` → `Store#journal_stroke`), one bound-param
+      statement plus an indexed seq/cap lookup, no transaction ceremony —
+      crash-safe per stroke, matching the autosave philosophy. SIGTERM/quit
+      needs nothing extra.
+- [x] **Lifecycle:** the journal hangs off the CURRENT autosave row's id.
+      Before the first successful dig there IS no row to hang strokes on;
+      they buffer in `App@ink_strokes` (memory) and are DISCARDED when the
+      dig lands — a dig repaints the board and wipes the glass first, so
+      flushing them would resurrect invisible ink after a resume. New /
+      Level clear the glass (the fault path too, where the old puzzle comes
+      back without its ink), so `fill_board` clears memory AND deletes the
+      persisted strokes of the current row. SAVE copies the source game's
+      strokes onto the manual copy (`copy_strokes`). Load/resume replays via
+      `Renderer#draw_ink` between the model paints and the flush — same path
+      for resume-on-launch, load-from-menu, BACK out of the menu and
+      SIGCONT, all through `adopt_record`. Delete relies on the FK CASCADE,
+      proven to fire by test (foreign_keys is ON per connection).
+- [x] **Robustness:** a corrupt/unparseable stroke row is skipped and logged
+      at read (`Store#strokes` re-parses and bounds-checks every row) and
+      refused at write; load and resume never break. Caps: STROKES_CAP = 2000
+      journaled strokes per game (oldest dropped past the cap, logged;
+      injectable as `stroke_cap:` for tests) and MAX_STROKE_POINTS = 2048
+      recorded points per stroke (recording stops, live ink does not) —
+      pathological sessions cannot bloat the file for ever.
+- [x] Tests: store-level (v1→v2 migration preserves games; round-trip across
+      reopen; corrupt rows skipped; refusals; cap enforcement; cascade delete;
+      copy; clear isolation) and app-level (journal-on-lift; gap becomes two
+      subpaths; New and Level clear persisted strokes; SAVE copies them;
+      load replays through draw_ink; SIGTERM quit + relaunch restores board
+      AND ink; pre-dig buffering discarded at first dig).
+
 ---
 
 ## Out of scope (explicitly)
 
-- Persisting ink/strokes (needs a journal model — v2).
+- ~~Persisting ink/strokes~~ — pulled INTO M3a as Task 6 by the owner's
+  scope extension of 2026-08-25.
 - Saving recognizer entries meaningfully (arrives with the M3 recognizer; the
   column already exists).
 - Export/import of games, statistics, named saves, cloud anything.

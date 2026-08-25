@@ -100,7 +100,7 @@ module Redoku
     # its answer and `achieved_tier` the tier the generator actually reached —
     # see fill_board for why the last of those is stored rather than shown.
     attr_reader :difficulty, :ink_dirty, :grid, :solution, :achieved_tier,
-                :current_save_id, :screen
+                :current_save_id, :screen, :ink_strokes
 
     # `rng:` IS the boundary between a varying device and deterministic tests.
     # Its default reads the wall clock, so each launch deals a different
@@ -181,6 +181,24 @@ module Redoku
       @travel = 0       # distance travelled so far, for tap detection
       @ink_dirty = nil  # pending ink damage, inclusive corners
       @erased = nil     # last cell this erase stroke cleared (see erase_at)
+      # The stroke journal (M3a Task 6). @ink_strokes is every completed
+      # stroke of the board on the glass, in draw order — the in-memory copy
+      # of what the store holds under @current_save_id. While no autosave
+      # exists yet (@current_save_id nil — no dig has succeeded this session)
+      # it doubles as the BUFFER: strokes stay here and are discarded the
+      # moment a dig lands, because a dig repaints the board and wipes the
+      # glass first, so flushing them would resurrect ink nobody can see.
+      # Once an autosave exists each completed stroke is journaled to the
+      # store immediately (crash-safe, same philosophy as the autosave row).
+      @ink_strokes = []
+      # Capture state for the stroke OPEN right now: subpaths being built,
+      # the subpath under construction, its last recorded endpoint, and a
+      # running point count against Store::MAX_STROKE_POINTS. All nil/zero
+      # whenever no ink stroke is open.
+      @stroke_subs = nil
+      @stroke_cur = nil
+      @stroke_from = nil
+      @stroke_count = 0
 
       # The touch stroke is tracked separately from the pen's, so that a
       # finger landing on the glass can never cut a stroke short or steal
@@ -213,14 +231,14 @@ module Redoku
     # UNLESS there is an autosave to resume (M3a Task 3). Then the saved game
     # comes back INSTEAD of the dig: chrome painted with the SAVED difficulty,
     # the puzzle drawn on top exactly as handle_resume does after a suspend,
-    # one flush. Ink stays blank — strokes were never in the model — and that
-    # is silent on purpose, matching board-after-clear behaviour. The splash
-    # and the progress bar are generation UI; resuming digs nothing, so they
-    # do not belong on the panel.
+    # the saved ink replayed over it (Task 6), one flush.
+    # The splash and the progress bar are generation UI; resuming digs
+    # nothing, so they do not belong on the panel.
     def run
       if restore_saved
         @renderer.draw_all(@difficulty)
         @renderer.draw_puzzle(@grid)
+        @renderer.draw_ink(@ink_strokes)
         @renderer.flush_all
       else
         @renderer.draw_all(@difficulty)
@@ -447,8 +465,10 @@ module Redoku
       # it: without this the first suspend and resume would silently wipe the
       # board the player was working on. Guarded because handle_resume is
       # reachable before anything has been dug — every resume test does
-      # exactly that — and draw_puzzle wants a Grid.
+      # exactly that — and draw_puzzle wants a Grid. The ink comes back too
+      # (Task 6), from the same journal the load and resume paths read.
       @renderer.draw_puzzle(@grid) if @grid
+      @renderer.draw_ink(@ink_strokes)
       @renderer.flush_all
       self
     end
@@ -631,6 +651,15 @@ module Redoku
       if Layout.cell_at(x, y) && @screen == :play
         @button = nil
         @mode = erasing ? :erase : :ink
+        # An ink stroke opens its capture here — the journal needs the whole
+        # polyline, and a stroke's meaning is latched at pen-down, so this is
+        # also the only place capture can start.
+        if @mode == :ink
+          @stroke_subs = []
+          @stroke_cur = nil
+          @stroke_from = nil
+          @stroke_count = 0
+        end
         erase_at(x, y)
       else
         # Off the board — or ON it while the GAMES menu is up: the menu's
@@ -660,11 +689,33 @@ module Redoku
       ink_to(x, y)
       erase_at(x, y)
       press(@button) if tap?(x, y)
+      close_ink_capture
       @mode = nil
       @last = nil
       @button = nil
       @travel = 0
       @erased = nil
+    end
+
+    # A completed ink stroke leaves the capture and goes two places at once:
+    # into @ink_strokes (the board's in-memory journal, what repaints draw
+    # from) and — when an autosave row exists to hang it on — into the store,
+    # immediately, one INSERT. Crash-safe per stroke: a power cut between two
+    # strokes loses nothing but the stroke that had not ended yet.
+    def close_ink_capture
+      subs = @stroke_subs
+      @stroke_subs = nil
+      @stroke_cur = nil
+      @stroke_from = nil
+      @stroke_count = 0
+      return if subs.nil? || subs.empty?
+      stroke = { color: INK_GRAY, width: INK_WIDTH, subpaths: subs }
+      @ink_strokes << stroke
+      return unless @store && @current_save_id
+      @store.journal_stroke(@current_save_id, stroke[:color],
+                            stroke[:width], stroke[:subpaths])
+    rescue StandardError => e
+      log_line('stroke journal failed (' + e.message + ')')
     end
 
     # The board is the writing surface and the chrome is not, so a segment is
@@ -680,6 +731,26 @@ module Redoku
       return unless Layout.cell_at(@last[0], @last[1]) && Layout.cell_at(x, y)
       @d.draw_line(@last[0], @last[1], x, y, INK_WIDTH, INK_GRAY)
       mark_dirty(@last[0], @last[1], x, y)
+      note_ink(@last, [x, y])
+    end
+
+    # Records one drawn segment into the open stroke's capture. Consecutive
+    # samples append to the same subpath; an excursion off the board (which
+    # ink_to refuses to draw across) leaves a gap that starts a NEW subpath,
+    # so the replay connects exactly the segments that were drawn and never
+    # bridges a gap. Recording stops at Store::MAX_STROKE_POINTS — the live
+    # ink keeps flowing either way; what stops is only how much of this
+    # stroke survives a reload.
+    def note_ink(from_pt, to_pt)
+      return if @stroke_subs.nil?
+      return if @stroke_count >= Store::MAX_STROKE_POINTS
+      if @stroke_cur.nil? || @stroke_from != from_pt
+        @stroke_cur = [from_pt]
+        @stroke_subs << @stroke_cur
+      end
+      @stroke_cur << to_pt
+      @stroke_from = to_pt
+      @stroke_count += 1
     end
 
     # The eraser's counterpart to ink_to, in the same shape: @mode is checked
@@ -820,6 +891,7 @@ module Redoku
       @delete_mode = false
       @renderer.draw_all(@difficulty)
       @renderer.draw_puzzle(@grid) if @grid
+      @renderer.draw_ink(@ink_strokes)
       @renderer.flush_all
       self
     end
@@ -894,6 +966,7 @@ module Redoku
       @delete_mode = false
       @renderer.draw_all(@difficulty)
       @renderer.draw_puzzle(@grid)
+      @renderer.draw_ink(@ink_strokes)
       @renderer.flush_all
       log_line('loaded saved game ' + id.to_s)
       self
@@ -908,6 +981,12 @@ module Redoku
     def save_manual_copy
       return self unless @store
       id = @store.save_manual(@grid ? current_game_record : nil)
+      if id && @current_save_id
+        # The bookmark takes the ink with it, so loading it later restores
+        # the board AND the marks on it. No autosave id (nothing dug) means
+        # no strokes either — save_manual was handed nil and refused.
+        @store.copy_strokes(@current_save_id, id)
+      end
       log_line('saved manual copy ' + id.to_s) if id
       self
     rescue StandardError => e
@@ -1079,6 +1158,12 @@ module Redoku
         # cut an instant later resumes THIS puzzle, not a fresh search.
         persist_autosave
       end
+      # New / Level cleared the glass the moment the splash went up — on the
+      # FAULT path too, where the old puzzle comes back without its ink. The
+      # journal follows the glass, whatever the search did: memory emptied,
+      # and the persisted strokes of the row this board belongs to deleted.
+      # This is also what disposes of any pre-dig buffered strokes.
+      clear_ink_journal
       @renderer.draw_board
       # @grid is nil only when nothing has EVER been dug and this search
       # produced nothing: paint the empty board anyway (see above).
@@ -1259,6 +1344,11 @@ module Redoku
       @difficulty = rec[:difficulty]
       @achieved_tier = rec[:achieved_tier]
       @current_save_id = rec[:id]
+      # The ink travels with the game: whatever is journaled under this row
+      # becomes the board's in-memory journal, ready for the caller's
+      # repaint to replay. Corrupt rows were already skipped-and-logged
+      # inside the store.
+      @ink_strokes = @store ? @store.strokes(rec[:id]) : []
       true
     rescue StandardError => e
       log_line('could not restore saved game (' + e.message + ')')
@@ -1266,7 +1356,26 @@ module Redoku
       @solution = nil
       @achieved_tier = nil
       @current_save_id = nil
+      @ink_strokes = []
       false
+    end
+
+    # Empties every copy of the current board's ink: memory, the open
+    # capture (a stroke cannot be open across a press, but this costs
+    # nothing) and — when the board has a save row — its persisted strokes.
+    # Called from fill_board, i.e. from New, Level and the first dig of a
+    # launch; NOT from load_game/adopt_record, which swap in another game's
+    # ink whole rather than discarding it.
+    def clear_ink_journal
+      @ink_strokes = []
+      @stroke_subs = nil
+      @stroke_cur = nil
+      @stroke_from = nil
+      @stroke_count = 0
+      return unless @store && @current_save_id
+      @store.clear_strokes(@current_save_id)
+    rescue StandardError => e
+      log_line('could not clear strokes (' + e.message + ')')
     end
 
     # Upserts the autosave row for the board on the glass. Called after every
