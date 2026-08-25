@@ -1,5 +1,5 @@
 MRuby::Gem::Specification.new('mruby-rm2') do |spec|
-  spec.license = 'MIT'
+  spec.license = 'AGPL-3.0-or-later'
   spec.author  = 'Quint Pieters'
   spec.summary = 'reMarkable 2 rm2fb display-server client'
 

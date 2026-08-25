@@ -9,6 +9,18 @@ board, echoes pen ink into it, and hands the screen back on Quit — no
 puzzles yet, and the pen path is still awaiting its first run on real
 hardware. See [PLAN.md](PLAN.md) for the full design and roadmap.
 
+## License
+
+reDoku is free software, licensed under the
+[GNU Affero General Public License v3.0](LICENSE) or (at your option) any
+later version (`AGPL-3.0-or-later`).
+
+That means anyone may use, study, modify, and share it — but if a company
+(for example reMarkable, shipping it as part of their product) distributes
+it or a modified version, they must pass those same freedoms on: the
+complete corresponding source, under the same license. If that's a problem
+for you, get in touch and we can talk about a commercial license.
+
 ## Prerequisites
 
 - Docker (all builds run in a container; nothing is installed on your machine)

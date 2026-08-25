@@ -1,5 +1,5 @@
 MRuby::Gem::Specification.new('mruby-redoku') do |spec|
-  spec.license = 'MIT'
+  spec.license = 'AGPL-3.0-or-later'
   spec.author  = 'Quint Pieters'
   spec.summary = 'reDoku game logic: layout, rendering, input handling'
 
