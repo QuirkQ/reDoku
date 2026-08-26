@@ -353,31 +353,61 @@ press CHECK; *then* every ink-marked cell is read once, compared against the
 stored solution, and marked right or wrong (§7). Same recognizer, one
 invocation instead of hundreds, and the code is simpler end to end.
 
-**Algorithm: $P point-cloud recognizer** (Vatavu/Anthony/Wobbrock).
-Chosen over $1 because it's inherently multi-stroke and stroke-order/direction
-invariant — people write 4, 5, 7 with varying stroke counts and orders.
+**Algorithm: a stage-1 feature classifier behind
+`Recognizer.read(strokes) -> [digit_or_nil, confidence]`.** What ships is NOT
+the $P point-cloud recognizer this section specified until 2026-08-26 — see
+[`docs/design/m3b-check-flow.md`](docs/design/m3b-check-flow.md) §5 for the
+full argument. $P was costed before it was written and did not survive the
+arithmetic: its greedy match runs n^(1−ε) start positions through an O(n²)
+pass — at n = 48 against 45 templates ≈725k point-distance evaluations per
+cell, and a board of ~50 inked cells is **≈36M evaluations in interpreted
+mruby on a Cortex-A7**, seconds to minutes where one CHECK press happens.
+It stays on record here as the costed-and-narrowed alternative (the spec's
+stage 2 would have run it on a two-digit shortlist only); if stage 1 ever
+fails on device, that is the fallback and the arithmetic above is why it was
+not the first choice.
 
-Pipeline, run per inked cell when CHECK fires:
+What actually runs per inked cell when CHECK fires:
 
 1. Collect all strokes for the cell (a stroke belongs to the cell containing
-   its bounding-box center; consecutive strokes in the same cell accumulate).
-2. Normalize: resample the combined cloud to 48 points, scale uniformly by
-   the larger bounding-box side (aspect preserved — it's what separates 1
-   from 7; guard the degenerate near-vertical "1" against divide-by-tiny
-   width), translate centroid to origin.
-3. Greedy cloud matching against templates for digits 1–9; score =
-   inverse of best cloud distance.
-4. Accept if best score clears a confidence threshold **and** leads the
-   runner-up digit by a margin. A cell that fails both thresholds reads as
-   *not a confident answer*: it is marked wrong like any other mismatch — no
-   mid-game reject-flash exists any more, because nothing interrupts the
-   player while they draw. The recognized digit lands in the game record's
-   `entries` column (the column M3a future-proofed), so the check result is
-   itself persisted and re-checkable without re-recognizing.
+   its bounding-box center — the rule spec §4 pins after finding this plan's
+   old "fully inside" guard contradicted it; digits written slightly over a
+   cell line are normal handwriting on a 140 px cell, and the guard would
+   have silently discarded exactly those).
+2. Normalise: resample the combined cloud to 32 points, scale uniformly by
+   the larger bounding-box side (aspect preserved — it separates 1 from 7;
+   the near-vertical "1" is guarded against divide-by-tiny width),
+   translate the box to origin.
+3. Reduce to a fixed integer vector: 16 ink-density boxes (4×4) plus 8 shape
+   features — aspect, stroke count, direction reversals, spread, and the
+   START and END points of the resampled cloud. That is **24 integers**, each
+   scaled 0..255 so the squared distance stays inside mruby's fixnum range on
+   32-bit ARM. The start/end features were added when the authored 3 and 5
+   collided below MARGIN_MIN on silhouette alone — both are S-curves of near
+   the same extent, and their density boxes barely differ; where the pen
+   entered and left separates them by an order of magnitude. (The drafted
+   design said 20-int; every number downstream describes the shipped 24.)
+4. Nearest-neighbour over precomputed template vectors by squared distance,
+   ≈1.1k operations per cell — four orders of magnitude under $P.
+5. Accept only if the best distance clears ACCEPT_MAX **and** leads the
+   runner-up digit by MARGIN_MIN; otherwise the cell reads *unreadable* —
+   corner `?`, ink kept — and not "marked wrong like any other mismatch",
+   which is what this plan used to say. Spec §2's verdict table governs.
+   Shipped thresholds are **ACCEPT_MAX = 450 / MARGIN_MIN = 220**: 900 was
+   the drafted bar until a crossing scribble scored d = 491 inside it, which
+   would have made the unreadable verdict unreachable, so the bar came down
+   and the authored corpus re-measured identically (STAGE1 total=84
+   right=84 refused=0 misread=0 accuracy=100%). The recognized digit lands
+   in the game record's `entries` column (the column M3a future-proofed),
+   so the check result is itself persisted and re-checkable without
+   re-recognizing.
 
-**Templates:** ship 3–5 authored samples per digit in `assets/templates/`
-(bootstrap set drawn during development). `redoku --record` runs on-device:
-it prompts "write 1 … write 9" a few rounds, saves clouds to
+**Templates:** authored polyline literals per digit in
+`mrbgems/mruby-redoku/mrblib/redoku/templates.rb` (`Templates::AUTHORED`,
+two or three variants per digit covering stroke-count and order variation),
+resampled at load — so the recognizer is host-testable from day one and
+nothing blocks on hardware. `redoku --record` runs on-device: it prompts
+"WRITE 1 … WRITE 9" a few rounds and saves clouds to
 `/home/root/redoku/templates.local`, which the game loads on top of the
 shipped set — so the recognizer tunes itself to *your* handwriting cheaply.
 
@@ -427,8 +457,13 @@ player, a lost Marker Plus) the cheap answer is an Erase button in the existing
 button row — the row, the tap discipline, the acknowledgement flash and the
 finger path all exist already — and not the gesture.
 
-**Pre-classification guards:** strokes fully inside a cell's bounds only;
-tiny dots (< 8 px path) are discarded as accidental touches.
+**Pre-classification guards:** tiny dots (combined path < 8 px) are discarded
+as accidental touches. The old companion guard — "strokes fully inside a
+cell's bounds only" — is gone as of 2026-08-26: it contradicted the
+bounding-box-centre rule above and would have silently discarded legitimate
+answers written over a cell line. Spec §4 records the reasoning; the dot
+guard stays, but on the combined path, so a digit drawn as several short
+strokes survives it (`Recognizer.playable`).
 
 ## 7. Sudoku engine
 
@@ -483,15 +518,24 @@ Pure Ruby, zero device dependencies (fully unit-testable on host).
     [`docs/design/difficulty-rating.md`](docs/design/difficulty-rating.md).**
     Read it before changing any constant in `Rater`; several of these numbers
     are counter-intuitive and were arrived at by being wrong first.
-- **Mistake checking** — CHECK is the moment ink becomes an answer. Whatever
-  ink remains on the board when it is pressed *is* the player's solution
-  (the intended workflow: erase your scratch notes first, leave only digits);
-  §6's batch pass reads each inked cell into `entries`, and those entries are
-  compared against the stored solution. Wrong cells get a small corner ✕
-  (they stay until edited); right cells keep their ink untouched. When every
-  cell reads back correct, the win screen fires (full GC16 flash,
-  "Solved — n mistakes checked", tap for new puzzle). Re-checking after edits
-  re-recognizes only cells whose ink changed since the last CHECK.
+- **Mistake checking** — CHECK is the moment ink becomes an answer. The pass
+  runs over every non-given cell holding live ink and gives it one of three
+  verdicts (spec §2): a cell whose ink clears both thresholds is **read** —
+  the digit prints in `ENTRY_GRAY`, its ink is *retired* (kept in the record,
+  never replayed), and a mismatch with the stored solution adds a corner ✕.
+  A cell clearing neither threshold stays **unreadable**: ink kept, corner
+  `?`, persisted as `'?'`. This paragraph used to say right cells keep their
+  ink untouched; that lost to diagnosability (spec §2) — a recognizer that
+  misreads a correct 4 as a 9 shows a ✕ over a cell the player got right
+  unless the printed digit exposes the machine's mistake. Given cells are
+  skipped entirely, so annotations on clues survive. The press itself counts:
+  `App@checks` tallies CHECK presses per sitting, and the win screen reports
+  the total ("Solved — n mistakes checked"); it resets on relaunch, by design
+  (spec §3). When every non-given cell holds an entry equal to the solution,
+  the win screen fires (full GC16 flash, tap for new puzzle). Re-checking
+  after edits re-recognizes only cells whose ink changed since the last
+  CHECK — for free: retire-on-read *is* the incremental-recheck mechanism
+  (spec §4).
 
 ## 8. Screen layout & rendering
 
@@ -709,15 +753,29 @@ Split into two slices:
 
 - **M3a** ([plan](docs/plans/2026-08-25-m3-sqlite-saves.md)) — persistence and
   the free-draw surface. Landed host-complete 2026-08-25: SQLite saves
-  (`games` + `strokes`, schema v2), autosave upsert with stable id, resume on
-  launch, GAMES menu (load / save / delete / paginate), and ink that survives
-  quit, relaunch and battery pull via the stroke journal. Device verification
-  (deploy, resume round-trip, battery-pull) still pending.
-- **M3b** — the check flow. Batch recognition at CHECK (§6), corner ✕ marks on
-  wrong cells, `entries` written from the verdicts, win screen on full-and-
-  correct, difficulty menu. Ships the digit templates and `redoku --record`;
-  the corpus test of §9 measures batch accuracy over whole boards rather than
-  live single-cell latency.
+  (`games` + `strokes`, schema v2, v3 since M3b's retire column), autosave
+  upsert with stable id, resume on launch, GAMES menu (load / save / delete /
+  paginate), and ink that survives quit, relaunch and battery pull via the
+  stroke journal. Device verification (deploy, resume round-trip,
+  battery-pull) still pending. One claim of its Task 6 did not survive
+  contact with a probe: ink persistence as shipped was **incomplete**, not
+  merely device-unverified — an erase touched neither the journal nor the DB,
+  so erased strokes came back on reload. The plan's wrong reasoning is kept
+  on record there under an annotation; M3b's Task 3 fixed it (schema v3 +
+  journal deletion).
+- **M3b** — the check flow ([spec](docs/design/m3b-check-flow.md),
+  [plan](docs/plans/2026-08-26-m3b-check-flow.md)). Batch recognition at
+  CHECK behind `Recognizer.read`, unreadable cells as a persisted fourth Grid
+  state, retired-not-deleted ink, win screen, difficulty menu, and
+  `redoku --record`. **Shipped host-only through Task 10, 2026-08-26**: the
+  CHECK flow is live against the authored templates; the recognizer's
+  decision gate measured stage 1 alone at **100% accuracy, 0 misreads** over
+  the authored corpus at ACCEPT_MAX = 450, so $P's stage 2 was never built
+  (§6). What remains open is **Task 11, device tuning**: the owner records
+  their own hand with `--record`, those clouds become both the shipped set
+  and §9's corpus split train/holdout, and the thresholds are re-tuned
+  against the holdout. Until then every accuracy number here describes one
+  hand's authored templates plus jitter, not a player's writing.
 
 **Erase is off that list, and was M3's before it.** The pen's own eraser end
 landed on main on 2026-08-24, between M2 and M3, and supersedes the

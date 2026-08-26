@@ -285,6 +285,18 @@ The owner moved ink persistence from "out of scope / v2" into M3a.
       deliberately: the binding binds Strings as text and reads TEXT columns
       with `mrb_str_new_cstr`, which truncates at the first NUL byte — a
       binary encoding could not round-trip through this binding.
+
+> **SUPERSEDED 2026-08-26 — this bullet's erase claim is wrong, kept as
+> written** because the reasoning was load-bearing for M3b and is worth
+> reading in its wrong form. *The eraser is not journaled* turned out to be
+> half true at best: the stroke was journaled at pen-lift by
+> `App#close_ink_capture`, before the eraser ever came near it, while
+> `App#erase_at` repainted the cell and touched neither `@ink_strokes` nor
+> the DB — so the glass was cleaned and the record was not, and erased ink
+> came back on every reload. Two probes against the green baseline caught it
+> ([spec §1](../design/m3b-check-flow.md)); [M3b's plan](2026-08-26-m3b-check-flow.md)
+> Task 3 fixed it on schema v3, drawing the distinction this bullet blurred:
+> erase **deletes** journal rows, CHECK **retires** them.
 - [x] **Journal timing:** each completed stroke INSERTs immediately at pen
       lift (`App#close_ink_capture` → `Store#journal_stroke`), one bound-param
       statement plus an indexed seq/cap lookup, no transaction ceremony —
