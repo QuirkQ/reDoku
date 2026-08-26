@@ -2752,3 +2752,203 @@ assert('BACK out and reopening the menu clears the armed DEL state') do
   assert_false(app.instance_variable_get(:@delete_mode))
   assert_equal(255, d.gray_at(lx + 10, ly + lh / 2))   # label back up
 end
+
+# --- CHECK (M3b Task 7). The button, the pass, the verdicts. Helpers first,
+# then the assertions; every stroke still goes through handle_sample as real
+# pen packets, and the recognizer sees the same panel coordinates the game
+# gives it.
+
+def cell_rect_of(index)
+  Redoku::Layout.cell_rect(Redoku::Sudoku::Grid.col_of(index),
+                           Redoku::Sudoku::Grid.row_of(index))
+end
+
+def first_empty_cell(grid)
+  i = 0
+  i += 1 while i < 81 && grid.given?(i)
+  i
+end
+
+def next_empty_cell(grid, after)
+  i = after + 1
+  i += 1 while i < 81 && grid.given?(i)
+  i
+end
+
+def first_given_cell(grid)
+  i = 0
+  i += 1 while i < 81 && !grid.given?(i)
+  i
+end
+
+# Draws the authored template for `digit` inside `index`, as pen samples, so
+# the recognizer sees the same panel coordinates the game gives it.
+def write_digit_in_cell(app, index, digit)
+  entry = Redoku::Templates::AUTHORED.find { |d, _s| d == digit }
+  x, y, w, h = cell_rect_of(index)
+  entry[1].each do |sub|
+    pts = sub.map { |px, py| [x + px * w / 100, y + py * h / 100] }
+    pts.each { |px, py| app.handle_sample(pen_sample(px, py, true)) }
+    app.handle_sample(pen_sample(pts[-1][0], pts[-1][1], false))
+  end
+end
+
+def scribble_in_cell(app, index)
+  x, y, w, h = cell_rect_of(index)
+  [[10, 10], [90, 90], [10, 90], [90, 10], [50, 10], [50, 90],
+   [10, 50], [90, 50]].each do |px, py|
+    app.handle_sample(pen_sample(x + px * w / 100, y + py * h / 100, true))
+  end
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, false))
+end
+
+def press_check(app)
+  x, y, w, h = Redoku::Layout.button_rect(:check)
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, true))
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, false))
+end
+
+assert('CHECK reads a written digit into the grid and retires its ink') do
+  path = stroke_app_db('check_read')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, = new_app(store: store, generator: FakeGenerator.new)
+  app.new_puzzle
+  sid = app.current_save_id
+  index = first_empty_cell(app.grid)
+  want = app.solution[index]
+  write_digit_in_cell(app, index, want)   # helper below
+
+  assert_equal 1, app.run_check
+  assert_equal want, app.grid.value_at(index)
+  assert_nil app.mark_of(index)
+  # The ink is retired: still in the table, no longer read back.
+  assert_equal 0, store.strokes(sid).size
+  assert_equal 0, app.ink_strokes.size
+  rows = store.instance_variable_get(:@db)
+              .execute('SELECT COUNT(*) FROM strokes WHERE game_id = ?', [sid])
+  assert_true rows[0][0] > 0
+  store.close
+  remove_app_db(path)
+end
+
+assert('a wrong digit is written, printed and marked') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  index = first_empty_cell(app.grid)
+  wrong = app.solution[index] == 9 ? 8 : 9
+  write_digit_in_cell(app, index, wrong)
+  app.run_check
+  assert_equal wrong, app.grid.value_at(index)
+  assert_equal :wrong, app.mark_of(index)
+end
+
+assert('unreadable ink is KEPT on the glass and marked, not repainted away') do
+  # The trap: redraw_cell repaints a cell from the model, which would wipe
+  # the very ink an unreadable verdict is preserving. Unreadable cells get
+  # draw_mark only.
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  index = first_empty_cell(app.grid)
+  scribble_in_cell(app, index)
+  d.clear_calls
+  app.run_check
+  assert_true app.grid.unreadable?(index)
+  assert_equal :unreadable, app.mark_of(index)
+  assert_equal 1, app.ink_strokes.size          # ink survived
+  x, y, w, h = cell_rect_of(index)
+  # No full-cell white fill over this cell: that is what erasing looks like.
+  assert_false d.rects.any? { |rx, ry, rw, rh, g|
+    g == Redoku::Renderer::WHITE && rx == x && ry == y && rw == w && rh == h
+  }
+end
+
+assert('CHECK never touches a given, even one with ink on it') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  given = first_given_cell(app.grid)
+  before = app.grid.value_at(given)
+  scribble_in_cell(app, given)
+  assert_equal 0, app.run_check          # nothing was read
+  assert_equal before, app.grid.value_at(given)
+  assert_equal 1, app.ink_strokes.size   # the annotation survives
+end
+
+assert('CHECK counts its presses and reports them') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  assert_equal 0, app.checks
+  press_check(app)
+  press_check(app)
+  assert_equal 2, app.checks
+end
+
+assert('re-checking skips a cell already read, without any dirty tracking') do
+  # Spec §4: a read cell has no live strokes, so it is not in the grouped
+  # set at all. This is the whole of the "re-recognize only what changed"
+  # promise in PLAN.md §7.
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  index = first_empty_cell(app.grid)
+  write_digit_in_cell(app, index, app.solution[index])
+  assert_equal 1, app.run_check
+  assert_equal 0, app.run_check
+end
+
+assert('writing into a checked cell clears its entry and its mark') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  index = first_empty_cell(app.grid)
+  wrong = app.solution[index] == 9 ? 8 : 9
+  write_digit_in_cell(app, index, wrong)
+  app.run_check
+  assert_equal :wrong, app.mark_of(index)
+  write_digit_in_cell(app, index, app.solution[index])
+  assert_true app.grid.empty?(index)      # cleared at pen-down
+  assert_nil app.mark_of(index)
+  app.run_check
+  assert_nil app.mark_of(index)
+end
+
+assert('a cell repaint that removes an entry digit flushes GL16, not DU') do
+  # Constraint 4, and App#flush_ink's warning at the point of choice:
+  # ENTRY_GRAY is 96, a mid tone, and DU is two-level.
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  index = first_empty_cell(app.grid)
+  write_digit_in_cell(app, index, app.solution[index])
+  app.run_check
+  d.clear_calls
+  write_digit_in_cell(app, index, 5)
+  x, y, w, h = cell_rect_of(index)
+  hit = d.updates.find { |ux, uy, uw, uh, _wf, _fl|
+    ux <= x && uy <= y && ux + uw >= x + w && uy + uh >= y + h
+  }
+  assert_false hit.nil?
+  assert_equal RM2::GL16, hit[4]
+end
+
+assert('CHECK persists its verdicts, including the unreadable one') do
+  path = stroke_app_db('check_persist')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, = new_app(store: store, generator: FakeGenerator.new)
+  app.new_puzzle
+  read_cell = first_empty_cell(app.grid)
+  write_digit_in_cell(app, read_cell, app.solution[read_cell])
+  bad_cell = next_empty_cell(app.grid, read_cell)
+  scribble_in_cell(app, bad_cell)
+  app.run_check
+
+  rec = store.autosave
+  assert_equal app.solution[read_cell].to_s, rec[:entries][read_cell]
+  assert_equal '?', rec[:entries][bad_cell]
+
+  store2 = Redoku::Store.open(path, log: nil)
+  app2, _d2, _in2, sig2 = new_app(store: store2)
+  sig2.terminated = true
+  app2.run
+  assert_equal app.solution[read_cell], app2.grid.value_at(read_cell)
+  assert_true app2.grid.unreadable?(bad_cell)
+  remove_app_db(path)
+end

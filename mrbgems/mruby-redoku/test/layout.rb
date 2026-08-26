@@ -26,7 +26,7 @@ assert('Layout.cell_at maps screen points back to cells') do
 end
 
 assert('Layout buttons put Quit at the far end of its row') do
-  assert_equal [:new, :level, :games, :quit],
+  assert_equal [:new, :level, :check, :games, :quit],
                Redoku::Layout.buttons.map { |b| b[0] }
   assert_equal [72, 1540, 400, 140], Redoku::Layout.button_rect(:new)
   assert_equal [502, 1540, 400, 140], Redoku::Layout.button_rect(:level)
@@ -44,7 +44,27 @@ assert('Layout buttons put Quit at the far end of its row') do
   assert_true Redoku::Layout.button_rect(:games)[0] +
               Redoku::Layout.button_rect(:games)[2] <
               Redoku::Layout.button_rect(:quit)[0]
-  assert_nil Redoku::Layout.button_rect(:check) # not part of M1
+end
+
+assert('CHECK sits in row 1, keeping QUIT alone at the far end of row 2') do
+  x, y, w, h = Redoku::Layout.button_rect(:check)
+  assert_equal [932, Redoku::Layout::BTN_ROW1_Y, 400, 140], [x, y, w, h]
+  # PLAN.md §8's sketch draws it here, and Layout's own comment gives the
+  # rule: the destructive button stays two full widths clear.
+  # NOTE: the brief wrote `(x - qx).abs > 0` here, but its own BUTTONS put
+  # :check and :quit in the SAME column (932) of different rows, so that
+  # line can never pass. The invariant the test name states is row
+  # separation — CHECK in row 1, QUIT alone at the far end of row 2 — so it
+  # is asserted on y.
+  qx, qy = Redoku::Layout.button_rect(:quit)
+  assert_equal Redoku::Layout::BTN_ROW2_Y, qy
+  assert_true (y - qy).abs > 0
+  assert_true x + w <= Redoku::Layout::BOARD_X + Redoku::Layout::BOARD_W
+end
+
+assert('a tap in the CHECK rect resolves to :check') do
+  x, y, w, h = Redoku::Layout.button_rect(:check)
+  assert_equal :check, Redoku::Layout.button_at(x + w / 2, y + h / 2)
 end
 
 assert('Layout.button_at hit-tests the button row') do

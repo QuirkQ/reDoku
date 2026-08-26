@@ -28,7 +28,13 @@ module Redoku
     # STRICT, per spec §5: a false '?' costs the player one rewrite, while
     # a guess that happens to match the solution is a false win they can
     # neither see nor undo.
-    ACCEPT_MAX = 900      # best squared distance must be under this
+    ACCEPT_MAX = 450      # best squared distance must be under this
+    # 900 admitted a crossing scribble (X plus bars, the shape an unreadable
+    # verdict exists for) at d=491 to the authored 7 — inside the old bar
+    # with margin to spare. Every authored variant matches at d=0 with the
+    # worst different-digit runner-up at 749, so the bar comes down to 450:
+    # still generous for hand ink, but past it a cell is a '?' rather than a
+    # lucky guess. Tuned again in Task 11 against recorded human clouds.
     MARGIN_MIN = 220      # runner-up must exceed the best by this
 
     def self.read(strokes)
@@ -111,8 +117,15 @@ module Redoku
     def self.resample(strokes, n)
       flat = []
       strokes.each { |s| s[:subpaths].each { |sub| sub.each { |p| flat << p } } }
-      return nil if flat.empty?
-      pts = spread_evenly(flat, n)
+      # A release packet repeats the last position (see App#end_stroke), so
+      # every captured stroke ends in a zero-length segment — and spread_evenly
+      # below picks by INDEX, where one duplicated point distorts the whole
+      # resampled cloud. Drop consecutive duplicates: a zero-length segment
+      # carries no shape information and replays as a line of no length.
+      clean = []
+      flat.each { |p| clean << p if clean.empty? || clean[-1] != p }
+      return nil if clean.empty?
+      pts = spread_evenly(clean, n)
       min_x = min_y = max_x = max_y = nil
       pts.each do |x, y|
         if min_x.nil?

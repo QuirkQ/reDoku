@@ -50,7 +50,12 @@ module Redoku
       '9' => ['.###.', '#...#', '#...#', '.####', '....#', '...#.', '.##..'],
       '-' => ['.....', '.....', '.....', '#####', '.....', '.....', '.....'],
       ':' => ['.....', '..#..', '.....', '.....', '.....', '..#..', '.....'],
-      '.' => ['.....', '.....', '.....', '.....', '.....', '.##..', '.##..']
+      '.' => ['.....', '.....', '.....', '.....', '.....', '.##..', '.##..'],
+      # The unreadable verdict's mark (Renderer#draw_mark). Constraint 3:
+      # Font.draw silently draws NOTHING for a character it has no glyph
+      # for, so a '?' verdict without this entry would paint an empty cell
+      # corner under a fully green suite everywhere else.
+      '?' => ['.###.', '#...#', '....#', '...#.', '..#..', '.....', '..#..']
     }.freeze
 
     # Pixel width of `text` at `scale`, without the trailing inter-glyph gap.

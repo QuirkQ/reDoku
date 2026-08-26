@@ -50,7 +50,13 @@ end
 
 assert('Font.draw ignores unknown characters without raising') do
   d = TestDisplay.new
-  Redoku::Font.draw(d, '?', 0, 0, 1, 0)
+  Redoku::Font.draw(d, '@', 0, 0, 1, 0)
   assert_equal [], d.rects
-  assert_equal 5, Redoku::Font.width('?', 1) # still advances
+  assert_equal 5, Redoku::Font.width('@', 1) # still advances
+end
+
+assert("Font has a '?' glyph, because draw() is silent without one") do
+  assert_false Redoku::Font::GLYPHS['?'].nil?
+  assert_equal Redoku::Font::HEIGHT, Redoku::Font::GLYPHS['?'].size
+  Redoku::Font::GLYPHS['?'].each { |r| assert_equal Redoku::Font::WIDTH, r.size }
 end

@@ -31,11 +31,16 @@ module Redoku
     # button stays at the FAR end of its row — two full widths away from New
     # and Level, and across a dead gap from Games — so a mis-aimed tap still
     # cannot end the game while reaching for anything else.
+    #
+    # CHECK takes row 1's third slot, which is where PLAN.md §8's sketch has
+    # always drawn it. Not an arbitrary free slot: it keeps QUIT alone at the
+    # far end of row 2, across a dead gap, which is this comment's rule.
     # Each row is frozen too, not just the outer array: `buttons` hands the
     # shared array out, so a mutable row would be editable process-wide.
     BUTTONS = [
       [:new,   BOARD_X,                          BTN_ROW1_Y, BTN_W, BTN_H].freeze,
       [:level, BOARD_X + BTN_W + BTN_GAP,        BTN_ROW1_Y, BTN_W, BTN_H].freeze,
+      [:check, BOARD_X + 2 * (BTN_W + BTN_GAP),  BTN_ROW1_Y, BTN_W, BTN_H].freeze,
       [:games, BOARD_X,                          BTN_ROW2_Y, BTN_W, BTN_H].freeze,
       [:quit,  BOARD_X + 2 * (BTN_W + BTN_GAP),  BTN_ROW2_Y, BTN_W, BTN_H].freeze
     ].freeze

@@ -657,3 +657,40 @@ assert('draw_games_menu relabels the chrome and inverts DEL when armed') do
   assert_equal 0, d.gray_at(lx + 10, ly + lh / 2)   # armed: inverted
   assert_equal 255, d.gray_at(lx, ly)               # border reads white
 end
+
+# --- verdict marks (M3b Task 7). draw_mark paints ONLY the mark — the path
+# an :unreadable verdict must take, because redraw_cell would repaint the
+# cell from the model and wipe the ink the verdict exists to preserve.
+
+assert('Renderer#draw_mark paints only a small mark inside its cell') do
+  [:wrong, :unreadable].each do |mark|
+    d = TestDisplay.new
+    r = Redoku::Renderer.new(d)
+    r.draw_board
+    d.clear_calls
+    r.draw_mark(0, mark)
+    x, y, w, h = Redoku::Layout.cell_rect(0, 0)
+    # All the mark's ink lies inside the cell...
+    assert_true menu_ink_in?(d, x, y, w, h), mark.to_s
+    # ...in its TOP-RIGHT corner, clear of the centre where a digit or the
+    # player's handwriting has to stay legible under it.
+    d.rects.each do |rx, ry, rw, rh, gray|
+      next if gray == 255
+      assert_true rx >= x + w / 2 && ry <= y + h / 2,
+                  "#{mark} mark is not confined to the top-right corner"
+    end
+  end
+end
+
+assert('Renderer#redraw_cell takes a mark and paints it beside the digit') do
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  grid = grid_of(EASY_81)
+  grid.set_entry(0, 1) # cell 0 is blank in EASY_81, so it can hold an entry
+  r.draw_board
+  d.clear_calls
+  r.redraw_cell(0, grid, mark: :unreadable)
+  assert_true d.glyph_in_cell?(0)   # the printed digit came back...
+  x, y, w, h = Redoku::Layout.cell_rect(0, 0)
+  assert_true menu_ink_in?(d, x + w / 2, y, w / 2, h) # ...and so did the mark
+end

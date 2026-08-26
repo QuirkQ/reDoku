@@ -100,7 +100,7 @@ module Redoku
     # its answer and `achieved_tier` the tier the generator actually reached —
     # see fill_board for why the last of those is stored rather than shown.
     attr_reader :difficulty, :ink_dirty, :grid, :solution, :achieved_tier,
-                :current_save_id, :screen, :ink_strokes
+                :current_save_id, :screen, :ink_strokes, :checks
 
     # `rng:` IS the boundary between a varying device and deterministic tests.
     # Its default reads the wall clock, so each launch deals a different
@@ -181,6 +181,7 @@ module Redoku
       @travel = 0       # distance travelled so far, for tap detection
       @ink_dirty = nil  # pending ink damage, inclusive corners
       @erased = nil     # last cell this erase stroke cleared (see erase_at)
+      @checks = 0       # CHECK presses this sitting (spec §3: it counts itself)
       # The stroke journal (M3a Task 6). @ink_strokes is every completed
       # stroke of the board on the glass, in draw order — the in-memory copy
       # of what the store holds under @current_save_id. While no autosave
@@ -473,6 +474,119 @@ module Redoku
       self
     end
 
+    # --- CHECK (M3b Task 7). The button, the pass, the verdicts. Public,
+    # like new_puzzle: it is what a Check press does and what a test drives
+    # directly, and Task 8 consumes mark_of and solved_correctly?.
+
+    # CHECK is the moment ink becomes an answer (PLAN.md §7, spec §2). One
+    # batch pass: group the live ink by cell, read each cell once, write the
+    # verdict into the model, and paint it.
+    #
+    # Not gated on a full board, and it counts itself (spec §3). Pressed on
+    # three cells it is a correctness oracle, which is a real way to cheat —
+    # the answer taken was to leave that to the player and put the number on
+    # the win screen, rather than to police it.
+    def run_check
+      @checks += 1
+      groups = ink_by_cell
+      return 0 if groups.empty?
+      done = 0
+      groups.each do |index, strokes|
+        done += 1
+        @renderer.draw_progress(done, groups.size)
+        @renderer.flush_progress
+        digit, = Recognizer.read(strokes)
+        if digit
+          @grid.set_entry(index, digit)
+          retire_ink(strokes)
+          # Repaints the cell from the model, so the printed digit replaces
+          # the handwriting — which is the point (spec §2): a misread is
+          # then visible as a printed 9 where you wrote a 4, instead of a
+          # bare X you cannot tell from your own mistake.
+          @renderer.redraw_cell(index, @grid, mark: mark_of(index))
+        else
+          @grid.set_unreadable(index)
+          # NOT redraw_cell: this cell keeps its ink.
+          @renderer.draw_mark(index, :unreadable)
+        end
+      end
+      # One board-wide GL16 rather than a per-cell storm. Constraint 4
+      # forbids DU here (entry digits are a mid tone), and fifty cell-sized
+      # GL16 flushes would take far longer than one board flush.
+      @renderer.flush_board
+      persist_autosave
+      done
+    end
+
+    # Live ink, grouped by the cell it sits in. Givens are skipped: a clue
+    # cannot be answered, set_entry would raise on one, and a player who
+    # circled a clue keeps that annotation. Cells below the dot guard fall
+    # out inside Recognizer.read rather than here, so a cell holding one
+    # stray speck still reads as unreadable rather than silently vanishing.
+    def ink_by_cell
+      out = {}
+      @ink_strokes.each do |s|
+        index = Ink.cell_of(s)
+        next if index.nil?
+        next if @grid.nil? || @grid.given?(index)
+        (out[index] ||= []) << s
+      end
+      out
+    end
+
+    # Read ink stops being replayed but stays in the record: it is the only
+    # copy of the player's hand. Contrast forget_ink_in, which DELETEs,
+    # because an erase means gone.
+    def retire_ink(strokes)
+      ids = []
+      strokes.each { |s| ids << s[:id] if s[:id] }
+      @ink_strokes = @ink_strokes - strokes
+      return if ids.empty? || @store.nil?
+      begin
+        @store.retire_strokes(ids)
+      rescue StandardError => e
+        log_line('stroke retire failed (' + e.message + ')')
+      end
+    end
+
+    # A pure function of state that already persists, which is why no column
+    # and no dirty set exists for marks (spec §2).
+    def mark_of(index)
+      return nil if @grid.nil? || @grid.given?(index)
+      return :unreadable if @grid.unreadable?(index)
+      v = @grid.value_at(index)
+      return nil if v == 0
+      return nil if @solution.nil? || @solution[index].nil?
+      v == @solution[index] ? nil : :wrong
+    end
+
+    def solved_correctly?
+      return false if @grid.nil? || @solution.nil?
+      i = 0
+      while i < Sudoku::Grid::CELLS
+        unless @grid.given?(i)
+          return false if @grid.value_at(i) != @solution[i]
+        end
+        i += 1
+      end
+      true
+    end
+
+    # Called from begin_stroke's :ink path, before the first segment is
+    # echoed: PLAN.md §7's "they stay until edited", made exact. Repainting
+    # is what takes the printed digit off the glass, and constraint 4 makes
+    # that a GL16 region — DU is two-level and would ghost the 96-gray
+    # digit.
+    def clear_verdict_at(index)
+      return if @grid.nil? || @grid.given?(index)
+      return if @grid.empty?(index) && !@grid.unreadable?(index)
+      @grid.clear_entry(index)
+      @renderer.redraw_cell(index, @grid)
+      x, y, w, h = Layout.cell_rect(Sudoku::Grid.col_of(index),
+                                    Sudoku::Grid.row_of(index))
+      @renderer.flush_rect(x, y, w, h, waveform: RM2::GL16)
+    end
+
     private
 
     # The empty check runs on every turn, not only when the list just shrank:
@@ -659,6 +773,11 @@ module Redoku
           @stroke_cur = nil
           @stroke_from = nil
           @stroke_count = 0
+          # PLAN.md §7's "they stay until edited", made exact: writing into
+          # a cell takes its last verdict — printed digit or '?' — off the
+          # glass before the first segment is echoed. See clear_verdict_at.
+          cell = Layout.cell_at(x, y)
+          clear_verdict_at(Sudoku::Grid.index_of(cell[0], cell[1]))
         end
         erase_at(x, y)
       else
@@ -854,6 +973,7 @@ module Redoku
       when :new   then return :back
       when :level then return :del
       when :games then return :save
+      when :check then return nil  # the saves list has no check: dead there
       when :quit  then return :quit
       end
       b = Layout.menu_button_at(x, y)
@@ -871,6 +991,7 @@ module Redoku
       when :quit then quit
       when :level then acknowledge(:level) { cycle_difficulty }
       when :new then acknowledge(:new) { new_puzzle }
+      when :check then acknowledge(:check) { run_check }
       when :games then acknowledge(:games) { open_menu }
       end
     end

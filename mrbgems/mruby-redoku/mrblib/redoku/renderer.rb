@@ -28,6 +28,11 @@ module Redoku
     # pixel rather than a crisp face.
     DIGIT_SCALE = 14
 
+    # A verdict mark, in the cell's top-right corner, small enough to leave
+    # the digit or the player's ink legible under it.
+    MARK_SCALE = 4
+    MARK_INSET = 8
+
     # The splash ('GENERATING...') is the other full-board-width text the
     # renderer prints, so it takes the header's own scale rather than
     # inventing a third one: same visual weight as REDOKU, and verified
@@ -308,25 +313,36 @@ module Redoku
     # cell's own line. Widening the repaint into the neighbours would trade
     # that band for something worse: shaving pixels off ink the player wrote
     # in a cell they never touched.
-    def redraw_cell(index, grid)
+    def redraw_cell(index, grid, mark: nil)
       col = Sudoku::Grid.col_of(index)
       row = Sudoku::Grid.row_of(index)
       x, y, w, h = Layout.cell_rect(col, row)
       @d.fill_rect(x, y, w, h, WHITE)
       redraw_cell_lines(col, row, x, y, w, h)
       if grid && !grid.empty?(index)
-        # WAVEFORM WARNING for whoever wires M3's recogniser through here.
-        # ENTRY_GRAY is 96, a mid tone, and the caller that exists today
-        # (App#erase_at) flushes this region as RM2::DU — a TWO-LEVEL
-        # waveform, which thresholds 96 to black or white and destroys the
-        # given-versus-entry distinction PLAN.md §8 asks for. Nothing in M2
-        # can reach it (no entries exist yet), so the ONLY gray this method
-        # ever actually prints today is GIVEN_GRAY. Repaint a cell holding an
-        # entry and the flush for it has to be GL16; App#flush_ink says the
-        # same thing at the point where the waveform is chosen.
+        # WAVEFORM WARNING, still true at the flush: ENTRY_GRAY is 96, a mid
+        # tone, and a DU update thresholds it to black or white. Any caller
+        # that puts an entry digit back on the glass — App#clear_verdict_at,
+        # CHECK's read path — must flush this region as GL16 (constraint 4).
         gray = grid.given?(index) ? GIVEN_GRAY : ENTRY_GRAY
         draw_digit(index, grid.value_at(index), gray)
       end
+      draw_mark(index, mark) if mark
+      self
+    end
+
+    # Paints ONLY the mark, over whatever is already in the cell. This is
+    # the path an :unreadable verdict must take: that cell is keeping its
+    # ink, and redraw_cell above would repaint the cell from the model and
+    # wipe the very strokes the verdict exists to preserve.
+    def draw_mark(index, mark)
+      text = mark == :wrong ? 'X' : '?'
+      col = Sudoku::Grid.col_of(index)
+      row = Sudoku::Grid.row_of(index)
+      x, y, w, _h = Layout.cell_rect(col, row)
+      gw = Font.width(text, MARK_SCALE)
+      Font.draw(@d, text, x + w - gw - MARK_INSET, y + MARK_INSET,
+                MARK_SCALE, GIVEN_GRAY)
       self
     end
 
