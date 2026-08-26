@@ -6,6 +6,11 @@ module Redoku
   # Store creates the directory itself, so a fresh device needs nothing.
   DB_PATH = '/home/root/redoku/games.db'.freeze
 
+  # How many passes over 1..9 one --record run asks for. Four rounds is 36
+  # samples — enough for Task 11 to tune against without asking the player
+  # to sit through a hundred prompts.
+  RECORD_ROUNDS = 4
+
   USAGE = <<~TEXT
     usage: redoku [options]
 
@@ -13,6 +18,7 @@ module Redoku
     The board takes the pen only; the buttons also take a finger.
     Tap Quit to give the screen back to xochitl.
 
+      --record    capture handwriting templates for the recognizer
       --clients   list the display server's clients and exit
       --help      show this message
   TEXT
@@ -20,7 +26,9 @@ module Redoku
   # Entry point called from tools/redoku/redoku.c. Returns the process exit
   # status.
   def self.main(argv)
-    unknown = argv.find { |a| !['--help', '--clients'].include?(a) }
+    unknown = argv.find do |a|
+      !['--help', '--clients', '--record'].include?(a)
+    end
     if unknown
       $stderr.puts "redoku: unknown option #{unknown}"
       $stderr.puts USAGE
@@ -30,6 +38,7 @@ module Redoku
       puts USAGE
       return 0
     end
+    return record_templates if argv.include?('--record')
     return list_clients if argv.include?('--clients')
 
     play
@@ -43,6 +52,83 @@ module Redoku
   rescue StandardError => e
     $stderr.puts "redoku: #{e.message}"
     1
+  end
+
+  # The capture half of --record: paint the prompt, feed pen strokes to the
+  # Recorder one completed stroke at a time, and write TARGET when the walk
+  # is over. This is a stripped-down App loop — no buttons, no board, no
+  # store — because a recording session has exactly one interaction: write
+  # the digit being asked for. Everything smarter than that (round-major
+  # ordering, codec, corrupt-line tolerance) lives in Recorder, which is
+  # what makes it host-testable.
+  #
+  # A SIGINT/SIGTERM mid-walk still writes what was captured: parse skips
+  # corrupt lines precisely so a torn file costs samples, never the session,
+  # and 20 good samples beat 0 because the player had to write them by hand.
+  def self.record_templates
+    RM2.setup_signals
+    display = nil
+    inputs = []
+    begin
+      display = RM2::Display.open
+
+      paths = RM2::Input.resolve_all(PEN_DEVICE)
+      if paths.empty?
+        raise "no input device named #{PEN_DEVICE}"
+      end
+      inputs = paths.map { |path| display.open_input(path) }
+
+      renderer = Renderer.new(display)
+      recorder = Recorder.new(rounds: RECORD_ROUNDS)
+      renderer.draw_record_prompt(recorder)
+      renderer.flush_all
+
+      subs = nil # subpaths of the stroke open right now; nil when pen is up
+      until recorder.done? || RM2.terminated?
+        ready = RM2::Input.wait(inputs, App::POLL_MS)
+        next unless ready
+        inputs.each do |input|
+          input.pending_events.each do |sample|
+            raw_x, raw_y, _pressure, tools = sample
+            x, y = Pen.to_screen(raw_x, raw_y)
+            down = (tools & RM2::Input::TOUCH) != 0
+            if down && subs.nil?
+              subs = [[[x, y]]]
+            elsif down
+              cur = subs[0]
+              prev = cur[cur.size - 1]
+              cur << [x, y] if prev[0] != x || prev[1] != y
+            elsif subs
+              stroke = { subpaths: subs }
+              # The dot guard decides "is this ink at all", exactly as it
+              # does in play: an accidental contact must not become a
+              # template of nothing.
+              if Ink.path_length(stroke) >= Ink::MIN_PATH
+                recorder.accept(stroke[:subpaths])
+                renderer.draw_record_prompt(recorder)
+                renderer.flush_all
+              end
+              subs = nil
+            end
+          end
+        end
+        # Same rule as App#drop_hung_up_sources: the server tearing down a
+        # uinput clone costs one source, never the session, and a session
+        # whose every pen source died has nothing left to wait on.
+        inputs = inputs.reject { |source| source.hung_up? }
+        break if inputs.empty?
+      end
+
+      Store.make_parent_dirs(File.dirname(Recorder::TARGET))
+      File.open(Recorder::TARGET, 'w') { |f| f.write(recorder.to_text) }
+      puts "redoku: saved #{recorder.samples.size} sample(s) to " +
+           Recorder::TARGET
+    ensure
+      inputs.each { |input| input.close }
+      # Closing the connection hands the panel back to xochitl, as in play.
+      display.close if display
+    end
+    0
   end
 
   def self.play

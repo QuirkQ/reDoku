@@ -102,6 +102,19 @@ module Redoku
     WIN_SCALE  = 10
     WIN_SUB    = 5
 
+    # The --record capture prompt (M3b Task 10): the digit being asked for,
+    # full-screen at the win headline's scale, and how many samples the walk
+    # has banked so far under it. Same pinned-string rule as WIN_TEXT —
+    # every character here must have a glyph, and test/renderer.rb asserts
+    # that against Font::GLYPHS rather than trusting the literals. The
+    # progress line reads 'SAVED N' rather than 'N OF M' because '/' has no
+    # glyph; the recorder's total is derivable but the count alone is what
+    # tells the player the pen stroke landed.
+    RECORD_TITLE     = 'WRITE '
+    RECORD_DONE_TEXT = 'DONE'
+    RECORD_SUB       = 'SAVED '
+    RECORD_SUB_SCALE = 5
+
     # THE PROGRESS BAR, and it is a real one: generation already loops over
     # attempts, so a callback on completed work gives honest progress at no
     # extra cost. What it means, stated plainly because a bar that means
@@ -409,6 +422,22 @@ module Redoku
     def centre_line(text, scale, y)
       w = Font.width(text, scale)
       Font.draw(@d, text, (Layout::SCREEN_W - w) / 2, y, scale, BLACK)
+    end
+
+    # The whole capture screen in one paint: which digit to write now (or
+    # DONE once the walk is over), and the running sample count. Like
+    # draw_win this is a full-screen paint followed by the caller's
+    # flush_all — a prompt is a mode change the player reads as one event,
+    # and it fires once per completed stroke, so there is nothing to be
+    # saved by region bookkeeping.
+    def draw_record_prompt(recorder)
+      @d.fill_rect(0, 0, Layout::SCREEN_W, Layout::SCREEN_H, WHITE)
+      title = recorder.done? ? RECORD_DONE_TEXT
+                             : RECORD_TITLE + recorder.wanted.to_s
+      centre_line(title, WIN_SCALE, Layout::SCREEN_H / 2 - 160)
+      centre_line(RECORD_SUB + recorder.samples.size.to_s,
+                  RECORD_SUB_SCALE, Layout::SCREEN_H / 2 + 120)
+      self
     end
 
     # The whole GAMES screen in one paint: header (title + pagination),

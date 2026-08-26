@@ -265,16 +265,27 @@ module Redoku
       @template_features ||= build_template_features
     end
 
-    # The authored polylines live in a 100x100 box, so they are lifted into
-    # panel coordinates for a real cell first: the feature vector must be
-    # computed from the same kind of input the game will hand read(), or the
-    # density boxes disagree.
+    # The authored polylines live in a 100x100 box, and the recorded ones
+    # (templates.local, via Recorder#to_text) are already in panel points —
+    # both are lifted into a real cell's coordinates before their feature
+    # vectors are computed, because the feature vector must come from the
+    # same kind of input the game hands read(). For the recorded set the
+    # lift is an isotropic scale-and-shift of points that were already
+    # panel-sized, which resample's normalisation (translate + uniform
+    # scale by the larger side) divides back out; only its integer rounding
+    # survives, which is noise at 140 px cells.
     def self.build_template_features
       out = []
+      add_features(out, Templates::AUTHORED)
+      add_features(out, load_local)   # the player's own hand, on top
+      out
+    end
+
+    def self.add_features(out, set)
       cell = 40 # the middle cell; any cell works, features are normalised
       x, y, w, h = Layout.cell_rect(Sudoku::Grid.col_of(cell),
                                     Sudoku::Grid.row_of(cell))
-      Templates::AUTHORED.each do |digit, subpaths|
+      set.each do |digit, subpaths|
         mapped = []
         subpaths.each do |sub|
           m = []
@@ -285,6 +296,15 @@ module Redoku
         out << [digit, vec] if vec
       end
       out
+    end
+
+    # Missing file is the NORMAL case, not an error: nobody has recorded
+    # anything on a fresh install, and the authored set is what ships.
+    def self.load_local
+      return [] unless File.exist?(Recorder::TARGET)
+      Recorder.parse(File.read(Recorder::TARGET))
+    rescue StandardError
+      []
     end
 
   end

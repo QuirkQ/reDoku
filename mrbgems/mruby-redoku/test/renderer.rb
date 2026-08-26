@@ -273,6 +273,31 @@ assert('every Rater tier name has a glyph for each of its characters') do
   end
 end
 
+# draw_record_prompt builds its two lines from RECORD_TITLE / RECORD_DONE_TEXT
+# plus digits (renderer.rb), under the same Font.draw-silently-draws-nothing
+# hazard SPLASH_TEXT is guarded against above. Asserting on the constants —
+# and on a full line assembled the way the method assembles it — covers both
+# what ships and how it is used.
+assert('every --record prompt string has a glyph for each of its characters') do
+  lines = [Redoku::Renderer::RECORD_TITLE + '9',
+           Redoku::Renderer::RECORD_DONE_TEXT,
+           Redoku::Renderer::RECORD_SUB + '36']
+  lines.each do |line|
+    line.each_char do |ch|
+      assert_true !Redoku::Font::GLYPHS[ch].nil?,
+                  "no glyph for #{ch.inspect} in record line #{line.inspect}"
+    end
+  end
+  # And the screen it paints is a real full-screen paint with printable
+  # content, not three silent no-ops over white paper.
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  rec = Redoku::Recorder.new(rounds: 1)
+  r.draw_record_prompt(rec)
+  assert_true d.draw_count > 0
+  assert_true d.inked_grays.include?(Redoku::Renderer::BLACK)
+end
+
 # SPLASH_SCALE is not handed to us the way DIGIT_SCALE is — Task 5a chose it,
 # so its arithmetic gets its own assertion rather than trust. Picked to match
 # Layout::TITLE_SCALE (the header's scale) for visual consistency between the
