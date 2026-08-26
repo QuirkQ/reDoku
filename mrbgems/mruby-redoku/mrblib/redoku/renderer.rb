@@ -92,6 +92,16 @@ module Redoku
     # (test/renderer.rb), instead of trusted anew at every call site.
     SPLASH_TEXT = 'GENERATING...'
 
+    # Pinned as constants for the reason SPLASH_TEXT is pinned: Font.draw
+    # silently draws NOTHING for a character it has no glyph for, so a
+    # caller-supplied string could ship a blank win screen and no test would
+    # see it. Pinned here, and asserted against the charset in test/app.rb.
+    WIN_TEXT   = 'SOLVED'
+    WIN_LABEL  = 'CHECKS: '
+    WIN_HINT   = 'TAP FOR A NEW ONE'
+    WIN_SCALE  = 10
+    WIN_SUB    = 5
+
     # THE PROGRESS BAR, and it is a real one: generation already loops over
     # attempts, so a callback on completed work gives honest progress at no
     # extra cost. What it means, stated plainly because a bar that means
@@ -378,6 +388,27 @@ module Redoku
       tx, ty = centered_origin(SPLASH_TEXT, SPLASH_SCALE, x, y, w, h)
       Font.draw(@d, SPLASH_TEXT, tx, ty, SPLASH_SCALE, BLACK)
       self
+    end
+
+    # The whole win screen in one paint: white panel, the verdict centred
+    # where a headline wants to be, the check count under it and the one
+    # instruction the screen needs. Like draw_games_menu, this is a FULL-
+    # screen paint rather than a region patch — it replaces the board and
+    # the chrome at once, and every caller flushes with flush_all.
+    def draw_win(checks)
+      @d.fill_rect(0, 0, @d.width, @d.height, WHITE)
+      centre_line(WIN_TEXT, WIN_SCALE, Layout::SCREEN_H / 2 - 160)
+      centre_line(WIN_LABEL + checks.to_s, WIN_SUB, Layout::SCREEN_H / 2)
+      centre_line(WIN_HINT, WIN_SUB, Layout::SCREEN_H / 2 + 120)
+      self
+    end
+
+    # `text` horizontally centred in the panel at `scale`, its top at `y`.
+    # The one formula draw_win's three lines share, so their rounding cannot
+    # drift apart the way three hand-written centres would.
+    def centre_line(text, scale, y)
+      w = Font.width(text, scale)
+      Font.draw(@d, text, (Layout::SCREEN_W - w) / 2, y, scale, BLACK)
     end
 
     # The whole GAMES screen in one paint: header (title + pagination),

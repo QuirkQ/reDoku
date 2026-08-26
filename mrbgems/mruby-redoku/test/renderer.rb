@@ -694,3 +694,20 @@ assert('Renderer#redraw_cell takes a mark and paints it beside the digit') do
   x, y, w, h = Redoku::Layout.cell_rect(0, 0)
   assert_true menu_ink_in?(d, x + w / 2, y, w / 2, h) # ...and so did the mark
 end
+
+# --- draw_win (M3b Task 8). The win screen is a full-screen paint like the
+# GAMES menu, so the same two guards the splash has apply: every character
+# must have a glyph, and every ink rect must land inside the panel.
+assert('Renderer draws the win screen the font can actually print') do
+  [Redoku::Renderer::WIN_TEXT,
+   Redoku::Renderer::WIN_LABEL,
+   Redoku::Renderer::WIN_HINT].each do |text|
+    text.each_char do |ch|
+      assert_true !Redoku::Font::GLYPHS[ch].nil?, "no glyph for #{ch.inspect}"
+    end
+  end
+  d = TestDisplay.new
+  Redoku::Renderer.new(d).draw_win(7)
+  assert_true d.painted_within?(0, 0, Redoku::Layout::SCREEN_W,
+                               Redoku::Layout::SCREEN_H)
+end

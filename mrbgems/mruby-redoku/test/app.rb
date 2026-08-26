@@ -2928,6 +2928,83 @@ assert('a cell repaint that removes an entry digit flushes GL16, not DU') do
   assert_equal RM2::GL16, hit[4]
 end
 
+# --- THE WIN SCREEN (M3b Task 8). Helpers first, then the assertions; the
+# board is solved by real pen samples, so the win is earned through the
+# recognizer exactly as it is on the device.
+
+def fill_board_correctly(app)
+  i = 0
+  while i < Redoku::Sudoku::Grid::CELLS
+    write_digit_in_cell(app, i, app.solution[i]) unless app.grid.given?(i)
+    i += 1
+  end
+end
+
+def last_empty_cell(grid)
+  i = Redoku::Sudoku::Grid::CELLS - 1
+  i -= 1 while i >= 0 && grid.given?(i)
+  i
+end
+
+assert('a full and correct board wins, and reports the check count') do
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  fill_board_correctly(app)      # helper: writes every non-given answer
+  app.run_check
+  assert_true app.won?
+  assert_equal :win, app.screen
+  # GC16 + SYNC: the one full-screen flash a transition is allowed.
+  last = d.updates[-1]
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H],
+               [last[0], last[1], last[2], last[3]]
+  assert_equal RM2::GC16, last[4]
+end
+
+assert('one unreadable cell is enough to withhold the win') do
+  # The property Grid::UNREADABLE exists for (spec §2): a cell that could
+  # not be read is not a solved cell, so no false win.
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  fill_board_correctly(app)
+  last = last_empty_cell(app.grid)
+  app.grid.clear_entry(last)
+  scribble_in_cell(app, last)
+  app.run_check
+  assert_true app.grid.unreadable?(last)
+  assert_false app.won?
+end
+
+assert('one wrong digit is enough to withhold the win') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  fill_board_correctly(app)
+  i = first_empty_cell(app.grid)
+  app.grid.set_entry(i, app.solution[i] == 9 ? 8 : 9)
+  assert_false app.solved_correctly?
+end
+
+assert('a tap on the win screen deals a new puzzle') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  fill_board_correctly(app)
+  app.run_check
+  before = app.grid.givens_s
+  app.handle_sample(pen_sample(700, 900, true))
+  app.handle_sample(pen_sample(700, 900, false))
+  assert_equal :play, app.screen
+  assert_false before == app.grid.givens_s
+  assert_equal 0, app.checks         # a new puzzle is a new sitting
+end
+
+assert('the win screen text stays inside the font charset') do
+  # Constraint 3: Font.draw silently draws NOTHING for a missing glyph, so
+  # a stray lowercase letter would ship a blank screen.
+  allowed = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -:.?'
+  Redoku::Renderer::WIN_TEXT.each_char do |ch|
+    assert_true allowed.include?(ch), "no glyph for #{ch.inspect}"
+  end
+end
+
 assert('CHECK persists its verdicts, including the unreadable one') do
   path = stroke_app_db('check_persist')
   remove_app_db(path)

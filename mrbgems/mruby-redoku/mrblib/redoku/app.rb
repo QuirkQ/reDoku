@@ -515,7 +515,20 @@ module Redoku
       # GL16 flushes would take far longer than one board flush.
       @renderer.flush_board
       persist_autosave
+      win_screen if solved_correctly?
       done
+    end
+
+    def won?
+      @screen == :win
+    end
+
+    # The one full-screen GC16 a transition is allowed (PLAN.md §8): it also
+    # clears the ghosting fifty cell repaints just laid down.
+    def win_screen
+      @screen = :win
+      @renderer.draw_win(@checks)
+      @renderer.flush_all
     end
 
     # Live ink, grouped by the cell it sits in. Givens are skipped: a clue
@@ -964,6 +977,7 @@ module Redoku
     # so a stroke that slides to a different meaning cancels itself exactly
     # as sliding off a button always has.
     def target_at(x, y)
+      return :win_tap if @screen == :win
       return Layout.button_at(x, y) if @screen == :play
       menu_target_at(x, y)
     end
@@ -993,6 +1007,12 @@ module Redoku
       when :new then acknowledge(:new) { new_puzzle }
       when :check then acknowledge(:check) { run_check }
       when :games then acknowledge(:games) { open_menu }
+      when :win_tap then
+        # A new puzzle is a new sitting, so the check count resets with it —
+        # @checks is per-board, not a lifetime score (spec §3).
+        @screen = :play
+        @checks = 0
+        new_puzzle
       end
     end
 
