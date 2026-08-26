@@ -356,3 +356,20 @@ end
 def r_shuffle_with_seed(list, seed)
   Redoku::Rng.new(seed).shuffle(list)
 end
+
+# The inverse of Grid#entries_s: '.' is empty, '?' is unreadable (M3b), and
+# anything else is a digit. Distinct from values_of, which has no '?' case
+# because givens and solutions can never hold one.
+def values_of_entries(str)
+  out = []
+  str.each_char do |ch|
+    out << if ch == '.' || ch == '0'
+             0
+           elsif ch == '?'
+             Redoku::Sudoku::Grid::UNREADABLE
+           else
+             ch.to_i
+           end
+  end
+  out
+end

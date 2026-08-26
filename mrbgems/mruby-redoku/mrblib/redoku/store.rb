@@ -35,6 +35,9 @@ module Redoku
     MAX_STROKE_POINTS = 2048
 
     BOARD_CHARS = '0123456789.'
+    # entries is the only column that may carry M3b's unreadable marker: a
+    # given and a solution are always digits or holes.
+    ENTRY_CHARS = '0123456789.?'
 
     # A replayed draw_line coordinate must fit what Display#draw_line accepts
     # (RM2_MAX_SPAN in src/display.c); Pen.to_screen cannot leave the panel,
@@ -521,7 +524,8 @@ module Redoku
 
     def normalize(game)
       return nil unless game.is_a?(Hash)
-      return nil unless board?(game[:givens]) && board?(game[:entries]) &&
+      return nil unless board?(game[:givens]) &&
+                        entries_board?(game[:entries]) &&
                         board?(game[:solution])
       diff = tier_of(game[:difficulty])
       ach = tier_of(game[:achieved_tier])
@@ -534,7 +538,7 @@ module Redoku
       diff = tier_of(r[2])
       ach = tier_of(r[3])
       if kind.nil? || diff.nil? || ach.nil? ||
-         !board?(r[4]) || !board?(r[5]) || !board?(r[6])
+         !board?(r[4]) || !entries_board?(r[5]) || !board?(r[6])
         log_line('skipped corrupt saved-game row ' + r[0].to_s)
         return nil
       end
@@ -544,8 +548,16 @@ module Redoku
     end
 
     def board?(s)
+      chars?(s, BOARD_CHARS)
+    end
+
+    def entries_board?(s)
+      chars?(s, ENTRY_CHARS)
+    end
+
+    def chars?(s, allowed)
       return false unless s.is_a?(String) && s.size == 81
-      s.each_char { |ch| return false unless BOARD_CHARS.include?(ch) }
+      s.each_char { |ch| return false unless allowed.include?(ch) }
       true
     end
 

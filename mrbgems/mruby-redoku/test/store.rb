@@ -736,3 +736,19 @@ assert('a version ABOVE v3 is still quarantined') do
   store.close
   remove_store_db(path)
 end
+
+assert('a game record may carry ? in entries but not in givens or solution') do
+  path = store_db('entries_q')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  ok = store_game
+  ok[:entries] = '?' + '.' * 80
+  assert_false store.save_autosave(ok).nil?
+  assert_equal '?', store.autosave[:entries][0]
+
+  bad = store_game
+  bad[:givens] = '?' + bad[:givens][1, 80]
+  assert_nil store.save_autosave(bad)
+  store.close
+  remove_store_db(path)
+end

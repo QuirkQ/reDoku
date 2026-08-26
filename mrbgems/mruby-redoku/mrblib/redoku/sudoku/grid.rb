@@ -230,8 +230,38 @@ module Redoku
         @givens[i] != 0
       end
 
+      # A non-given cell holds one of three things in @entries: 0 (empty),
+      # 1..9 (the player's answer), or UNREADABLE.
+      #
+      # UNREADABLE means CHECK looked at this cell's ink and could not read
+      # a digit from it with enough confidence (spec §5 — the thresholds err
+      # this way deliberately, because a guess that happens to match the
+      # solution is a silent false win). The cell keeps its ink and shows a
+      # '?'.
+      #
+      # It is a NEGATIVE sentinel and not a tenth digit so that value_at can
+      # filter it with one comparison, which is what keeps the whole engine
+      # blind to it: Solver, Rater and Techniques take `values` arrays, never
+      # a Grid, so as long as `values` reports 0 here they see exactly the
+      # board they have always seen. Two properties depend on that filter and
+      # neither is separately coded — an unreadable cell counts as unsolved
+      # (so it cannot produce a false win), and the generator's dig and the
+      # rater's re-solves are unaffected. Do not "simplify" value_at.
+      UNREADABLE = -1
+
       def value_at(i)
-        @givens[i] != 0 ? @givens[i] : @entries[i]
+        return @givens[i] if @givens[i] != 0
+        @entries[i] > 0 ? @entries[i] : 0
+      end
+
+      def set_unreadable(i)
+        raise "cell #{i} is a given" if given?(i)
+        @entries[i] = UNREADABLE
+        self
+      end
+
+      def unreadable?(i)
+        @entries[i] == UNREADABLE
       end
 
       # Writing over a given is refused rather than ignored: the caller has a
@@ -295,7 +325,15 @@ module Redoku
 
       def str_of(list)
         s = ''
-        list.each { |d| s = s + (d == 0 ? '.' : d.to_s) }
+        list.each do |d|
+          s = s + if d == 0
+                    '.'
+                  elsif d == UNREADABLE
+                    '?'
+                  else
+                    d.to_s
+                  end
+        end
         s
       end
     end

@@ -1386,7 +1386,11 @@ module Redoku
       i = 0
       while i < Sudoku::Grid::CELLS
         ch = rec[:entries][i]
-        grid.set_entry(i, ch.to_i) if ch != '.' && ch != '0' && !grid.given?(i)
+        if ch == '?'
+          grid.set_unreadable(i) unless grid.given?(i)
+        elsif ch >= '1' && ch <= '9'
+          grid.set_entry(i, ch.to_i) unless grid.given?(i)
+        end
         i += 1
       end
       @grid = grid

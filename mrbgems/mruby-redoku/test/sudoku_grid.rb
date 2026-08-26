@@ -239,3 +239,72 @@ assert('Grid entries survive alongside givens when both are supplied') do
   assert_true full.solved?
   assert_equal SOLVED_81, full.values_s
 end
+
+assert('an unreadable cell reads as empty to the engine') do
+  g = Redoku::Sudoku::Grid.parse('.' * 81)
+  g.set_unreadable(0)
+  assert_true g.unreadable?(0)
+  assert_equal 0, g.value_at(0)      # not -1: the sentinel never escapes
+  assert_true g.empty?(0)
+  assert_equal 0, g.values[0]
+  assert_equal '.', g.values_s[0]    # the engine's view is unchanged
+end
+
+assert('an unreadable cell persists as ? and nothing else does') do
+  g = Redoku::Sudoku::Grid.parse('.' * 81)
+  g.set_unreadable(3)
+  g.set_entry(4, 7)
+  assert_equal '?', g.entries_s[3]
+  assert_equal '7', g.entries_s[4]
+  assert_equal '.', g.entries_s[5]
+  # givens_s and values_s can never carry the sentinel, because value_at
+  # filters it and @givens never holds it.
+  assert_false g.givens_s.include?('?')
+  assert_false g.values_s.include?('?')
+end
+
+assert('an unreadable cell cannot produce a false win') do
+  # THE property this state exists to protect, and the reason the sentinel
+  # filter in value_at must not be "simplified" away. Fill a solved board,
+  # then make one cell unreadable: complete? already returns false because
+  # value_at reads 0 there, so solved? is false with no extra guard.
+  solved = solved_values                        # test/_support.rb
+  g = Redoku::Sudoku::Grid.new(Array.new(81, 0), solved.dup)
+  assert_true g.solved?
+  g.set_unreadable(40)
+  assert_false g.solved?
+end
+
+assert('writing a digit over an unreadable cell clears the sentinel') do
+  g = Redoku::Sudoku::Grid.parse('.' * 81)
+  g.set_unreadable(9)
+  g.set_entry(9, 5)
+  assert_false g.unreadable?(9)
+  assert_equal 5, g.value_at(9)
+end
+
+assert('clear_entry clears an unreadable cell too') do
+  g = Redoku::Sudoku::Grid.parse('.' * 81)
+  g.set_unreadable(9)
+  g.clear_entry(9)
+  assert_false g.unreadable?(9)
+  assert_equal '.', g.entries_s[9]
+end
+
+assert('set_unreadable refuses a given, exactly as set_entry does') do
+  g = Redoku::Sudoku::Grid.parse('5' + '.' * 80)
+  begin
+    g.set_unreadable(0)
+    assert_true false, 'expected a raise'
+  rescue RuntimeError => e
+    assert_true e.message.include?('given')
+  end
+end
+
+assert('a Grid round-trips an unreadable cell through its strings') do
+  g = Redoku::Sudoku::Grid.parse('.' * 81)
+  g.set_unreadable(11)
+  back = Redoku::Sudoku::Grid.new(Array.new(81, 0),
+                                  values_of_entries(g.entries_s))
+  assert_true back.unreadable?(11)
+end
