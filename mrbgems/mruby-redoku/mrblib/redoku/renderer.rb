@@ -438,6 +438,33 @@ module Redoku
       self
     end
 
+    # --- the LEVEL picker (M3b). Same full-screen shape as the GAMES menu:
+    # title in the header band, one row per option tiled over the board area
+    # with a hairline under each, chrome relabelled (BACK over New's rect is
+    # the way out). The current tier carries LEVEL_MARK; the others two spaces,
+    # so every label starts on the same column. Pinned strings for the reason
+    # SPLASH_TEXT is pinned: Font.draw silently draws NOTHING for a character
+    # it has no glyph for, so each literal the picker can print lives here and
+    # is glyph-asserted against Rater::TIERS in test/app.rb.
+    LEVEL_TITLE = 'LEVEL'
+    LEVEL_MARK  = '- '        # against the current tier; inside the charset
+
+    def draw_levels_menu(tiers, current)
+      @d.fill_rect(0, 0, @d.width, @d.height, WHITE)
+      Font.draw(@d, LEVEL_TITLE, Layout::HEADER_X, Layout::HEADER_Y,
+                Layout::TITLE_SCALE, BLACK)
+      tiers.each_with_index do |tier, i|
+        x, y, w, h = Layout.menu_row_rect(i)
+        label = (tier == current ? LEVEL_MARK : '  ') + tier.to_s.upcase
+        Font.draw(@d, label, x + 20,
+                  y + (h - Font::HEIGHT * Layout::LABEL_SCALE) / 2,
+                  Layout::LABEL_SCALE, BLACK)
+        @d.fill_rect(x, y + h - 1, w, 1, BLACK)
+      end
+      draw_menu_buttons(false)
+      self
+    end
+
     # The whole bar, frame and fill, repainted from scratch each time: 620x24
     # is nothing to fill and it removes any question of a stale fill edge
     # surviving a repaint.
@@ -501,7 +528,7 @@ module Redoku
     # The other half, and the reason draw_button takes its colours as
     # arguments: a pressed button has to come back up, because neither of the
     # two actions that survive their own press repaints the buttons
-    # (cycle_difficulty flushes the header, new_puzzle the board), so an
+    # (new_puzzle flushes the board, open_levels the whole panel), so an
     # inverted button would otherwise stay inverted for the session. Only
     # App knows which presses outlive themselves, so App decides — see
     # App#acknowledge.

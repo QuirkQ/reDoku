@@ -425,8 +425,8 @@ module Redoku
     # board under a fully green test suite.
     #
     # Public because it is what a New press does and what a test drives
-    # directly; the dig itself is fill_board, which cycle_difficulty and run
-    # also reach.
+    # directly; the dig itself is fill_board, which the win screen's tap,
+    # level_chosen and run also reach.
     # An EMPTY BAR goes up with the splash, on the splash's own flush, for the
     # same reason run does it: it costs no extra refresh, and a bar that
     # appears from nowhere partway through a search reads worse than one that
@@ -459,6 +459,13 @@ module Redoku
       # the GAMES menu must bring the menu back, not the board underneath it.
       if @screen == :menu
         refresh_menu
+        return self
+      end
+      # Same rule one screen over: a SIGCONT that lands in the LEVEL picker
+      # must bring the picker back, not the board underneath it.
+      if @screen == :levels
+        @renderer.draw_levels_menu(Sudoku::Rater::TIERS, @difficulty)
+        @renderer.flush_all
         return self
       end
       @renderer.draw_all(@difficulty)
@@ -997,13 +1004,20 @@ module Redoku
     end
 
     def press(target)
-      if @screen == :menu
+      # Both menus share the same stroke targets (menu_target_at), so both
+      # route through the same press handler; the row case dispatches on
+      # @screen there.
+      if @screen == :menu || @screen == :levels
         press_in_menu(target)
         return self
       end
       case target
       when :quit then quit
-      when :level then acknowledge(:level) { cycle_difficulty }
+      # LEVEL opens a picker rather than cycling. Cycling is REPLACED, not kept
+      # beside it: five tiers meant up to five presses and a full dig on each
+      # one that landed, and two ways to set one value is how the tier label
+      # and Renderer::DIFFICULTIES drifted apart before.
+      when :level then acknowledge(:level) { open_levels }
       when :new then acknowledge(:new) { new_puzzle }
       when :check then acknowledge(:check) { run_check }
       when :games then acknowledge(:games) { open_menu }
@@ -1016,7 +1030,8 @@ module Redoku
       end
     end
 
-    # Menu presses. Every action repaints its own result (refresh_menu or a
+    # Menu presses, for both menus (:menu GAMES, :levels LEVEL). Every action
+    # repaints its own result (refresh_menu / the picker's full paint or a
     # full play-mode repaint), which is why the repainting ones run inside
     # acknowledge like every other press — and why the acknowledgement's
     # restore half is what decides whether the flash survives its own
@@ -1024,10 +1039,10 @@ module Redoku
     #
     # - BACK/SAVE/PREV/NEXT come back up, because their actions repaint
     #   regions that include their buttons but no button pass repaints them;
-    # - a ROW stays down (restore: false): loading a save repaints everything
-    #   anyway, and deleting repaints the menu — either way the inverted row
-    #   it flashed is gone under the repaint, and painting it "back" would
-    #   flush stale pixels over whatever the action just put there.
+    # - a ROW stays down (restore: false): loading a save, dealing at a tier
+    #   and deleting all repaint everything the inverted row covered —
+    #   either way the flash is gone under the repaint, and painting it "back"
+    #   would flush stale pixels over whatever the action just put there.
     #
     # DEL acknowledges nothing: its feedback is PERSISTENT, not transient —
     # the armed state is the label sitting inverted (draw_menu_buttons), and
@@ -1035,20 +1050,53 @@ module Redoku
     # inversions racing to one panel, and a release would un-arm the mode on
     # the glass while it stayed armed in the model.
     #
+    # The row-index case dispatches on @screen, because menu_target_at is
+    # shared: an Integer row means "load this save" in :menu but "deal at
+    # this tier" in :levels. The GAMES-only actions (DEL/SAVE/PREV/NEXT) are
+    # dead on the picker rather than falling through to their GAMES meanings.
+    #
     # An unknown target cannot reach here (both stroke paths latch nil for
     # dead space and nil never presses), so the case simply falls through.
     def press_in_menu(target)
       case target
       when :quit then quit
       when :back then acknowledge(:back) { close_menu }
-      when :del then toggle_delete_mode
-      when :save then acknowledge(:save, restore: false) { save_manual_copy }
-      when :prev then acknowledge(:prev) { turn_page(-1) }
-      when :next then acknowledge(:next) { turn_page(1) }
+      when :del then toggle_delete_mode if @screen == :menu
+      when :save then acknowledge(:save, restore: false) { save_manual_copy } if @screen == :menu
+      when :prev then acknowledge(:prev) { turn_page(-1) } if @screen == :menu
+      when :next then acknowledge(:next) { turn_page(1) } if @screen == :menu
       else
         return unless target.is_a?(Integer)
-        acknowledge(target, restore: false) { row_chosen(target) }
+        acknowledge(target, restore: false) do
+          @screen == :levels ? level_chosen(target) : row_chosen(target)
+        end
       end
+    end
+
+    # --- the LEVEL picker (M3b). LEVEL opens it, a row deals at that tier,
+    # BACK leaves without touching the tier or the board.
+
+    # LEVEL opens a picker rather than cycling. Cycling is REPLACED, not kept
+    # beside it: five tiers meant up to five presses and a full dig on each
+    # one that landed, and two ways to set one value is how the tier label
+    # and Renderer::DIFFICULTIES drifted apart before.
+    def open_levels
+      @screen = :levels
+      @renderer.draw_levels_menu(Sudoku::Rater::TIERS, @difficulty)
+      @renderer.flush_all
+      self
+    end
+
+    # A tapped row means "deal at this tier". Out of range is a no-op, never
+    # a crash. The dig IS the transition: new_puzzle repaints the board
+    # itself, hence restore: false back in press_in_menu.
+    def level_chosen(n)
+      tier = Sudoku::Rater::TIERS[n]
+      return unless tier
+      @difficulty = tier
+      @screen = :play
+      new_puzzle          # repaints the board itself, hence restore: false
+      self
     end
 
     # --- the GAMES menu (M3a). State: @screen, @page, @delete_mode. Every
@@ -1243,7 +1291,7 @@ module Redoku
     #
     # What this deliberately does NOT cover, because it is the actions' own
     # pre-existing shape rather than the acknowledgement's: a flush raised by
-    # cycle_difficulty or new_puzzle themselves still unwinds out of the loop,
+    # new_puzzle or open_levels themselves still unwinds out of the loop,
     # past main.rb's explicit display.close, and leaves the button inverted
     # on the way out. Containing that means making main.rb close the display
     # come what may, which is a change to the entry point, not to this
@@ -1275,38 +1323,21 @@ module Redoku
       false
     end
 
-    # Level advances the tier, repaints the label AND digs a new board at the
-    # new tier, because a tier means nothing until a puzzle of that tier is on
-    # the glass — a Level press that only changed a word would be a setting,
-    # not a button.
-    #
-    # Header first, puzzle second. The label is the cheap half and answers the
-    # tap at once; new_puzzle's splash then covers the dig, which is the
-    # expensive half. Doing it the other way round would leave the old tier's
-    # name over the new tier's board for the whole search.
-    def cycle_difficulty
-      list = Sudoku::Rater::TIERS
-      @difficulty = list[(list.index(@difficulty) + 1) % list.size]
-      @renderer.draw_header(@difficulty)
-      @renderer.flush_header
-      new_puzzle
-    end
-
     # Digs a puzzle at the current difficulty and puts it on the board. The
     # caller owns the splash — new_puzzle flushes one first, and run's opening
     # GC16 already carries one — so this is the second half of both.
     #
     # WHAT THE HEADER SHOWS is settled here, and it shows the REQUESTED tier:
-    # @difficulty is what cycle_difficulty advanced, what draw_header printed
-    # and what the generator was asked for. The header is the Level button's
-    # read-out, not a rating of the board — a label that followed the achieved
-    # tier would make the button unpredictable: ask for medium, get easy, the
-    # label reads EASY, so the next press reads EASY as the current tier and
-    # offers medium again, three presses stop visiting three labels, and HARD
-    # can become unreachable. Splitting the two apart into "the tier you asked
-    # for" and "the tier you got" is also what keeps M1's one-step-per-tap
-    # guarantee (test/app.rb, 'the acknowledgement runs each action exactly
-    # once') meaningful.
+    # @difficulty is what the player chose — in the picker's row tap or at
+    # launch — what draw_header printed and what the generator was asked for.
+    # The header is the chosen tier's read-out, not a rating of the board — a
+    # label that followed the achieved tier would make it unpredictable: ask
+    # for medium, get easy, the label reads EASY, so the picker reads EASY as
+    # the current tier and offers medium again, and HARD can become
+    # unreachable. Splitting the two apart into "the tier you asked for" and
+    # "the tier you got" is also what keeps M1's one-step-per-tap guarantee
+    # (test/app.rb, 'the acknowledgement runs each action exactly once')
+    # meaningful.
     #
     # Under the retry-without-limit rule that gap has NARROWED to one case, and
     # it is worth naming: a successful search only ever returns the tier that

@@ -182,6 +182,58 @@ def pen_away_sample(sx, sy)
   [s[0], s[1], 0, 0]
 end
 
+# --- press and tap helpers. Defined here, before the first assertion that
+# uses them: top-level defs execute in file order in mruby, so a helper
+# defined below its first caller is simply not there yet. Built on pen_sample
+# rather than a parallel set, so a change to how a stroke is faked lands in
+# one place.
+
+def press_new(app)
+  press_pen_button(app, :new)
+end
+
+def press_level(app)
+  press_pen_button(app, :level)
+end
+
+# In a menu the play-mode :new rect means BACK (App#menu_target_at).
+def press_back(app)
+  x, y, w, h = Redoku::Layout.button_rect(:new)
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, true))
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, false))
+end
+
+# A tap: down and up on the centre of the named button.
+def press_pen_button(app, name)
+  x, y, w, h = Redoku::Layout.button_rect(name)
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, true))
+  app.handle_sample(pen_sample(x + w / 2, y + h / 2, false))
+  app
+end
+
+def tap_pen_at(app, x, y)
+  app.handle_sample(pen_sample(x, y, true))
+  app.handle_sample(pen_sample(x, y, false))
+  app
+end
+
+def tap_button(app, name)
+  x, y, w, h = Redoku::Layout.button_rect(name)
+  tap_pen_at(app, x + w / 2, y + h / 2)
+end
+
+# A GAMES-menu action taps the play-mode button whose rect it shares
+# (geometry never moves between modes — see App#menu_target_at).
+def tap_menu_action(app, name)
+  chrome = { back: :new, del: :level, save: :games }
+  tap_button(app, chrome[name])
+end
+
+def tap_menu_row(app, n)
+  x, y, w, h = Redoku::Layout.menu_row_rect(n)
+  tap_pen_at(app, x + w / 2, y + h / 2)
+end
+
 # The same packet with the pen's OTHER END in proximity: BTN_TOOL_RUBBER
 # where pen_sample has BTN_TOOL_PEN. The digitizer latches one tool code or
 # the other when the tool enters range and reports contact separately on
@@ -760,9 +812,11 @@ assert('New and Level come back up; Quit stays down because it is leaving') do
     app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
     app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
     assert_true app.running?, name.to_s
-    # Neither action repaints the buttons — new_puzzle flushes the board,
-    # cycle_difficulty the header — so without a release of its own the
-    # button would stay inverted for the rest of the session.
+    # Neither action leaves the button inverted: new_puzzle flushes the board,
+    # open_levels the whole panel — either way every pixel of the pressed
+    # button has just been repainted over, but only by paints that are
+    # already ordered before the release, so the release of its own is what
+    # guarantees the button comes back up.
     assert_equal [bx, by, bw, bh, RM2::DU, RM2::FAST_DRAW],
                  d.updates[d.updates.size - 1], name.to_s
     # Same waveform in both directions, so the flash is symmetric: a press
@@ -836,34 +890,31 @@ end
 assert('the acknowledgement runs each action exactly once') do
   app, d, = new_app
   lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
-  3.times do |i|
+  nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
+  2.times do
     d.clear_calls
-    app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
-    app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
-    # One step per tap: a press that ran cycle_difficulty twice would skip a
-    # difficulty, and one that dropped it would stay put.
-    list = Redoku::Sudoku::Rater::TIERS
-    assert_equal(list[(i + 1) % list.size], app.difficulty)
-    # Exactly one header flush per tap, exactly as before. What changed is how
-    # it is counted: Level now digs a puzzle as well as renaming the tier, and
-    # new_puzzle's two board flushes are GL16 chrome too, so counting GL16
-    # updates no longer isolates the header. Counted by REGION instead, which
-    # asks a tighter question than the old waveform count did, not a looser
-    # one — the old version would have accepted a header flush that landed on
-    # the wrong rect.
-    hx = Redoku::Layout::HEADER_X
-    hy = Redoku::Layout::HEADER_Y
-    header = d.updates.reject { |u| u[0] != hx || u[1] != hy }
-    assert_equal 1, header.size
-    # And exactly two board flushes, which is the same "exactly once" property
-    # applied to the new half of the action: the splash and then the puzzle,
-    # dug once per tap and not twice.
-    bx, by, = Redoku::Layout.board_rect
-    board = d.updates.reject { |u| u[0] != bx || u[1] != by }
-    assert_equal 2, board.size
-    # All three of those are chrome and none of them ink, which is the M1
-    # waveform discipline the old count was written in.
-    assert_equal 3, d.updates.reject { |u| u[4] != RM2::GL16 }.size
+    press_level(app)
+    # One picker per tap: a press that ran open_levels twice would paint two
+    # full screens, and one that dropped it would leave the board showing.
+    assert_equal :levels, app.screen
+    # Exactly three updates per tap: the press flash at the button (DU), ONE
+    # whole-screen GC16 carrying the picker — a menu is a mode change and
+    # arrives in one paint, exactly as the GAMES menu does — and the release
+    # flash. Counted by region rather than trusting the total alone.
+    assert_equal 3, d.updates.size
+    assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+    u = d.updates[1]
+    assert_equal [0, 0], [u[0], u[1]]
+    assert_equal [Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H],
+                 [u[2], u[3]]
+    assert_equal RM2::GC16, u[4]
+    assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
+    # And BACK out again, so the next round presses Level on :play, where it
+    # means the picker — on :menu and :levels that rect belongs to the menu.
+    d.clear_calls
+    app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, true))
+    app.handle_sample(pen_sample(nx + nw / 2, ny + nh / 2, false))
+    assert_equal :play, app.screen
   end
 end
 
@@ -887,7 +938,7 @@ assert('a finger tap is acknowledged exactly the way the pen tap is') do
   assert_equal 0, d.gray_at(nx, ny)
 end
 
-assert('a Level press whose flash is refused still cycles the difficulty') do
+assert('a Level press whose flash is refused still opens the picker') do
   d = DeafButtonsDisplay.new
   input = FakeInput.new
   waiter = TimelineWaiter.new([input], d)
@@ -900,46 +951,17 @@ assert('a Level press whose flash is refused still cycles the difficulty') do
   # N1 for all three buttons now, not Quit's alone: the display socket
   # carries a 10 s receive timeout, so a press flash really can raise on the
   # device — and the player must still get the thing they pressed.
-  assert_equal :medium, app.difficulty
+  assert_equal :levels, app.screen
+  assert_equal :easy, app.difficulty   # the picker, not a dig
   assert_true app.running?
-  # ...and the puzzle that goes with the tier, which is the other half of what
-  # Level now means.
-  assert_false app.grid.nil?
   # Nothing reached the panel to hold or to put back, so neither happened.
-  # The header, which is not a button, went out as usual.
   assert_equal [], waiter.calls
-  # COUNTED BY REGION, not by total, and that is the change the progress bar
-  # forced. The deaf display refuses only button rects, and the bar lives
-  # inside board_rect, so the bar lands here too — but this test digs :medium
-  # at the production cap, where the bar paints once per VISIBLE STEP and a
-  # :medium search may take more than one attempt to hit. The total is
-  # therefore not a number this document can predict, while every claim the
-  # test actually makes still is. Same pattern as 'the acknowledgement runs
-  # each action exactly once' above: a tighter question than a bare total, not
-  # a looser one.
-  #
-  # The header is still FIRST and still GL16 — the M1 decision this test
-  # exists for — and there is still exactly one of it.
-  hx = Redoku::Layout::HEADER_X
-  hy = Redoku::Layout::HEADER_Y
-  assert_equal RM2::GL16, d.updates[0][4]
-  assert_equal [hx, hy], [d.updates[0][0], d.updates[0][1]]
-  assert_equal 1, d.updates.reject { |u| u[0] != hx || u[1] != hy }.size
-  # Then exactly two board flushes: the splash and the finished puzzle. That is
-  # the dig Level gained, unchanged by the bar.
-  bx, by, bw, bh = Redoku::Layout.board_rect
-  board = d.updates.reject { |u| u[0] != bx || u[1] != by }
-  assert_equal 2, board.size
-  board.each { |u| assert_equal [bx, by, bw, bh, RM2::GL16, 0], u }
-  # ...and the bar moved at least once, in the ink waveform, between them.
-  px, py, = Redoku::Renderer.progress_rect
-  bar = d.updates.reject { |u| u[0] != px || u[1] != py }
-  assert_true bar.size >= 1
-  bar.each { |u| assert_equal RM2::DU, u[4] }
-  # Nothing else reached the panel at all. This is what replaces the old
-  # `assert_equal 3, d.updates.size`: it still says "and nothing else",
-  # without hard-coding a number the bar controls.
-  assert_equal d.updates.size, 1 + board.size + bar.size
+  # The action's own paint DID reach the panel: one whole-screen GC16. The
+  # deaf display refuses only button rects, and no button lives at (0, 0).
+  assert_equal 1, d.updates.size
+  u = d.updates[0]
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
+                RM2::GC16, RM2::SYNC], u
 end
 
 assert('a New press whose flash is refused still clears the ink') do
@@ -1019,34 +1041,27 @@ assert('sliding off Quit before releasing does not fire it') do
   assert_true app.running?
 end
 
-assert('a tap on Level cycles the difficulty and repaints the header') do
+assert('a tap on Level opens the picker instead of digging') do
   app, d, = new_app
   assert_equal :easy, app.difficulty
   lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
-  3.times do |i|
-    d.clear_calls
-    app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
-    app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
-    list = Redoku::Sudoku::Rater::TIERS
-    expected = list[(i + 1) % list.size]
-    assert_equal expected, app.difficulty
-    # press flash, header, splash, puzzle, release flash. Was three before
-    # M2, when Level only renamed the tier; the two extra are the board the
-    # tier now comes with. The header is still the FIRST thing after the press
-    # and still GL16 — the M1 decision this test is named for — and it is no
-    # longer the only GL16, because the splash and the puzzle are chrome too.
-    assert_equal 5, d.updates.size
-    assert_equal RM2::GL16, d.updates[1][4]
-    assert_equal Redoku::Layout::HEADER_X, d.updates[1][0]
-    assert_equal Redoku::Layout::HEADER_Y, d.updates[1][1]
-    bx, by, bw, bh = Redoku::Layout.board_rect
-    assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[2]
-    assert_equal [bx, by, bw, bh, RM2::GL16, 0], d.updates[3]
-    assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[4]
-    # ...and a board of the new tier really is on the glass, which is what
-    # makes the label mean anything.
-    assert_false app.grid.nil?
-  end
+  d.clear_calls
+  app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
+  app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
+  assert_equal :levels, app.screen
+  # The tier is untouched and nothing was dug — the dig belongs to a row tap,
+  # not to opening the list.
+  assert_equal :easy, app.difficulty
+  assert_nil app.grid
+  # press flash, whole-screen GC16 carrying the picker, release flash. Same
+  # shape as the GAMES menu's arrival, because it is the same kind of event.
+  assert_equal 3, d.updates.size
+  assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
+  u = d.updates[1]
+  assert_equal [0, 0], [u[0], u[1]]
+  assert_equal [Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H], [u[2], u[3]]
+  assert_equal RM2::GC16, u[4]
+  assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
 end
 
 assert('a tap on New clears the ink and repaints the board') do
@@ -1517,23 +1532,6 @@ def test_app_with_display
   [app, d]
 end
 
-def press_new(app)
-  press_pen_button(app, :new)
-end
-
-def press_level(app)
-  press_pen_button(app, :level)
-end
-
-# A tap: down and up on the centre of the named button, which is what every
-# existing press assertion above does by hand.
-def press_pen_button(app, name)
-  x, y, w, h = Redoku::Layout.button_rect(name)
-  app.handle_sample(pen_sample(x + w / 2, y + h / 2, true))
-  app.handle_sample(pen_sample(x + w / 2, y + h / 2, false))
-  app
-end
-
 assert('App holds a generated puzzle once it has one') do
   app = test_app
   app.new_puzzle
@@ -1559,14 +1557,51 @@ assert('a tap on New generates a different puzzle') do
   assert_true Redoku::Sudoku::Solver.unique?(app.grid.values)
 end
 
-assert('a tap on Level changes the difficulty and the puzzle with it') do
-  app = test_app
+assert('LEVEL opens the picker instead of cycling') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  before = app.difficulty
+  press_level(app)
+  assert_equal :levels, app.screen
+  assert_equal before, app.difficulty      # it no longer changes on press
+end
+
+assert('the picker offers exactly the five tiers, in Rater order') do
+  assert_equal Redoku::Sudoku::Rater::TIERS.size, Redoku::Layout.level_rows
+  # Derived and not duplicated: adding a sixth tier must not need a Layout
+  # edit. Rater::TIERS is the only tier list in the tree.
+  assert_equal 5, Redoku::Layout.level_rows
+  assert_true Redoku::Layout.level_rows <= 9   # rows the menu band can hold
+end
+
+assert('tapping a row sets that tier and deals at it') do
+  app, = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  press_level(app)
+  tap_menu_row(app, 3)                     # :expert, TIERS[3]
+  assert_equal :expert, app.difficulty
+  assert_equal :play, app.screen
+end
+
+assert('BACK leaves the picker without changing the tier or the board') do
+  app, = new_app(generator: FakeGenerator.new)
   app.new_puzzle
   before_tier = app.difficulty
-  before_puzzle = app.grid.givens_s
+  before_board = app.grid.givens_s
   press_level(app)
-  assert_false app.difficulty == before_tier
-  assert_false app.grid.givens_s == before_puzzle
+  press_back(app)
+  assert_equal :play, app.screen
+  assert_equal before_tier, app.difficulty
+  assert_equal before_board, app.grid.givens_s
+end
+
+assert('every tier label has a glyph for every character') do
+  allowed = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -:.?'
+  Redoku::Sudoku::Rater::TIERS.each do |t|
+    t.to_s.upcase.each_char do |ch|
+      assert_true allowed.include?(ch), "no glyph for #{ch.inspect} in #{t}"
+    end
+  end
 end
 
 assert('the splash reaches the panel before generation starts') do
@@ -1709,24 +1744,19 @@ class MissingGenerator < FakeGenerator
   end
 end
 
-# Cycles the difficulty until it reaches `tier`, which is how a player gets
-# there -- App has no setter, deliberately, because @difficulty is the Level
-# button's read-out.
+# Puts App at `tier` directly, which is how a test gets there -- @difficulty
+# has no setter because the player reaches tiers through the LEVEL picker, and
+# walking there would mean dealing a puzzle per stop (the picker's whole
+# point).
 #
-# EACH CYCLE DIGS. cycle_difficulty ends in new_puzzle -> fill_board, so
-# walking :easy -> :master is FOUR generations, not a state change: with a
-# hitting FakeGenerator that is four cheap calls and four log lines, and a test
-# that wants exact counts has to install its real generator AFTERWARDS.
-#
-# `send`, not a public cycle_difficulty. Object#send is available (this gem
-# declares mruby-metaprog since 18cc2f5), so there is no reason to widen App's
-# API for a test.
+# instance_variable_set rather than a public seam on App: this is a test
+# reaching into a test's own subject for one line, not an API anyone ships.
 def difficulty_to(app, tier)
-  Redoku::Sudoku::Rater::TIERS.size.times do
-    return app if app.difficulty == tier
-    app.send(:cycle_difficulty)
+  unless Redoku::Sudoku::Rater::TIERS.include?(tier)
+    raise "no such difficulty: #{tier}"
   end
-  raise "no such difficulty: #{tier}"
+  app.instance_variable_set(:@difficulty, tier)
+  app
 end
 
 assert('a missed tier is asked for again, without limit') do
@@ -2019,29 +2049,6 @@ end
 def game_record(givens, tier, entries = '.' * 81)
   { difficulty: tier, achieved_tier: tier,
     givens: givens, entries: entries, solution: SOLVED_81 }
-end
-
-def tap_pen_at(app, x, y)
-  app.handle_sample(pen_sample(x, y, true))
-  app.handle_sample(pen_sample(x, y, false))
-  app
-end
-
-def tap_button(app, name)
-  x, y, w, h = Redoku::Layout.button_rect(name)
-  tap_pen_at(app, x + w / 2, y + h / 2)
-end
-
-# A GAMES-menu action taps the play-mode button whose rect it shares
-# (geometry never moves between modes — see App#menu_target_at).
-def tap_menu_action(app, name)
-  chrome = { back: :new, del: :level, save: :games }
-  tap_button(app, chrome[name])
-end
-
-def tap_menu_row(app, n)
-  x, y, w, h = Redoku::Layout.menu_row_rect(n)
-  tap_pen_at(app, x + w / 2, y + h / 2)
 end
 
 def games_store_db(name)
@@ -2415,9 +2422,13 @@ assert('New clears the persisted strokes along with the ink') do
   assert_equal [], app.ink_strokes
   assert_equal [], store.strokes(sid)
 
-  # And a Level press is a New underneath, so it clears too.
+  # And dealing from the LEVEL picker is a New underneath, so it clears too:
+  # open the picker, tap row 0 (:easy), and the dig wipes the journal.
   draw_ink_stroke(app, d)
   press_level(app)
+  assert_equal :levels, app.screen
+  tap_menu_row(app, 0)
+  assert_equal :play, app.screen
   assert_equal [], store.strokes(app.current_save_id)
   store.close
   remove_app_db(path)

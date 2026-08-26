@@ -132,5 +132,14 @@ module Redoku
       end
       [BOARD_X, BOARD_Y + n * CELL, BOARD_W, CELL]
     end
+
+    # How many rows the LEVEL picker lists (M3b). Derived, never duplicated:
+    # Rater::TIERS is the ONLY tier list in the tree, and rater.rb says so at
+    # the point of definition ("Do not reintroduce one" — Renderer::DIFFICULTIES
+    # was deleted for being a second copy), so adding a sixth tier is an edit
+    # there alone.
+    def self.level_rows
+      Sudoku::Rater::TIERS.size
+    end
   end
 end
