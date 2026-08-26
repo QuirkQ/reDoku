@@ -2507,6 +2507,85 @@ assert('resume-on-launch brings the ink back with the board') do
   remove_app_db(path)
 end
 
+# --- erase persistence (M3b Task 3). The M3a plan claimed the eraser needed
+# no journal entry because it "repaints cells from the model, so a reload
+# restores erased cells correctly by simply not having those strokes"
+# (docs/plans/2026-08-25-m3-sqlite-saves.md, Task 6). The stroke was already
+# journaled at pen-lift, before the eraser came, so it did have one. These
+# two assertions are the proof and the guard.
+
+assert('erasing a cell removes its stroke from the journal') do
+  path = stroke_app_db('erase_journal')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, d, = new_app(store: store)
+  app.new_puzzle
+  sid = app.current_save_id
+  assert_false sid.nil?
+
+  draw_ink_stroke(app, d)              # cell (1,1), screen (300,400)..(340,440)
+  assert_equal 1, store.strokes(sid).size
+
+  app.handle_sample(eraser_sample(300, 400, true))
+  app.handle_sample(eraser_sample(300, 400, false))
+
+  assert_equal 0, store.strokes(sid).size
+  assert_equal 0, app.ink_strokes.size
+  store.close
+  remove_app_db(path)
+end
+
+assert('an erased stroke is not replayed after a relaunch') do
+  path = stroke_app_db('erase_reload')
+  remove_app_db(path)
+
+  store1 = Redoku::Store.open(path, log: nil)
+  app1, d1, _in1, signals1 = new_app(store: store1)
+  app1.new_puzzle
+  draw_ink_stroke(app1, d1)
+  app1.handle_sample(eraser_sample(300, 400, true))
+  app1.handle_sample(eraser_sample(300, 400, false))
+  signals1.terminated = true
+  app1.run
+  assert_true store1.closed?
+
+  store2 = Redoku::Store.open(path, log: nil)
+  app2, _d2, _in2, signals2 = new_app(store: store2)
+  signals2.terminated = true
+  app2.run                             # resume-on-launch happens inside run
+  assert_equal 0, app2.ink_strokes.size
+  remove_app_db(path)
+end
+
+assert('erasing one cell leaves a neighbour cell ink alone') do
+  # The fix must be cell-scoped, not "clear the journal". Two strokes in
+  # two cells, erase one, the other survives in memory AND on disk.
+  path = stroke_app_db('erase_neighbour')
+  remove_app_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  app, = new_app(store: store)
+  app.new_puzzle
+  sid = app.current_save_id
+
+  app.handle_sample(pen_sample(300, 400, true))   # cell (1,1)
+  app.handle_sample(pen_sample(320, 420, true))
+  app.handle_sample(pen_sample(320, 420, false))
+  app.handle_sample(pen_sample(300, 540, true))   # cell (1,2), one row down
+  app.handle_sample(pen_sample(320, 560, true))
+  app.handle_sample(pen_sample(320, 560, false))
+  assert_equal 2, store.strokes(sid).size
+
+  app.handle_sample(eraser_sample(300, 400, true))
+  app.handle_sample(eraser_sample(300, 400, false))
+
+  assert_equal 1, store.strokes(sid).size
+  assert_equal 1, app.ink_strokes.size
+  survivor = Redoku::Sudoku::Grid.index_of(1, 2)
+  assert_equal survivor, Redoku::Ink.cell_of(app.ink_strokes[0])
+  store.close
+  remove_app_db(path)
+end
+
 # A store whose autosave upsert fails ONCE on command — answering nil, the
 # way the real Store does for an invalid record or a database error — then
 # behaves. Everything else delegates to the real store it wraps, so strokes

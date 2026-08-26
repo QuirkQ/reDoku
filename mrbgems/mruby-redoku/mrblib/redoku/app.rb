@@ -712,10 +712,16 @@ module Redoku
       stroke = { color: INK_GRAY, width: INK_WIDTH, subpaths: subs }
       @ink_strokes << stroke
       return unless @store && @current_save_id
-      @store.journal_stroke(@current_save_id, stroke[:color],
-                            stroke[:width], stroke[:subpaths])
-    rescue StandardError => e
-      log_line('stroke journal failed (' + e.message + ')')
+      begin
+        # The id is what lets erase (Task 3) and CHECK (Task 7) delete or
+        # retire exactly these rows without a cell column or a table scan.
+        # nil is fine and expected: a stroke drawn before the first dig has
+        # no game row to hang off, and M3a discards those when the dig lands.
+        stroke[:id] = @store.journal_stroke(@current_save_id, stroke[:color],
+                                            stroke[:width], stroke[:subpaths])
+      rescue StandardError => e
+        log_line('stroke journal failed (' + e.message + ')')
+      end
     end
 
     # The board is the writing surface and the chrome is not, so a segment is
@@ -785,9 +791,42 @@ module Redoku
       index = Sudoku::Grid.index_of(cell[0], cell[1])
       return if index == @erased
       @erased = index
+      forget_ink_in(index)
       @renderer.redraw_cell(index, @grid)
       cx, cy, cw, ch = Layout.cell_rect(cell[0], cell[1])
       mark_dirty(cx, cy, cx + cw - 1, cy + ch - 1)
+    end
+
+    # An erase has to reach the RECORD, not only the glass. redraw_cell
+    # repaints this cell from the model, which is what makes the ink
+    # disappear now; without this the same strokes are still in
+    # @ink_strokes and still in the strokes table, so the next repaint —
+    # a resume, a GAMES load, or the next relaunch — puts them straight
+    # back. That is the defect this method carried until M3b (spec §1):
+    # the stroke was journaled at PEN LIFT, before the eraser existed as
+    # far as this cell was concerned.
+    #
+    # DELETE and not retire: the player erased it. Retiring would leave a
+    # tombstone row eating this game's STROKES_CAP for ink nobody can ever
+    # see again.
+    def forget_ink_in(index)
+      doomed = []
+      kept = []
+      @ink_strokes.each do |s|
+        if Ink.cell_of(s) == index
+          doomed << s[:id] if s[:id]
+        else
+          kept << s
+        end
+      end
+      return if doomed.empty? && kept.size == @ink_strokes.size
+      @ink_strokes = kept
+      return if doomed.empty? || @store.nil?
+      begin
+        @store.delete_strokes(doomed)
+      rescue StandardError => e
+        log_line('stroke delete failed (' + e.message + ')')
+      end
     end
 
     # A tap starts and ends on the same button, having travelled little in
