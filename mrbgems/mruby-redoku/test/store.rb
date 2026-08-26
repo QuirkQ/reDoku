@@ -383,7 +383,7 @@ assert('strokes round-trip through journal and read-back, across reopen') do
   store = Redoku::Store.open(path, log: nil)
   id = store.save_autosave(store_game)
 
-  assert_true(store.journal_stroke(id, 0, 4, stroke_subpaths))
+  assert_true(store.journal_stroke(id, 0, 4, stroke_subpaths).is_a?(Integer))
   got = store.strokes(id)
   assert_equal(1, got.size)
   assert_equal(0, got[0][:color])
@@ -391,7 +391,8 @@ assert('strokes round-trip through journal and read-back, across reopen') do
   assert_equal(stroke_subpaths, got[0][:subpaths])
 
   # Second stroke appends after the first, in order.
-  assert_true(store.journal_stroke(id, 96, 2, [[[500, 500], [510, 520]]]))
+  assert_true(store.journal_stroke(id, 96, 2,
+                                   [[[500, 500], [510, 520]]]).is_a?(Integer))
   got = store.strokes(id)
   assert_equal(2, got.size)
   assert_equal([[[500, 500], [510, 520]]], got[1][:subpaths])
@@ -457,7 +458,8 @@ assert('the stroke cap drops the oldest strokes and keeps appending') do
   store = Redoku::Store.open(path, log: nil, stroke_cap: 3)
   id = store.save_autosave(store_game)
   4.times do |i|
-    assert_true(store.journal_stroke(id, 0, 4, [[[i, i], [i + 1, i + 1]]]))
+    assert_true(store.journal_stroke(id, 0, 4,
+                                     [[[i, i], [i + 1, i + 1]]]).is_a?(Integer))
   end
   got = store.strokes(id)
   assert_equal(3, got.size)
@@ -542,7 +544,7 @@ assert('a many-subpath stroke over the point cap round-trips truncated') do
   end
   assert_true(n > cap)
 
-  assert_true(store.journal_stroke(id, 0, 4, subs))
+  assert_true(store.journal_stroke(id, 0, 4, subs).is_a?(Integer))
   got = store.strokes(id)
   assert_equal(1, got.size)
   back = got[0][:subpaths]
@@ -555,6 +557,182 @@ assert('a many-subpath stroke over the point cap round-trips truncated') do
   assert_equal(subs[0], back[0])            # whole subpaths stay whole...
   assert_equal(subs[1], back[1])
   assert_equal(cap - 2000, back[2].size)    # ...and the tail is cut mid-path
+  store.close
+  remove_store_db(path)
+end
+
+# --- schema v3: stroke identity and retirement. The "old" files the
+# migration assertions build are made from PINNED copies of the DDL as it
+# stood before v3, not from Store::SCHEMA_SQL — a migration test that builds
+# its old file from the current schema tests nothing at all.
+#
+# V1_SCHEMA_SQL is the v1 layout as shipped in
+# 4b851e2 (feat(m3a): Redoku::Store over mruby-sqlite3, ...): games only, no
+# strokes table. V2_SCHEMA_SQL is v2 as shipped in f87b7f8 (feat(m3a):
+# persist ink — strokes table (schema v2), ...): strokes WITHOUT `retired`.
+
+V1_SCHEMA_SQL = <<~SQL
+  PRAGMA synchronous = FULL;
+  PRAGMA user_version = 1;
+  CREATE TABLE IF NOT EXISTS games (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT    NOT NULL CHECK (kind IN ('autosave','manual')),
+    difficulty    TEXT    NOT NULL,
+    achieved_tier TEXT    NOT NULL,
+    givens        TEXT    NOT NULL,
+    entries       TEXT    NOT NULL,
+    solution      TEXT    NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_games_updated ON games(updated_at DESC);
+SQL
+
+V2_SCHEMA_SQL = <<~SQL
+  PRAGMA synchronous = FULL;
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE IF NOT EXISTS games (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT    NOT NULL CHECK (kind IN ('autosave','manual')),
+    difficulty    TEXT    NOT NULL,
+    achieved_tier TEXT    NOT NULL,
+    givens        TEXT    NOT NULL,
+    entries       TEXT    NOT NULL,
+    solution      TEXT    NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_games_updated ON games(updated_at DESC);
+  CREATE TABLE IF NOT EXISTS strokes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    color      INTEGER NOT NULL,
+    width      INTEGER NOT NULL,
+    pts        TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_strokes_game ON strokes(game_id, seq);
+SQL
+
+assert('journal_stroke returns the row id it wrote') do
+  path = store_db('journal_id')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_autosave(store_game)
+  a = store.journal_stroke(id, 96, 3, [[[10, 10], [20, 20]]])
+  b = store.journal_stroke(id, 96, 3, [[[30, 30], [40, 40]]])
+  assert_true a.is_a?(Integer)
+  assert_true b > a
+  got = store.strokes(id)
+  assert_equal [a, b], [got[0][:id], got[1][:id]]
+  store.close
+  remove_store_db(path)
+end
+
+assert('a retired stroke is kept but no longer read back') do
+  path = store_db('retire')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_autosave(store_game)
+  a = store.journal_stroke(id, 96, 3, [[[10, 10], [20, 20]]])
+  b = store.journal_stroke(id, 96, 3, [[[30, 30], [40, 40]]])
+
+  assert_equal 1, store.retire_strokes([a])
+  got = store.strokes(id)
+  assert_equal 1, got.size
+  assert_equal b, got[0][:id]
+
+  # Kept, not deleted — this is the whole difference from erase.
+  rows = store.instance_variable_get(:@db)
+              .execute('SELECT COUNT(*) FROM strokes WHERE game_id = ?', [id])
+  assert_equal 2, rows[0][0]
+  store.close
+  remove_store_db(path)
+end
+
+assert('a deleted stroke is gone from the table') do
+  path = store_db('delete_strokes')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  id = store.save_autosave(store_game)
+  a = store.journal_stroke(id, 96, 3, [[[10, 10], [20, 20]]])
+  store.journal_stroke(id, 96, 3, [[[30, 30], [40, 40]]])
+  assert_equal 1, store.delete_strokes([a])
+  rows = store.instance_variable_get(:@db)
+              .execute('SELECT COUNT(*) FROM strokes WHERE game_id = ?', [id])
+  assert_equal 1, rows[0][0]
+  store.close
+  remove_store_db(path)
+end
+
+assert('retire_strokes and delete_strokes tolerate an empty list') do
+  path = store_db('empty_ids')
+  remove_store_db(path)
+  store = Redoku::Store.open(path, log: nil)
+  assert_equal 0, store.retire_strokes([])
+  assert_equal 0, store.delete_strokes([])
+  assert_equal 0, store.retire_strokes(nil)
+  store.close
+  remove_store_db(path)
+end
+
+assert('a v2 file migrates to v3 with every stroke still live') do
+  path = store_db('v2_to_v3')
+  remove_store_db(path)
+
+  # Build a genuine v2 file: the v2 DDL, v2's user_version, one stroke row
+  # written the way v2 wrote them (no retired column at all).
+  db = SQLite3::Database.open(path)
+  db.exec(V2_SCHEMA_SQL) # pinned copy, see above
+  db.exec('PRAGMA user_version = 2')
+  now = 1_700_000_000
+  db.execute('INSERT INTO games (kind, difficulty, achieved_tier, givens, ' \
+             'entries, solution, created_at, updated_at) VALUES ' \
+             "('autosave','easy','easy',?,?,?,?,?)",
+             ['.' * 81, '.' * 81, '1' * 81, now, now])
+  gid = db.last_insert_rowid
+  db.execute('INSERT INTO strokes (game_id, seq, color, width, pts, ' \
+             'created_at) VALUES (?,1,96,3,?,?)', [gid, '10,10 20,20', now])
+  db.close
+
+  store = Redoku::Store.open(path, log: nil)
+  assert_equal 3, store.instance_variable_get(:@db)
+                       .execute('PRAGMA user_version')[0][0]
+  got = store.strokes(gid)
+  assert_equal 1, got.size            # survived the migration
+  assert_equal [[[10, 10], [20, 20]]], got[0][:subpaths]
+  assert_true got[0][:id].is_a?(Integer)
+  store.close
+  remove_store_db(path)
+end
+
+assert('a v1 file migrates straight to v3') do
+  path = store_db('v1_to_v3')
+  remove_store_db(path)
+  db = SQLite3::Database.open(path)
+  db.exec(V1_SCHEMA_SQL) # games only, no strokes table
+  db.exec('PRAGMA user_version = 1')
+  db.close
+  store = Redoku::Store.open(path, log: nil)
+  assert_equal 3, store.instance_variable_get(:@db)
+                       .execute('PRAGMA user_version')[0][0]
+  # The strokes table was CREATEd fresh, so it already has `retired` and
+  # needs no ALTER — the migration must not run one and must not raise.
+  assert_equal [], store.strokes(1)
+  store.close
+  remove_store_db(path)
+end
+
+assert('a version ABOVE v3 is still quarantined') do
+  path = store_db('v4')
+  remove_store_db(path)
+  db = SQLite3::Database.open(path)
+  db.exec('PRAGMA user_version = 4')
+  db.close
+  store = Redoku::Store.open(path, log: nil)
+  assert_true Dir.entries(File.dirname(path))
+                 .any? { |f| f.include?('.bad-') }
   store.close
   remove_store_db(path)
 end

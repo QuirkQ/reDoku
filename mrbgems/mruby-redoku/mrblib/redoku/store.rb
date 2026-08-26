@@ -29,7 +29,7 @@ module Redoku
   # recorded points per stroke (App stops recording past it; live ink keeps
   # flowing either way).
   class Store
-    VERSION = 2
+    VERSION = 3
     MANUAL_CAP = 50
     STROKES_CAP = 2000
     MAX_STROKE_POINTS = 2048
@@ -63,6 +63,7 @@ module Redoku
         color      INTEGER NOT NULL,
         width      INTEGER NOT NULL,
         pts        TEXT    NOT NULL,
+        retired    INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_strokes_game ON strokes(game_id, seq);
@@ -195,7 +196,9 @@ module Redoku
         return false
       end
       enforce_stroke_cap(game_id)
-      true
+      # enforce_stroke_cap runs first and deletes the OLDEST rows, never the
+      # one just inserted, so the id is still valid after it.
+      @db.last_insert_rowid
     end
 
     # Every journaled stroke of a game, oldest first, decoded and validated.
@@ -204,22 +207,37 @@ module Redoku
     def strokes(game_id)
       return [] unless game_id
       rows = @db.execute(
-        'SELECT color, width, pts FROM strokes ' \
-        'WHERE game_id = ? ORDER BY seq ASC, id ASC', [game_id])
+        'SELECT id, color, width, pts FROM strokes ' \
+        'WHERE game_id = ? AND retired = 0 ORDER BY seq ASC, id ASC',
+        [game_id])
       out = []
-      rows.each do |color, width, pts|
+      rows.each do |id, color, width, pts|
         subpaths = self.class.decode_pts(pts)
         if subpaths.nil? || !int?(color) || color < 0 || color > 255 ||
            !int?(width) || width < 1
           log_line('skipped corrupt stroke row for game ' + game_id.to_s)
           next
         end
-        out << { color: color, width: width, subpaths: subpaths }
+        out << { id: id, color: color, width: width, subpaths: subpaths }
       end
       out
     rescue StandardError => e
       log_line('could not read strokes (' + e.message + ')')
       []
+    end
+
+    # CHECK consumed this ink: the cell prints a digit now, so the strokes
+    # stop being replayed — but they stay in the record, because they are
+    # the player's own hand and the only copy of it.
+    def retire_strokes(ids)
+      update_strokes_by_id(ids,
+                           'UPDATE strokes SET retired = 1 WHERE id IN ')
+    end
+
+    # The player erased this ink. It is gone: no tombstone, which also keeps
+    # the journal inside STROKES_CAP instead of growing a permanent tail.
+    def delete_strokes(ids)
+      update_strokes_by_id(ids, 'DELETE FROM strokes WHERE id IN ')
     end
 
     def clear_strokes(game_id)
@@ -319,6 +337,23 @@ module Redoku
 
     private
 
+    # One statement over a bounded id list. The list is built from
+    # App@ink_strokes, so it is at most STROKES_CAP long and every element
+    # is an Integer this Store itself handed out — but it is filtered here
+    # anyway, because a nil id (a stroke buffered before the first dig) must
+    # not become the string 'nil' inside SQL.
+    def update_strokes_by_id(ids, sql)
+      return 0 unless ids.is_a?(Array)
+      live = ids.select { |i| int?(i) }
+      return 0 if live.empty?
+      marks = (['?'] * live.size).join(',')
+      @db.execute(sql + '(' + marks + ')', live)
+      @db.changes
+    rescue StandardError => e
+      log_line('could not update strokes (' + e.message + ')')
+      0
+    end
+
     # Keeps one game's journal bounded: past the cap, the OLDEST strokes go
     # (they are the ones the player is least likely to still be looking at)
     # and the fact is logged. Called after each append, where it normally
@@ -404,26 +439,37 @@ module Redoku
 
     def open_database
       existed = File.exist?(@path)
+      version = 0
       @db = SQLite3::Database.open(@path)
       if existed
         begin
           # 0 is a brand-new file (or one a crash left before the first
           # write); 1 is the v1 layout, which migrates by simply running the
-          # v2 DDL — CREATE TABLE IF NOT EXISTS strokes adds exactly what v1
-          # lacks and touches nothing else, so every saved game survives.
-          # Anything GREATER than VERSION belongs to a future build we
-          # cannot second-guess: rename aside per the prime directive.
+          # current DDL — CREATE TABLE IF NOT EXISTS strokes adds exactly
+          # what v1 lacks and touches nothing else, so every saved game
+          # survives. 2 additionally needs the one ALTER below, for the
+          # `retired` column its strokes table predates. Anything GREATER
+          # than VERSION belongs to a future build we cannot second-guess:
+          # rename aside per the prime directive.
           version = read_version
           if version > VERSION
             quarantine('unexpected schema version ' + version.to_s)
             @db = SQLite3::Database.open(@path)
+            version = 0
           end
         rescue StandardError => e
           quarantine(e.message)
           @db = SQLite3::Database.open(@path)
+          version = 0
         end
       end
       @db.exec(SCHEMA_SQL)
+      # v2 is the ONLY version that owns a strokes table without `retired`:
+      # a v1 file has no strokes table, so CREATE TABLE IF NOT EXISTS above
+      # just built it with the column, and a fresh file likewise. Running
+      # the ALTER on those would raise "duplicate column name".
+      @db.exec('ALTER TABLE strokes ADD COLUMN retired INTEGER NOT NULL ' \
+               'DEFAULT 0') if version == 2
       @db.exec('PRAGMA user_version = ' + VERSION.to_s)
     end
 
