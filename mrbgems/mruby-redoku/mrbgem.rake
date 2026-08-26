@@ -72,4 +72,11 @@ MRuby::Gem::Specification.new('mruby-redoku') do |spec|
   # not core: core only defines __send__ (src/class.c), and mruby-metaprog is
   # what the default gembox's `metaprog.gembox` pulls in for the plain names.
   spec.add_dependency('mruby-metaprog',    core: 'mruby-metaprog')
+  # Ink.path_length measures segment length with Math.sqrt (M3b Task 1).
+  # Math is mruby-math, pulled in by the default gembox's math.gembox — the
+  # shipped binary links it, but THIS gem's mrbtest state holds only its
+  # declared dependencies, so without this line path_length raises
+  # NameError under `make test` while working on the device. Same gap as
+  # mruby-time above; explicit declaration is the documented remedy.
+  spec.add_dependency('mruby-math',        core: 'mruby-math')
 end
