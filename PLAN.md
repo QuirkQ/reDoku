@@ -398,9 +398,21 @@ What actually runs per inked cell when CHECK fires:
    would have made the unreadable verdict unreachable, so the bar came down
    and the authored corpus re-measured identically (STAGE1 total=84
    right=84 refused=0 misread=0 accuracy=100%). The recognized digit lands
-   in the game record's `entries` column (the column M3a future-proofed),
-   so the check result is itself persisted and re-checkable without
-   re-recognizing.
+    in the game record's `entries` column (the column M3a future-proofed),
+    so the check result is itself persisted and re-checkable without
+    re-recognizing.
+
+What the four orders of magnitude bought is recorded too, because something
+was sold for them: $P's stroke-order and direction invariance — the property
+that made it attractive over $1, and which spec §5 called worth paying for
+stage 2 to keep — does not exist in stage 1. Keying on start and end points
+makes the classifier care how the pen travelled, so a 4 drawn bottom-up or
+a 5 started where its 3 ends are no longer free matches; what absorbs that
+for now is template authorship, not the matcher, which is why
+`Templates::AUTHORED` ships variants per digit rather than one canonical
+stroke per digit. Real hands are exactly Task 11's business: `--record` and
+the holdout corpus exist because variants drawn by one author cannot be
+trusted to cover how anyone else writes.
 
 **Templates:** authored polyline literals per digit in
 `mrbgems/mruby-redoku/mrblib/redoku/templates.rb` (`Templates::AUTHORED`,
