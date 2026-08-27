@@ -53,6 +53,17 @@ assert('RM2.resumed? reports each SIGCONT once') do
   assert_false RM2.resumed? # consumed
 end
 
+assert('RM2.reload? reports each SIGHUP once, like resumed? does for SIGCONT') do
+  RM2.setup_signals
+  RM2.reload? # clear anything left by an earlier assertion
+  assert_false RM2.reload?
+  RM2::TestServer.raise_signal(1) # SIGHUP
+  assert_true RM2.reload?
+  assert_false RM2.reload? # consumed: a config re-read is a repeatable action,
+                            # not a fact that becomes permanently true (unlike
+                            # terminated?), so the next SIGHUP must be seen too
+end
+
 assert('a write to a dead server raises instead of killing the process') do
   path = RM2::TestServer.start
   d = nil
