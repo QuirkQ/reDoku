@@ -28,6 +28,15 @@ set -eu
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
+# Which version am I, and am I a release build? A checkout stays "dev"
+# forever; tools/mkkit.sh stamps this exact line to the real tag in every
+# copy of this CLI it releases (design doc §3.3). That single rewrite is
+# what lets a released CLI resolve and fetch its OWN tag with no separate
+# lookup (§6.1) — and it must stay byte-for-byte "KIT_VERSION=dev" here,
+# because mkkit.sh finds the line to rewrite by literal match, not a marker
+# comment or a template placeholder.
+KIT_VERSION=dev
+
 REMOTE_DIR=/home/root/redoku
 REMOTE_GAME=$REMOTE_DIR/bin/redoku    # the game binary on the device
 KNOWN_HOSTS=$HOME/.ssh/redoku_known_hosts
@@ -319,13 +328,28 @@ pick_artifact() { # $1 = filename; prints the path
 find_game() {
   GAME=$REPO/build/rm2/bin/redoku
   GAME_WHY=
+  # In a checkout (KIT_VERSION=dev) a missing or wrong-arch game means a
+  # build step was never run, so the hint names the build. Inside a
+  # released kit (KIT_VERSION stamped) there is no build to run — this
+  # exact file shipped prebuilt (design doc §3.2) — so the SAME two
+  # conditions instead mean the download is incomplete or corrupt, and the
+  # fix is to re-fetch it, which is what "redoku upgrade" does (added in a
+  # later task of this milestone; naming it here is still correct).
   if [ ! -f "$GAME" ]; then
-    GAME_WHY="no game binary at $GAME — cross-build it with:  make build"
+    if [ "$KIT_VERSION" = dev ]; then
+      GAME_WHY="no game binary at $GAME — cross-build it with:  make build"
+    else
+      GAME_WHY="no game binary at $GAME — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+    fi
   elif ! is_arm_elf "$GAME"; then
     # One line, like the message above it: both callers print it as a single
     # indented continuation line, where an embedded newline would lose its
     # prefix and its indentation.
-    GAME_WHY="$GAME is not 32-bit ARM (a host build?) — rebuild with:  make clean && make build"
+    if [ "$KIT_VERSION" = dev ]; then
+      GAME_WHY="$GAME is not 32-bit ARM (a host build?) — rebuild with:  make clean && make build"
+    else
+      GAME_WHY="$GAME is not 32-bit ARM — this kit is corrupt, re-download it with:  redoku upgrade"
+    fi
   fi
   [ -z "$GAME_WHY" ] || { GAME=; return 1; }
 }
