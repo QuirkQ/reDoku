@@ -254,7 +254,19 @@ module Redoku
         @rearm_failing[role] = false
         @rearm_retry_at.delete(role)
         true
-      rescue SystemCallError => e
+      rescue StandardError => e
+        # Deliberately StandardError, not just SystemCallError: "re-arm,
+        # don't die" is the whole point of this method, and #watch has a
+        # second raise path this rescue must also catch — the C shim's own
+        # "inotify is closed" RuntimeError guard (src/inotify.c). Nothing in
+        # today's lifecycle closes @inotify out from under a live Watcher,
+        # so that path is unreachable right now, but it is not structurally
+        # prevented, and a rescue narrow enough to miss it would let the one
+        # failure this requirement exists to guard against — a dead watcher,
+        # silently — right back in through a gap nobody meant to leave open.
+        # The error still reaches stderr either way (fatal: raises with it
+        # in the message; non-fatal: note_rearm_failing logs it) — widening
+        # the catch is not the same as swallowing it.
         raise ConfigError, "cannot watch #{role} at #{path} (#{e.message})" if fatal
         note_rearm_failing(role, path, e)
         false

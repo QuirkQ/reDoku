@@ -387,6 +387,54 @@ assert('a re-arm that fails retries on a bounded interval and recovers once the 
   end
 end
 
+assert('a synthetic IN_Q_OVERFLOW re-arms both roles, healing a watch gone stale with its DELETE_SELF never drained') do
+  pdf = "#{WATCHER_TMP}/overflow.pdf"
+  metadata = "#{WATCHER_TMP}/overflow.metadata"
+  watcher_touch(pdf)
+  watcher_touch(metadata)
+  path = watcher_config(pdf: pdf, metadata: metadata)
+  w, clock, _control, spawner, _signals, out, = new_watcher(path)
+  begin
+    w.start
+
+    # Replace BOTH watched files without ever draining the DELETE_SELF (+
+    # automatic IGNORED) this generates for either — standing in for what a
+    # real queue overflow actually means: those events are simply never
+    # seen. Both old watch descriptors are now stale, still mapped in
+    # @watches but pointing at inodes that no longer exist under either
+    # path — the exact "silently dead" failure requirement 5 exists to
+    # prevent, reached here without the normal watch_died path ever firing.
+    File.delete(pdf)
+    watcher_touch(pdf)
+    File.delete(metadata)
+    watcher_touch(metadata)
+
+    # A synthetic event, not a real kernel overflow: forcing a real one
+    # needs thousands of events in one burst, which
+    # mruby-rm2/test/inotify.rb does not attempt either. process_events is
+    # a plain private method over a [wd, mask, cookie, name] array, so
+    # driving it directly touches nothing about @inotify itself — it stays
+    # the real fd/watches opened by #start, only the EVENT is synthetic.
+    w.send(:process_events, [[-1, RM2::Inotify::IN_Q_OVERFLOW, 0, '']])
+    assert_include out.text, 'inotify queue overflow'
+
+    # The observable consequence, not just that the branch ran: a REAL
+    # trigger on each of the (now current) files still fires, proving
+    # reconcile! actually re-armed BOTH roles against their live inodes
+    # rather than leaving either silently watching a file that is gone.
+    watcher_open_close(pdf)
+    w.tick(2000)
+    assert_equal 1, spawner.calls.size
+
+    clock.advance(Redoku::Watcher::DEBOUNCE_MS)
+    watcher_write_close(metadata)
+    w.tick(2000)
+    assert_equal 2, spawner.calls.size
+  ensure
+    w.close
+  end
+end
+
 # --- SIGHUP ----------------------------------------------------------------
 
 assert('SIGHUP re-reads the config and re-arms against a changed pdf path') do
