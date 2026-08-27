@@ -9,6 +9,14 @@
 # directly off the owner's device on firmware 3.27.3.0. That dump is this
 # file's spec; nothing here is guessed.
 #
+# The format doc's own source of truth is the raw capture it was written
+# from, .superpowers/sdd/M4-HIJACK/device-doc-dump.txt (`cat` of a real
+# document's sidecars). That capture lives in a git-ignored workspace
+# directory and will not travel with this repo, so if the JSON grammar
+# below ever looks wrong: the device is the authority, not this comment —
+# dump a fresh document's sidecars and diff against what render_json (below)
+# produces.
+#
 # Runs on the Mac as part of `bin/redoku install`, with the system CRuby —
 # stdlib only, no gems (json and optparse are both stdlib).
 #
@@ -297,7 +305,13 @@ module MkDecoy
       "lastOpened" => "0", # never opened yet — set by xochitl once tapped
       "lastOpenedPage" => 0,
       "new" => false, # keeps the blue "new" dot off the library row
-      "parent" => "", # library root — the dump's example was "trash"; ours must not be
+      # Library root. Two documents were read for this field (xochitl-3.27-
+      # format.md's provenance note): a trashed PDF, captured verbatim in
+      # device-doc-dump.txt, read "trash"; a second PDF at the library
+      # root (.metadata only, not in that raw-capture file) read "". Both
+      # are measured, not guessed — the decoy is neither trashed nor
+      # drawn-on, so it wants the second value.
+      "parent" => "",
       "pinned" => false,
       "source" => "",
       "type" => "DocumentType",
@@ -338,13 +352,22 @@ module MkDecoy
     }
   end
 
-  # xochitl's own JSON pretty-printer, reverse-engineered from a real dump
-  # (xochitl-3.27-format.md), not Ruby's: 4-space indent, keys in ASCII
-  # sort order, and empty objects/arrays STILL break across two lines
-  # ("{\n    }") instead of collapsing to "{}" the way
-  # JSON.pretty_generate would. That mismatch — confirmed against the
-  # dump's measured byte counts for both sidecars — is exactly why this is
-  # hand-rolled instead of the stdlib pretty-printer.
+  # xochitl's own JSON pretty-printer, not Ruby's — matched against the raw
+  # capture, device-doc-dump.txt, line by line (the format doc, xochitl-
+  # 3.27-format.md, is a summary of that capture; the capture is the thing
+  # actually checked byte-for-byte in tools/test/mkdecoy_test.rb — see the
+  # file header). Three things Ruby's own JSON.pretty_generate gets wrong
+  # for this grammar, each visible directly in the capture: 4-space indent
+  # (not 2); keys in ASCII sort order (not insertion order); and EVERY
+  # array/object, empty or not, breaks its brackets onto their own lines —
+  # an empty one as "{\n    }" instead of collapsing to "{}", and a
+  # populated one with exactly one element per line at each level's
+  # 4-space step (the capture's "redirectionPageMap" and "pages" arrays
+  # are 5 elements, each on its own line — never packed onto one line).
+  # The format doc, after a review round caught it summarizing this
+  # compressed onto single lines, names the cause: this is what xochitl's
+  # own Qt JSON writer produces (QJsonDocument's indented mode), which is
+  # why it isn't what Ruby's pretty-printer would choose by default.
   def self.render_json(value, level = 0)
     pad = "    " * level
     child_pad = "    " * (level + 1)

@@ -145,10 +145,17 @@ Dir.mktmpdir("mkdecoy-test") do |dir|
   # Beyond field-set equality (JSON.parse doesn't see indentation or key
   # order): the RAW BYTES must match the device's own JSON grammar exactly
   # — 4-space indent, ASCII key order, empty {}/[] broken across two lines,
-  # trailing newline. Built with this run's own uuid/pdf-size substituted
-  # in, so a formatting regression (Ruby's JSON.pretty_generate collapsing
-  # "{}" onto one line, 2-space indent, insertion-order keys…) fails loudly
-  # instead of hiding behind a parsed-equality check that can't see it.
+  # a populated array with one element per line (never packed onto one
+  # line), trailing newline. This whitespace is transcribed directly from
+  # .superpowers/sdd/M4-HIJACK/device-doc-dump.txt — the raw `cat` capture
+  # off the device, not the xochitl-3.27-format.md summary of it (that
+  # summary once compressed its example arrays onto single lines for
+  # readability without saying so, which is exactly the kind of drift a
+  # byte-exact expectation sourced from the raw capture cannot repeat).
+  # Built with this run's own uuid/pdf-size substituted in, so a formatting
+  # regression (Ruby's JSON.pretty_generate collapsing "{}" onto one line,
+  # 2-space indent, insertion-order keys…) fails loudly instead of hiding
+  # behind a parsed-equality check that can't see it.
   expected_metadata_text = <<~JSON
     {
         "createdTime": "#{MkDecoy::CREATED_TIME_MS}",
