@@ -95,7 +95,8 @@ module Redoku
       return nil if pts.nil? || pts.empty?
       vec = density(pts)
       vec << aspect_of(strokes)
-      vec << (strokes.size > 255 ? 255 : strokes.size) * 40
+      sub = strokes.size * 40
+      vec << (sub > 255 ? 255 : sub)
       vec << reversals(pts)
       vec << spread(pts)
       vec << pts[0][0]

@@ -8,8 +8,11 @@ module Redoku
   # Each entry is [digit, subpaths] in a 100x100 box, origin top-left. Two
   # or three variants per digit cover the ways a hand actually draws it —
   # a 7 with and without a crossbar, a 4 open and closed, a 1 with and
-  # without a serif — because stroke COUNT and order vary between them and
-  # that is precisely what the classifier must not key on.
+  # without a serif — because hands disagree about stroke COUNT, and the
+  # variants absorb that spread. (The borrowed $P invariance to stroke
+  # ORDER/DIRECTION is gone: stage 1's start/end-point features do key on
+  # direction, which PLAN.md §10 records as an accepted trade re-measured
+  # in Task 11 — before any retuning, this warning applies there too.)
   module Templates
     AUTHORED = [
       [1, [[[50, 8], [50, 92]]]],
