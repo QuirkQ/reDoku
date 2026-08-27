@@ -11,6 +11,12 @@ module Redoku
   # to sit through a hundred prompts.
   RECORD_ROUNDS = 4
 
+  # The default config path below is a literal, not
+  # Watcher::DEFAULT_CONFIG_PATH: mrblib files load in sorted filename order
+  # (test/_support.rb's own header explains why), and 'main.rb' sorts before
+  # 'watcher.rb', so this constant's own class body runs before Watcher
+  # exists — an interpolation here would raise NameError on every launch,
+  # not just --watch.
   USAGE = <<~TEXT
     usage: redoku [options]
 
@@ -18,30 +24,83 @@ module Redoku
     The board takes the pen only; the buttons also take a finger.
     Tap Quit to give the screen back to xochitl.
 
-      --record    capture handwriting templates for the recognizer
-      --clients   list the display server's clients and exit
-      --help      show this message
+      --record          capture handwriting templates for the recognizer
+      --clients         list the display server's clients and exit
+      --watch           run the resident hijack watcher (systemd service;
+                         reads /home/root/redoku/watch.conf)
+      --watch --config PATH
+                         same, reading PATH instead of the default config
+      --help            show this message
   TEXT
+
+  KNOWN_FLAGS = ['--help', '--clients', '--record', '--watch'].freeze
 
   # Entry point called from tools/redoku/redoku.c. Returns the process exit
   # status.
   def self.main(argv)
-    unknown = argv.find do |a|
-      !['--help', '--clients', '--record'].include?(a)
+    args = argv.dup
+    config_path = nil
+    idx = args.index('--config')
+    if idx
+      config_path = args[idx + 1]
+      if config_path.nil?
+        $stderr.puts 'redoku: --config requires a PATH argument'
+        $stderr.puts USAGE
+        return 2
+      end
+      # Removed rather than added to KNOWN_FLAGS: --config takes a value, so
+      # it and that value are consumed as a pair before the flag-only check
+      # below runs, or the path itself would read as an unknown option.
+      args.delete_at(idx + 1)
+      args.delete_at(idx)
     end
+
+    unknown = args.find { |a| !KNOWN_FLAGS.include?(a) }
     if unknown
       $stderr.puts "redoku: unknown option #{unknown}"
       $stderr.puts USAGE
       return 2
     end
-    if argv.include?('--help')
+    if config_path && !args.include?('--watch')
+      $stderr.puts 'redoku: --config is only valid with --watch'
+      $stderr.puts USAGE
+      return 2
+    end
+    if args.include?('--help')
       puts USAGE
       return 0
     end
-    return record_templates if argv.include?('--record')
-    return list_clients if argv.include?('--clients')
+    return record_templates if args.include?('--record')
+    return list_clients if args.include?('--clients')
+    return watch(config_path) if args.include?('--watch')
 
     play
+  end
+
+  # `redoku --watch` (M4-HIJACK.md Task 3): the resident watcher, run under
+  # `redoku-watcher.service`. RM2.setup_signals is called here rather than
+  # inside Watcher — the same split play/record_templates already use — so
+  # Watcher's own `signals:` default (plain RM2) can be exercised in tests
+  # without a real signal handler installed on the test process.
+  #
+  # A ConfigError (no pdf= key, or a pdf file that cannot be watched) is
+  # fatal here and only here: R5/R10 says a decoy nobody can arm is a
+  # launcher nobody can use, so there is nothing to run degraded. Once
+  # running, the very same error on a SIGHUP re-read is NOT fatal — Watcher
+  # swallows it itself and keeps the previous paths armed.
+  def self.watch(config_path)
+    RM2.setup_signals
+    watcher = Watcher.new(config_path || Watcher::DEFAULT_CONFIG_PATH)
+    begin
+      watcher.start
+      watcher.run
+    ensure
+      watcher.close
+    end
+    0
+  rescue StandardError => e
+    $stderr.puts "redoku: #{e.message}"
+    1
   end
 
   def self.list_clients

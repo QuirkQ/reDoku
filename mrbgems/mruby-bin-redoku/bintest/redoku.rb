@@ -55,6 +55,18 @@ assert('redoku --help explains itself and exits 0') do
   assert_equal 0, status
   assert_include out, 'redoku'
   assert_include out, '--clients'
+  assert_include out, '--watch'
+end
+
+assert('redoku --watch --config PATH fails clearly on a bogus config path') do
+  # No rm2fb server and no /home/root exist in the build container either,
+  # but this must fail on the CONFIG, before anything ever touches a
+  # display or a real device path — proving --watch's own argument handling
+  # rather than falling through to some other failure.
+  out, err, status = run_redoku('--watch', '--config', '/tmp/redoku-bintest-no-such-config.conf')
+  assert_equal 1, status
+  assert_equal '', out
+  assert_include err, 'redoku:'
 end
 
 assert('redoku fails clearly when no display server is listening') do
