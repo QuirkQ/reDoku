@@ -423,6 +423,45 @@ fs_raise_signal(mrb_state* mrb, mrb_value self) {
   return mrb_nil_value();
 }
 
+/* getsid/getpgid, exposed only so mrbtest can prove RM2.spawn_detached's
+ * child lands in a session and process group of its own (pid 0 means "the
+ * calling process" per POSIX, which is what lets a test ask about itself
+ * without a getpid() wrapper too). Nothing in the shim itself needs these
+ * — the watcher never queries them — so they stay test-only rather than
+ * becoming production API surface. */
+static mrb_value
+fs_getsid(mrb_state* mrb, mrb_value self) {
+  mrb_int pid;
+  pid_t sid;
+  mrb_get_args(mrb, "i", &pid);
+  sid = getsid((pid_t)pid);
+  if (sid < 0) mrb_sys_fail(mrb, "getsid");
+  return mrb_int_value(mrb, (mrb_int)sid);
+}
+
+static mrb_value
+fs_getpgid(mrb_state* mrb, mrb_value self) {
+  mrb_int pid;
+  pid_t pgid;
+  mrb_get_args(mrb, "i", &pid);
+  pgid = getpgid((pid_t)pid);
+  if (pgid < 0) mrb_sys_fail(mrb, "getpgid");
+  return mrb_int_value(mrb, (mrb_int)pgid);
+}
+
+/* One non-blocking reap attempt over every child of the test process.
+ * Returns the reaped pid, or nil when there was nothing to reap (no
+ * children at all, ECHILD, or children but none finished yet, status 0) —
+ * both read the same way for RM2.spawn_detached's zombie test: either
+ * answer proves nothing was left behind for the caller to clean up. */
+static mrb_value
+fs_wait_any_nohang(mrb_state* mrb, mrb_value self) {
+  int status;
+  pid_t r = waitpid(-1, &status, WNOHANG);
+  if (r <= 0) return mrb_nil_value();
+  return mrb_int_value(mrb, (mrb_int)r);
+}
+
 void
 mrb_mruby_rm2_gem_test(mrb_state* mrb) {
   struct RClass* rm2 = mrb_module_get(mrb, "RM2");
@@ -443,4 +482,8 @@ mrb_mruby_rm2_gem_test(mrb_state* mrb) {
                           fs_last_control_request, MRB_ARGS_NONE());
   mrb_define_class_method(mrb, ts, "raise_signal", fs_raise_signal,
                           MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, ts, "getsid", fs_getsid, MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, ts, "getpgid", fs_getpgid, MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, ts, "wait_any_nohang", fs_wait_any_nohang,
+                          MRB_ARGS_NONE());
 }
