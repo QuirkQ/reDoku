@@ -23,7 +23,7 @@ DOCKER_RUN := docker run --rm --platform $(PLATFORM) \
 
 RAKE := rake MRUBY_CONFIG=/work/build_config.rb MRUBY_BUILD_DIR=/work/build
 
-.PHONY: image build test test-tools rm2fb sqlite shell clean
+.PHONY: image build test test-tools test-kit rm2fb sqlite shell clean
 
 image:
 	docker build --platform $(PLATFORM) -t $(IMAGE) docker
@@ -44,6 +44,17 @@ test-tools: image
 		-v $(CURDIR):/work \
 		-w /work $(IMAGE) \
 		ruby tools/test/mkdecoy_test.rb
+
+# Every OTHER target in this file is a thin Docker wrapper so the Mac never
+# needs the toolchain directly (see the file header). This one breaks that
+# rule on purpose: tools/test/kit_test.sh tests tools/install.sh, and that
+# script's entire risk surface IS the host's own curl, shasum/sha256sum/
+# openssl and tar — the exact set of things a fixed Linux build image would
+# hide, since it always has GNU everything and never the BSD userland this
+# also has to work on. Running it in Docker would test the one platform
+# the portability code is not written for.
+test-kit:
+	sh tools/test/kit_test.sh
 
 tmp/mruby:
 	git clone --depth 1 --branch $(MRUBY_REF) https://github.com/mruby/mruby.git $@
