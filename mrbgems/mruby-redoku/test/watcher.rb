@@ -117,10 +117,11 @@ Dir.mkdir(WATCHER_TMP) unless Dir.exist?(WATCHER_TMP)
 
 # Named after the pdf it watches by default, so each test's config lands at
 # its own path without pulling in an RNG this file has no other use for.
-def watcher_config(pdf:, metadata: nil, game: nil, path: "#{pdf}.conf")
+def watcher_config(pdf:, metadata: nil, game: nil, trigger: nil, path: "#{pdf}.conf")
   text = "pdf=#{pdf}\n"
   text += "metadata=#{metadata}\n" if metadata
   text += "game=#{game}\n" if game
+  text += "trigger=#{trigger}\n" if trigger
   File.open(path, 'w') { |f| f.write(text) }
   path
 end
@@ -202,6 +203,21 @@ assert('Watcher::Config.parse leaves metadata nil and defaults game when absent'
   cfg = Redoku::Watcher::Config.parse("pdf=/a/decoy.pdf\n")
   assert_nil cfg.metadata
   assert_equal Redoku::Watcher::Config::DEFAULT_GAME, cfg.game
+  assert_equal Redoku::Watcher::Config::DEFAULT_TRIGGER, cfg.trigger
+end
+
+assert('Watcher::Config.parse reads trigger=lastopened and trigger=open explicitly') do
+  cfg = Redoku::Watcher::Config.parse("pdf=/a/decoy.pdf\ntrigger=lastopened\n")
+  assert_equal :lastopened, cfg.trigger
+
+  cfg = Redoku::Watcher::Config.parse("pdf=/a/decoy.pdf\ntrigger=open\n")
+  assert_equal :open, cfg.trigger
+end
+
+assert('Watcher::Config.parse rejects a trigger= value that is neither lastopened nor open') do
+  assert_raise(Redoku::Watcher::ConfigError) do
+    Redoku::Watcher::Config.parse("pdf=/a/decoy.pdf\ntrigger=sometimes\n")
+  end
 end
 
 assert('Watcher::Config.read wraps a missing file into ConfigError') do
@@ -337,7 +353,7 @@ assert('lastOpened unchanged does not spawn, even on a real IN_OPEN') do
   metadata = "#{WATCHER_TMP}/lo-unchanged.metadata"
   watcher_touch(pdf)
   watcher_write_metadata(metadata, 1000)
-  path = watcher_config(pdf: pdf, metadata: metadata)
+  path = watcher_config(pdf: pdf, metadata: metadata, trigger: 'lastopened')
   w, clock, _control, spawner, _signals, out, = new_watcher(path)
   begin
     start_past_grace(w, clock) # seeds the baseline at 1000 during #start
@@ -356,7 +372,7 @@ assert('lastOpened increased spawns exactly once, and the same value again does 
   metadata = "#{WATCHER_TMP}/lo-increased.metadata"
   watcher_touch(pdf)
   watcher_write_metadata(metadata, 1000)
-  path = watcher_config(pdf: pdf, metadata: metadata)
+  path = watcher_config(pdf: pdf, metadata: metadata, trigger: 'lastopened')
   w, clock, _control, spawner, _signals, out, = new_watcher(path)
   begin
     start_past_grace(w, clock)
@@ -380,7 +396,7 @@ assert('either armed path is just a hint: pdf IN_OPEN and metadata IN_CLOSE_WRIT
   metadata = "#{WATCHER_TMP}/lo-either.metadata"
   watcher_touch(pdf)
   watcher_write_metadata(metadata, 0)
-  path = watcher_config(pdf: pdf, metadata: metadata)
+  path = watcher_config(pdf: pdf, metadata: metadata, trigger: 'lastopened')
   w, clock, _control, spawner, = new_watcher(path)
   begin
     start_past_grace(w, clock)
@@ -410,7 +426,7 @@ assert('metadata unreadable falls back to the raw trigger, and says so') do
   pdf = "#{WATCHER_TMP}/lo-unreadable.pdf"
   metadata = "#{WATCHER_TMP}/lo-unreadable-missing.metadata" # never created
   watcher_touch(pdf)
-  path = watcher_config(pdf: pdf, metadata: metadata)
+  path = watcher_config(pdf: pdf, metadata: metadata, trigger: 'lastopened')
   w, clock, _control, spawner, _signals, _out, err = new_watcher(path)
   begin
     start_past_grace(w, clock)
@@ -420,6 +436,79 @@ assert('metadata unreadable falls back to the raw trigger, and says so') do
     assert_equal 1, spawner.calls.size
     assert_include err.text, 'metadata unreadable'
     assert_include err.text, 'falling back'
+  ensure
+    w.close
+  end
+end
+
+# --- triggering: trigger=open (fix round 3) -------------------------------
+
+assert('trigger=open spawns on a raw IN_OPEN alone, with no metadata configured at all') do
+  pdf = "#{WATCHER_TMP}/mode-open.pdf"
+  watcher_touch(pdf)
+  path = watcher_config(pdf: pdf, trigger: 'open')
+  w, clock, _control, spawner, _signals, out, = new_watcher(path)
+  begin
+    start_past_grace(w, clock)
+    assert_include out.text, 'trigger=open'
+
+    watcher_open_close(pdf)
+    w.tick(2000)
+    assert_equal 1, spawner.calls.size
+  ensure
+    w.close
+  end
+end
+
+assert('trigger=open still respects the fallback debounce, not a raw event every time') do
+  pdf = "#{WATCHER_TMP}/mode-open-debounce.pdf"
+  watcher_touch(pdf)
+  path = watcher_config(pdf: pdf, trigger: 'open')
+  w, clock, _control, spawner, _signals, out, = new_watcher(path)
+  begin
+    start_past_grace(w, clock)
+
+    watcher_open_close(pdf)
+    w.tick(2000)
+    assert_equal 1, spawner.calls.size
+
+    watcher_open_close(pdf) # no clock advance: still inside DEBOUNCE_MS
+    w.tick(2000)
+    assert_equal 1, spawner.calls.size
+    assert_include out.text, 'swallowed'
+  ensure
+    w.close
+  end
+end
+
+assert('trigger=open: a redraw IN_OPEN while redoku is present is suppressed, independent of the debounce') do
+  # The device capture (fix round 3's second measurement): xochitl redraws
+  # as it is demoted, ~1-2s after the spawn, firing IN_OPEN on the decoy
+  # again. Because trigger=open carries a launch decision on the raw event
+  # alone, this is the one place open mode differs materially from what
+  # round 2's tests already covered — it needs its own proof that
+  # suppression (not merely the debounce, which the previous test already
+  # covers) is what holds the line.
+  pdf = "#{WATCHER_TMP}/mode-open-redraw.pdf"
+  watcher_touch(pdf)
+  path = watcher_config(pdf: pdf, trigger: 'open')
+  control = WatcherClientsStub.new([])
+  w, clock, control2, spawner, _signals, out, = new_watcher(path, control: control)
+  begin
+    start_past_grace(w, clock)
+
+    watcher_open_close(pdf) # the tap itself
+    w.tick(2000)
+    assert_equal 1, spawner.calls.size
+
+    # redoku is now "running"; advance PAST DEBOUNCE_MS so only
+    # suppression, not the debounce, can be what blocks the redraw below.
+    control2.set_clients([{ pid: 99, active: true, name: 'redoku' }])
+    clock.advance(Redoku::Watcher::DEBOUNCE_MS + 100)
+    watcher_open_close(pdf) # xochitl's own redraw as it is demoted
+    w.tick(2000)
+    assert_equal 1, spawner.calls.size
+    assert_include out.text, 'already a client'
   ensure
     w.close
   end
@@ -538,7 +627,7 @@ end
 
 # --- re-arm after the watched file is replaced ---------------------------
 
-assert('a deleted-and-recreated pdf file re-arms and a fresh trigger still fires') do
+assert('a deleted-and-recreated pdf file re-arms, and the re-arm itself is evaluated as a hint') do
   pdf = "#{WATCHER_TMP}/replaced.pdf"
   watcher_touch(pdf)
   path = watcher_config(pdf: pdf)
@@ -547,12 +636,55 @@ assert('a deleted-and-recreated pdf file re-arms and a fresh trigger still fires
     start_past_grace(w, clock)
     File.delete(pdf)
     watcher_touch(pdf) # replace, the way xochitl/install.sh do (not edited in place)
-    w.tick(2000) # drains DELETE_SELF (+ the automatic IGNORED) and re-arms
+    w.tick(2000) # drains DELETE_SELF (+ IGNORED), re-arms, and evaluates the re-arm itself
+    assert_include out.text, 're-armed'
+    assert_include out.text, 'evaluating the launch decision'
+    # Fix round 3: the re-arm IS a launch decision now, not merely bookkeeping —
+    # no metadata is configured here, so it reaches the fallback path and,
+    # first-ever trigger of this Watcher's life, is not swallowed.
+    assert_equal 1, spawner.calls.size
 
+    # A genuinely independent trigger afterward, once the debounce and the
+    # cooldown both clear, still works — the watch is not merely alive, it
+    # is USABLE. The idle tick lets note_redoku_presence notice "gone" off
+    # the clock before the cooldown window below is measured from it (the
+    # same fix M4-HIJACK fix round 2 needed for the same reason).
+    w.tick(50)
+    clock.advance(Redoku::Watcher::COOLDOWN_MS)
     watcher_open_close(pdf)
     w.tick(2000)
-    assert_equal 1, spawner.calls.size
+    assert_equal 2, spawner.calls.size
+  ensure
+    w.close
+  end
+end
+
+assert('a metadata file replaced by RENAME (not edited in place) still carries its bumped lastOpened through') do
+  pdf = "#{WATCHER_TMP}/rename-metadata.pdf"
+  metadata = "#{WATCHER_TMP}/rename-metadata.metadata"
+  watcher_touch(pdf)
+  watcher_write_metadata(metadata, 0)
+  path = watcher_config(pdf: pdf, metadata: metadata, trigger: 'lastopened')
+  w, clock, _control, spawner, _signals, out, = new_watcher(path)
+  begin
+    start_past_grace(w, clock) # seeds the baseline at 0
+
+    # xochitl's own crash-safe pattern (and install.sh's): write a NEW file
+    # under a temp name, then rename it over the watched path. This
+    # unlinks the watched inode exactly like an explicit delete does
+    # (IN_DELETE_SELF + the automatic IN_IGNORED) — never an in-place
+    # edit, so IN_CLOSE_WRITE on the OLD inode never fires at all. Before
+    # fix round 3 this bump would have reached the watcher as nothing but
+    # a routine "metadata watch re-armed" line.
+    tmp = "#{metadata}.tmp"
+    watcher_write_metadata(tmp, 1000)
+    File.rename(tmp, metadata)
+
+    w.tick(2000) # drains DELETE_SELF/IGNORED, re-arms, and must evaluate the carried bump
     assert_include out.text, 're-armed'
+    assert_include out.text, 'evaluating the launch decision'
+    assert_include out.text, 'lastOpened increased to 1000'
+    assert_equal 1, spawner.calls.size
   ensure
     w.close
   end
@@ -700,7 +832,7 @@ assert('a trigger inside the startup grace does not spawn; the same lastOpened v
   metadata = "#{WATCHER_TMP}/grace.metadata"
   watcher_touch(pdf)
   watcher_write_metadata(metadata, 0)
-  path = watcher_config(pdf: pdf, metadata: metadata)
+  path = watcher_config(pdf: pdf, metadata: metadata, trigger: 'lastopened')
   w, clock, _control, spawner, _signals, out, = new_watcher(path)
   begin
     w.start # clock stays at 0; the grace runs to STARTUP_GRACE_MS from here

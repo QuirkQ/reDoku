@@ -30,12 +30,46 @@ module Redoku
       # duplicated on purpose rather than guessed independently.
       DEFAULT_GAME = '/home/root/redoku/bin/redoku'.freeze
 
-      attr_reader :pdf, :metadata, :game
+      # M4-HIJACK fix round 3: which signal a spawn is gated on.
+      # :lastopened — a spawn requires the decoy's own `lastOpened` field
+      # to have strictly increased (fix round 2's original policy). :open
+      # — an `IN_OPEN` on the pdf (or an `IN_CLOSE_WRITE` on metadata,
+      # since both armed paths are still just hints either way) is
+      # sufficient on its own, gated only by the startup grace, the
+      # fallback debounce and the suppress/cooldown — see
+      # `Watcher#genuine_open?`. This is NOT round 1's raw-event policy
+      # revived: round 1 had no grace and no cooldown; :open is the same
+      # raw trigger wearing round 2's guards, which is exactly what makes
+      # it safe to ship as a default rather than a revert.
+      #
+      # **:open is the shipped default, measured, not guessed** — a second
+      # device round (device-latency-journal.txt) settled the question fix
+      # round 3 raised: xochitl DOES write `lastOpened` at open time, but
+      # flushes the sidecar file to disk lazily — 13 s after one tap, 54 s
+      # after another, decoded straight out of the recorded epoch value
+      # itself, while `IN_OPEN` on the pdf fired at the instant of both
+      # taps, every time. Gating the launch on :lastopened means the owner
+      # stares at a static PDF for up to nearly a minute; that is a worse
+      # failure than either hazard :lastopened was built to prevent, and
+      # the SAME capture proved both of those hazards are independently
+      # closed already: the boot-time phantom `IN_OPEN` was swallowed at
+      # 9190 ms into the 10 s startup grace, and the post-quit relaunch was
+      # swallowed twice by the cooldown ("swallowed: 1504ms since redoku
+      # was last seen running, inside the 10000ms cooldown"). :lastopened
+      # stays selectable — a strictly more precise signal, and it may earn
+      # its keep on a firmware that flushes eagerly — but nothing measured
+      # on THIS device asks for it as the default. Whoever is tempted to
+      # flip this back on principle: reread this comment and the journal
+      # it cites first.
+      DEFAULT_TRIGGER = :open
 
-      def initialize(pdf:, metadata:, game:)
+      attr_reader :pdf, :metadata, :game, :trigger
+
+      def initialize(pdf:, metadata:, game:, trigger:)
         @pdf = pdf
         @metadata = metadata
         @game = game
+        @trigger = trigger
       end
 
       def self.parse(text)
@@ -59,7 +93,23 @@ module Redoku
         game = values['game']
         game = DEFAULT_GAME if game.nil? || game.empty?
 
-        new(pdf: pdf, metadata: metadata, game: game)
+        new(pdf: pdf, metadata: metadata, game: game, trigger: parse_trigger(values['trigger']))
+      end
+
+      # An absent key (every watch.conf mkdecoy.rb generates today has no
+      # `trigger=` line at all) must mean the default, not an error — this
+      # switch has to work against the file that already ships. mkdecoy.rb
+      # is another agent's file and is not touched here; it should learn to
+      # emit `trigger=` explicitly later, once the device measurement
+      # picks a mode worth defaulting to on record rather than by omission.
+      def self.parse_trigger(raw)
+        return DEFAULT_TRIGGER if raw.nil? || raw.empty?
+        case raw
+        when 'lastopened' then :lastopened
+        when 'open' then :open
+        else
+          raise ConfigError, "trigger= must be lastopened or open, got #{raw.inspect}"
+        end
       end
 
       def self.read(path)

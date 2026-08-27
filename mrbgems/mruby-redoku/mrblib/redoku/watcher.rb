@@ -6,20 +6,26 @@ module Redoku
   # fine here because it rides the separate control-socket datagram RPC, not
   # the display connection (PLAN.md §3).
   #
-  # **The launch policy below is fix round 2, rewritten from what the device
-  # actually measured** (M4-HIJACK device-watcher-journal.txt), not from the
-  # plan's original guess. Round 1 spawned on the raw inotify event; the
-  # owner's device showed that was wrong twice over: `IN_OPEN` fires on a
-  # boot-time restore with nobody touching the screen, and Quit's own panel
-  # handback makes xochitl re-read the decoy, relaunching the very game that
-  # just quit. Both watched paths (pdf `IN_OPEN`, metadata `IN_CLOSE_WRITE`)
-  # stay armed, but neither event is the trigger any more — it is a HINT
-  # that xochitl's `lastOpened` field (in the `.metadata` sidecar) might
-  # have moved, and only a strict increase over the value recorded at
-  # startup counts as a real tap (see #genuine_open?). A raw-event debounce
-  # remains as the fallback for when metadata cannot be read at all (see
-  # #fallback_genuine?) — it stopped being the primary filter, not a
-  # concern this file dropped.
+  # **The launch policy below is rewritten twice from what the device
+  # actually measured**, not from the plan's original guess — read
+  # `Watcher::Config::DEFAULT_TRIGGER`'s comment for the second rewrite's
+  # numbers before touching either. Round 1 spawned on the raw inotify
+  # event; the owner's device showed that was wrong twice over: `IN_OPEN`
+  # fires on a boot-time restore with nobody touching the screen, and
+  # Quit's own panel handback makes xochitl re-read the decoy, relaunching
+  # the very game that just quit (M4-HIJACK device-watcher-journal.txt).
+  # Round 2's answer was the startup grace, the suppress/cooldown, AND
+  # gating the launch on the decoy's own `lastOpened` field increasing
+  # (`trigger=lastopened`) rather than on either watched path's raw event.
+  # A second device round then measured that gate's actual cost: xochitl
+  # writes `lastOpened` at open time but flushes the sidecar to disk
+  # lazily, up to nearly a minute late, while the grace and the cooldown
+  # alone already close both hazards round 2 was built for — so
+  # `trigger=open` (the raw event, wearing round 2's guards) ships as the
+  # default, with `lastopened` kept as a selectable, strictly more precise
+  # mode. Both watched paths (pdf `IN_OPEN`, metadata `IN_CLOSE_WRITE`)
+  # stay armed either way; neither is ever the trigger by itself — see
+  # #genuine_open? for what each mode does with the hint.
   #
   # `clock:`/`control:`/`spawner:`/`signals:` are the App-style seam: real
   # RM2 modules by default, fakes in tests, so the launch policy is
@@ -217,7 +223,11 @@ module Redoku
     # mechanism. Called from #start (the first attempt) and from
     # #retry_pending_rearms (every later one); both discard the true/false
     # it returns, because neither has anything more to do either way — the
-    # loop just keeps turning.
+    # loop just keeps turning. Always logs which trigger= mode is active on
+    # success (not only on a recovery, unlike the re-arm-failing pattern
+    # elsewhere in this file): fix round 3 asks for this specifically, so
+    # one on-device tap plus one journal read settles which of :lastopened
+    # or :open this device actually needs, without guessing.
     def load_config
       begin
         @config = Config.read(@config_path)
@@ -231,13 +241,11 @@ module Redoku
         end
         return false
       end
-      recovered = @rearm_failing[:config]
       @rearm_failing[:config] = false
       @rearm_retry_at.delete(:config)
-      if recovered
-        log_line("config read: pdf=#{@config.pdf} " \
-                  "metadata=#{@config.metadata || '(none)'} game=#{@config.game}")
-      end
+      log_line("config read: pdf=#{@config.pdf} " \
+                "metadata=#{@config.metadata || '(none)'} game=#{@config.game} " \
+                "trigger=#{@config.trigger}")
       seed_last_opened
       reconcile!(:pdf)
       reconcile!(:metadata)
@@ -248,11 +256,15 @@ module Redoku
     # so a value already sitting there from before this process existed —
     # a boot restore, a stale open from days ago — can never itself read as
     # a fresh tap (requirement A: "seed... so a boot restore or a thumbnail
-    # render... cannot launch anything"). Silent when metadata isn't
-    # configured at all (nothing to seed); logged to stderr when it is
-    # configured but unreadable right now, because #genuine_open? will keep
-    # retrying this same read on every later trigger until it succeeds.
+    # render... cannot launch anything"). A no-op in :open mode — nothing
+    # ever reads @last_opened_ms there, and attempting the read would only
+    # risk a misleading "metadata unreadable" line for a value this mode
+    # never consults. Otherwise silent when metadata isn't configured at
+    # all (nothing to seed); logged to stderr when it is configured but
+    # unreadable right now, because #genuine_open? will keep retrying this
+    # same read on every later trigger until it succeeds.
     def seed_last_opened
+      return if @config.trigger == :open
       path = @config.metadata
       return if path.nil?
       reading = read_last_opened
@@ -376,7 +388,8 @@ module Redoku
       reconcile!(:pdf)
       reconcile!(:metadata)
       log_line("config re-read: pdf=#{@config.pdf} " \
-                "metadata=#{@config.metadata || '(none)'} game=#{@config.game}")
+                "metadata=#{@config.metadata || '(none)'} game=#{@config.game} " \
+                "trigger=#{@config.trigger}")
     end
 
     def process_events(events)
@@ -402,21 +415,44 @@ module Redoku
       end
     end
 
+    # A watch dying this way (IN_IGNORED/DELETE_SELF/MOVE_SELF) is very
+    # often xochitl replacing the file by rename — write-temp-then-rename
+    # is the crash-safe pattern, and it unlinks the watched inode exactly
+    # like an explicit delete does (this file's own header names it as one
+    # of the two ways a replace happens). The rename IS the write: if the
+    # replacement metadata already carries a bumped lastOpened, that fact
+    # would otherwise reach this watcher as nothing but a re-arm log line —
+    # a tap silently lost, with no evidence a launch decision was even
+    # skipped (fix round 3). So a successful re-arm is evaluated exactly
+    # like an ordinary trigger — same grace, same genuine_open?, same
+    # suppression/cooldown — and says so in the log.
     def watch_died(wd, role, mask)
       path = target_path(role)
       log_line("#{role} watch on #{path} ended " \
                 "(#{self.class.decode_mask(mask).join('|')}); re-arming")
       @watches.delete(wd)
       @wd_for[role] = nil
-      log_line("#{role} watch re-armed on #{target_path(role)}") if reconcile!(role)
+      return unless reconcile!(role)
+      log_line("#{role} watch re-armed on #{target_path(role)}")
+      log_line("#{role} re-arm carries a hint; evaluating the launch decision")
+      evaluate_hint
     end
 
     # An armed path fired. Not itself the trigger any more (see this file's
-    # header) — first the startup grace, then #genuine_open? decide that.
+    # header) — #evaluate_hint decides that, the same way whether it was
+    # reached from here or from a re-arm that just carried a hint of its
+    # own (#watch_died).
     def handle_trigger(role, mask)
       path = target_path(role)
       log_line("trigger: #{self.class.decode_mask(mask).join('|')} on #{path} (#{role})")
+      evaluate_hint
+    end
 
+    # The startup grace, then #genuine_open?, then the spawn decision —
+    # shared by every path that can carry a hint: an ordinary trigger
+    # (#handle_trigger) and a watch that died and was re-armed
+    # (#watch_died).
+    def evaluate_hint
       since_start = @clock.monotonic_ms - @started_at_ms
       if since_start >= 0 && since_start < STARTUP_GRACE_MS
         log_line("swallowed: #{since_start}ms since start, inside the " \
@@ -439,6 +475,17 @@ module Redoku
     # beat it there (metadata unreadable at #start, readable by the time a
     # hint arrives); anything higher than the baseline is a real tap.
     def genuine_open?
+      # trigger=open (fix round 3): the raw event is the whole answer, on
+      # purpose — see Config::DEFAULT_TRIGGER's comment for why this is not
+      # round 1's policy revived. A different condition from the fallback
+      # below (which reacts to metadata being broken); this reacts to the
+      # operator having said not to bother with lastOpened at all, so it is
+      # checked first and unconditionally, never attempting the read.
+      if @config.trigger == :open
+        log_line('trigger=open: evaluating the raw event only')
+        return fallback_genuine?
+      end
+
       reading = read_last_opened
       if reading.nil?
         if @config.metadata
