@@ -83,11 +83,15 @@ module Redoku
   # Watcher's own `signals:` default (plain RM2) can be exercised in tests
   # without a real signal handler installed on the test process.
   #
-  # A ConfigError (no pdf= key, or a pdf file that cannot be watched) is
-  # fatal here and only here: R5/R10 says a decoy nobody can arm is a
-  # launcher nobody can use, so there is nothing to run degraded. Once
-  # running, the very same error on a SIGHUP re-read is NOT fatal — Watcher
-  # swallows it itself and keeps the previous paths armed.
+  # Nothing about a missing or unreadable config is fatal here, or anywhere
+  # downstream (M4-HIJACK fix round 2, requirement D): the device measured
+  # `/home/root` mounting AFTER systemd starts this unit — `203/EXEC` on
+  # every boot — so `Watcher#start` never raises for that reason; it logs
+  # and retries on its own bounded interval instead (`Watcher#load_config`).
+  # A watcher that exits at boot because a mount lost a race is a launcher
+  # that only works after a manual restart, which defeats the point of this
+  # milestone. `watcher.start`/`#run` are still wrapped so an unrelated bug
+  # cannot crash silently.
   def self.watch(config_path)
     RM2.setup_signals
     watcher = Watcher.new(config_path || Watcher::DEFAULT_CONFIG_PATH)

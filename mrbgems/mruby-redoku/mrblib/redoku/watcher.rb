@@ -6,90 +6,27 @@ module Redoku
   # fine here because it rides the separate control-socket datagram RPC, not
   # the display connection (PLAN.md §3).
   #
-  # Two triggers are armed at once and share one 5 s debounce (M4-HIJACK.md
-  # ruling): IN_OPEN on the decoy's own PDF (primary) and IN_CLOSE_WRITE on
-  # its .metadata sidecar (fallback: xochitl writes `lastOpened` there on
-  # every open) — which one xochitl actually fires is an on-device fact this
-  # code cannot know. Every trigger is logged with its mask decoded into
-  # constant names and the path it fired on: on a device with no
-  # `inotifyd`, this log is the only instrument that will ever tell Task 5
-  # which trigger is real.
+  # **The launch policy below is fix round 2, rewritten from what the device
+  # actually measured** (M4-HIJACK device-watcher-journal.txt), not from the
+  # plan's original guess. Round 1 spawned on the raw inotify event; the
+  # owner's device showed that was wrong twice over: `IN_OPEN` fires on a
+  # boot-time restore with nobody touching the screen, and Quit's own panel
+  # handback makes xochitl re-read the decoy, relaunching the very game that
+  # just quit. Both watched paths (pdf `IN_OPEN`, metadata `IN_CLOSE_WRITE`)
+  # stay armed, but neither event is the trigger any more — it is a HINT
+  # that xochitl's `lastOpened` field (in the `.metadata` sidecar) might
+  # have moved, and only a strict increase over the value recorded at
+  # startup counts as a real tap (see #genuine_open?). A raw-event debounce
+  # remains as the fallback for when metadata cannot be read at all (see
+  # #fallback_genuine?) — it stopped being the primary filter, not a
+  # concern this file dropped.
   #
   # `clock:`/`control:`/`spawner:`/`signals:` are the App-style seam: real
-  # RM2 modules by default, fakes in tests, so the debounce, the
-  # already-running check and the spawn decision are host-testable without a
-  # display server or a real game process. `inotify:` is the one seam kept
-  # REAL (a real tmpdir file, real kernel events), as mruby-rm2/test/inotify.rb
-  # does it — there is no protocol here worth faking, only a filesystem.
+  # RM2 modules by default, fakes in tests, so the launch policy is
+  # host-testable without a display server or a real game process.
+  # `inotify:` is the one seam kept REAL (a real tmpdir file, real kernel
+  # events), as mruby-rm2/test/inotify.rb does it.
   class Watcher
-    # Raised for a config this watcher cannot trust to arm from. `Redoku.watch`
-    # (main.rb) treats it as fatal on the FIRST read (print, exit non-zero —
-    # R5/R10: a decoy nobody can watch is a launcher nobody can use). A
-    # SIGHUP re-read treats the same error as "log it, keep the previous good
-    # paths armed" (#reread_config_if_requested) — a bad edit must not
-    # silently disarm the launcher.
-    class ConfigError < StandardError; end
-
-    # watch.conf's shape is fixed by ruling: key=value lines, '#' comments
-    # and blank lines allowed, exactly the keys pdf=/metadata=/game=.
-    # tools/mkdecoy.rb (MkDecoy.watch_conf_for) is the one writer of a real
-    # one; this is the one reader. DEFAULT_GAME mirrors
-    # MkDecoy::DEVICE_GAME_BIN by value — the two tools can't share code
-    # (one host CRuby, one mruby), so it's duplicated on purpose.
-    class Config
-      DEFAULT_GAME = '/home/root/redoku/bin/redoku'.freeze
-
-      attr_reader :pdf, :metadata, :game
-
-      def initialize(pdf:, metadata:, game:)
-        @pdf = pdf
-        @metadata = metadata
-        @game = game
-      end
-
-      # A missing/blank pdf= is the "missing" half of R5/R10's "pdf missing
-      # or unreadable is fatal"; the "unreadable" half is a filesystem fact
-      # caught later, where the path is actually armed (fatal: true below).
-      def self.parse(text)
-        values = {}
-        text.split("\n").each do |raw|
-          line = raw.strip
-          next if line.empty? || line.start_with?('#')
-          key, value = line.split('=', 2)
-          next if key.nil? || value.nil?
-          key = key.strip
-          next if key.empty?
-          values[key] = value.strip # unknown keys: accepted, ignored, forward-compatible
-        end
-
-        pdf = values['pdf']
-        raise ConfigError, 'pdf= is required' if pdf.nil? || pdf.empty?
-
-        metadata = values['metadata']
-        metadata = nil if metadata && metadata.empty?
-
-        game = values['game']
-        game = DEFAULT_GAME if game.nil? || game.empty?
-
-        new(pdf: pdf, metadata: metadata, game: game)
-      end
-
-      def self.read(path)
-        parse(File.read(path))
-      rescue ConfigError => e
-        # Re-raised through a captured variable, not a bare `raise`: mruby's
-        # method-level `rescue` (no explicit begin) does not reliably leave
-        # $! set the way a begin/rescue block does, and a bare `raise` there
-        # was observed to surface as a bare RuntimeError instead of this
-        # ConfigError — losing the exact message every caller depends on.
-        raise e
-      rescue StandardError => e
-        # File.read raises a SystemCallError subclass on a missing/unreadable
-        # file; folded into ConfigError so callers see one exception type.
-        raise ConfigError, "cannot read config #{path} (#{e.message})"
-      end
-    end
-
     # R5/R10: `redoku --watch` with no `--config PATH` reads this. Kept as a
     # literal in main.rb's USAGE text too (see that file's header comment)
     # rather than interpolated, for a load-order reason specific to that
@@ -97,19 +34,48 @@ module Redoku
     # a method body (evaluated lazily) can just reference this one.
     DEFAULT_CONFIG_PATH = '/home/root/redoku/watch.conf'.freeze
 
-    # PLAN.md §11's "watcher re-trigger loop" rule, shared across BOTH
-    # trigger paths (ruling): a pdf IN_OPEN and a metadata IN_CLOSE_WRITE for
-    # the same tap must not add up to two spawns.
+    # The FALLBACK filter's window (PLAN.md §11's "watcher re-trigger loop"
+    # rule) — only reached when metadata cannot be read at all, so the raw
+    # event is all there is to go on.
     DEBOUNCE_MS = 5_000
+
+    # Boot is the noisiest moment on this device (M4-HIJACK fix round 2,
+    # requirement C): xochitl's own restore-last-document / thumbnail read
+    # can fire IN_OPEN on the decoy with nobody touching the screen, and the
+    # device measured exactly that, seconds after boot. Every trigger in the
+    # first 10 s of this process's life is swallowed outright, before even
+    # the lastOpened check runs — belt under braces, since a boot restore is
+    # not expected to bump lastOpened either, but boot is the one moment
+    # this watcher trusts least.
+    STARTUP_GRACE_MS = 10_000
+
+    # After a spawn, requirement B: no relaunch while a client named
+    # `redoku` is present, and none for this long after it disappears
+    # either. This is the structural kill for the quit-relaunch loop the
+    # device measured — Quit closes the display connection, the server
+    # promotes xochitl, xochitl re-reads the decoy it still has open, and
+    # that read can reach this watcher as a fresh trigger (and, the device
+    # run could not rule out, possibly even a bumped lastOpened) well after
+    # DEBOUNCE_MS has expired. Presence is authoritative and unconditional;
+    # this cooldown is what closes the gap the instant presence cannot
+    # cover — the moment between the game actually exiting and this watcher
+    # next happening to check.
+    COOLDOWN_MS = 10_000
 
     # Bounds the inotify wait so SIGTERM/SIGINT/SIGHUP latches are checked at
     # least once a second (ruling: "the poll must be bounded"), and doubles
-    # as the pace a pending re-arm retry is checked at.
+    # as the pace a pending re-arm or config retry is checked at.
     POLL_MS = 1_000
 
     # How often a failed re-arm (the watched file briefly absent, mid a
-    # xochitl/installer replace) is retried, rather than every POLL_MS turn —
-    # that would turn a multi-second install window into a log flood.
+    # xochitl/installer replace) OR a failed config read (mid a slow
+    # `/home/root` mount — the device's `203/EXEC` on every boot,
+    # requirement D) is retried, rather than every POLL_MS turn — that would
+    # turn a multi-second window into a log flood. `:config` shares this
+    # same retry bookkeeping (`@rearm_failing`/`@rearm_retry_at`) under its
+    # own pseudo-role key alongside `:pdf`/`:metadata`; `reconcile!` never
+    # sees it (`retry_pending_rearms` special-cases it to `#load_config`
+    # instead), so nothing downstream has to know a third role exists.
     REARM_RETRY_MS = 5_000
 
     # IN_DELETE_SELF/IN_MOVE_SELF are requested explicitly per watch
@@ -124,8 +90,8 @@ module Redoku
     # Every mask bit this watcher decodes, in the shim's own order
     # (mruby-rm2/README.md). The measuring-instrument requirement: every
     # trigger is logged with its mask decoded into NAMES, never a bare hex
-    # number — this log is the only place Task 5 can read back which trigger
-    # actually fired on-device.
+    # number — this log is the only place Task 5 (and fix round 2's own
+    # diagnosis) can read back which trigger actually fired on-device.
     MASK_NAMES = [
       [RM2::Inotify::IN_OPEN, 'IN_OPEN'],
       [RM2::Inotify::IN_CLOSE_WRITE, 'IN_CLOSE_WRITE'],
@@ -141,6 +107,29 @@ module Redoku
       MASK_NAMES.each { |bit, name| names << name if (mask & bit) != 0 }
       names << format('0x%x', mask) if names.empty?
       names
+    end
+
+    # xochitl's own `lastOpened` field (device format: a millisecond epoch
+    # as a JSON string — xochitl-3.27-format.md), read as a plain string
+    # scan. No JSON parser and no new dependency: the device's own dump is a
+    # fixed, machine-written shape, `"lastOpened": "<digits>"`, and this is
+    # the one field this watcher ever needs out of it. Returns nil for
+    # anything it cannot make sense of — missing key, missing quotes,
+    # non-digit content — every one of which means "the caller falls back,"
+    # never "raise."
+    def self.extract_last_opened(text)
+      idx = text.index('"lastOpened"')
+      return nil unless idx
+      colon = text.index(':', idx)
+      return nil unless colon
+      q1 = text.index('"', colon)
+      return nil unless q1
+      q2 = text.index('"', q1 + 1)
+      return nil unless q2
+      digits = text[(q1 + 1)...q2]
+      return nil if digits.empty?
+      digits.each_char { |c| return nil if c < '0' || c > '9' }
+      digits.to_i
     end
 
     # `inotify:` defaults to a fresh fd; tests pass one they made and close
@@ -162,29 +151,36 @@ module Redoku
       @config = nil
       @watches = {}   # wd => :pdf or :metadata, for events read back later
       @wd_for = {}    # :pdf/:metadata => its current wd, or nil if unarmed
-      @rearm_failing = {}  # role => true while its re-arm retry is failing
-      @rearm_retry_at = {} # role => monotonic ms of its next retry attempt
-      @last_trigger_ms = nil
+      @rearm_failing = {}  # :pdf/:metadata/:config => true while failing
+      @rearm_retry_at = {} # same keys => monotonic ms of the next retry
+      @last_trigger_ms = nil   # fallback-path debounce bookkeeping
+      @last_opened_ms = nil    # primary-path baseline (nil until seeded)
+      @started_at_ms = nil     # set by #start; anchors the startup grace
+      @spawned_once = false    # has this process EVER called spawn_detached
+      @redoku_gone_since_ms = nil # monotonic ms redoku was first seen gone
     end
 
-    # Loads the config and arms both triggers. pdf is fatal on failure
-    # (R5/R10: no pdf, no launcher, nothing to run degraded); metadata is
-    # best-effort like every later re-arm, since it is documented as the
-    # FALLBACK — losing it costs redundancy, not the feature.
+    # Requirement D: never raises. A config that cannot be read yet — the
+    # device's `203/EXEC`, `/home/root` mounting after this unit starts —
+    # is logged and retried on the same bounded interval a re-arm uses, not
+    # treated as fatal: a watcher that exits at boot because a mount lost a
+    # race is a launcher that only works after a manual restart, and that
+    # defeats the entire point of this milestone.
     def start
-      @config = Config.read(@config_path)
-      reconcile!(:pdf, fatal: true)
-      reconcile!(:metadata)
+      @started_at_ms = @clock.monotonic_ms
+      load_config
       self
     end
 
     # One full iteration, exposed so a test can drive the loop
-    # deterministically: re-read the config if SIGHUP arrived, retry any
-    # watch still waiting to be re-armed, wait up to timeout_ms for an
-    # inotify event, and act on whatever came in.
+    # deterministically: re-read the config if SIGHUP arrived, retry the
+    # config (if it never loaded) or any watch still waiting to be
+    # re-armed, wait up to timeout_ms for an inotify event, and act on
+    # whatever came in.
     def tick(timeout_ms = POLL_MS)
       reread_config_if_requested
       retry_pending_rearms
+      note_redoku_presence
       ready = @inotify.wait(timeout_ms)
       process_events(@inotify.read_events) if ready
       self
@@ -215,6 +211,70 @@ module Redoku
       @err.flush
     end
 
+    # Reads @config_path, retrying on REARM_RETRY_MS under the `:config`
+    # pseudo-role until it succeeds — see REARM_RETRY_MS's own comment for
+    # why this shares that bookkeeping rather than inventing a second retry
+    # mechanism. Called from #start (the first attempt) and from
+    # #retry_pending_rearms (every later one); both discard the true/false
+    # it returns, because neither has anything more to do either way — the
+    # loop just keeps turning.
+    def load_config
+      begin
+        @config = Config.read(@config_path)
+      rescue ConfigError => e
+        first = !@rearm_failing[:config]
+        @rearm_failing[:config] = true
+        @rearm_retry_at[:config] = @clock.monotonic_ms + REARM_RETRY_MS
+        if first
+          err_line("config unreadable (#{@config_path}): #{e.message}; " \
+                    "retrying every #{REARM_RETRY_MS}ms")
+        end
+        return false
+      end
+      recovered = @rearm_failing[:config]
+      @rearm_failing[:config] = false
+      @rearm_retry_at.delete(:config)
+      if recovered
+        log_line("config read: pdf=#{@config.pdf} " \
+                  "metadata=#{@config.metadata || '(none)'} game=#{@config.game}")
+      end
+      seed_last_opened
+      reconcile!(:pdf)
+      reconcile!(:metadata)
+      true
+    end
+
+    # Establishes the primary path's baseline from the CURRENT lastOpened,
+    # so a value already sitting there from before this process existed —
+    # a boot restore, a stale open from days ago — can never itself read as
+    # a fresh tap (requirement A: "seed... so a boot restore or a thumbnail
+    # render... cannot launch anything"). Silent when metadata isn't
+    # configured at all (nothing to seed); logged to stderr when it is
+    # configured but unreadable right now, because #genuine_open? will keep
+    # retrying this same read on every later trigger until it succeeds.
+    def seed_last_opened
+      path = @config.metadata
+      return if path.nil?
+      reading = read_last_opened
+      if reading
+        @last_opened_ms = reading
+        log_line("lastOpened baseline seeded at #{reading}")
+      else
+        err_line("metadata unreadable at startup (#{path}); will retry on the next trigger")
+      end
+    end
+
+    # The current lastOpened value, or nil for "metadata not configured, or
+    # unreadable, or unparseable right now" — every one of those is the
+    # same instruction to the caller: fall back.
+    def read_last_opened
+      path = @config.metadata
+      return nil if path.nil?
+      self.class.extract_last_opened(File.read(path))
+    rescue StandardError
+      nil
+    end
+
     def target_path(role)
       role == :pdf ? @config.pdf : @config.metadata
     end
@@ -231,13 +291,10 @@ module Redoku
     # success the previous watch for this role is forgotten only NOW — after
     # the new one is live — so a SIGHUP reread never has a gap where neither
     # path is covered, and a reread that fails leaves the OLD watch exactly
-    # as armed as it was.
-    #
-    # `fatal:` is `start`'s escape hatch for the one case that must not
-    # become a retry: the pdf trigger has never been armed even once. Every
-    # other caller gets the forgiving behaviour — log once on the state
-    # change into failing, keep retrying on REARM_RETRY_MS, never raise.
-    def reconcile!(role, fatal: false)
+    # as armed as it was. Never raises: "re-arm, don't die" is the whole
+    # point (see #note_rearm_failing), and every caller — startup, SIGHUP, a
+    # died watch, a bounded retry — gets the identical forgiving behaviour.
+    def reconcile!(role)
       path = target_path(role)
       if path.nil?
         forget_watch(role)
@@ -255,19 +312,15 @@ module Redoku
         @rearm_retry_at.delete(role)
         true
       rescue StandardError => e
-        # Deliberately StandardError, not just SystemCallError: "re-arm,
-        # don't die" is the whole point of this method, and #watch has a
+        # Deliberately StandardError, not just SystemCallError: #watch has a
         # second raise path this rescue must also catch — the C shim's own
         # "inotify is closed" RuntimeError guard (src/inotify.c). Nothing in
         # today's lifecycle closes @inotify out from under a live Watcher,
         # so that path is unreachable right now, but it is not structurally
         # prevented, and a rescue narrow enough to miss it would let the one
         # failure this requirement exists to guard against — a dead watcher,
-        # silently — right back in through a gap nobody meant to leave open.
-        # The error still reaches stderr either way (fatal: raises with it
-        # in the message; non-fatal: note_rearm_failing logs it) — widening
-        # the catch is not the same as swallowing it.
-        raise ConfigError, "cannot watch #{role} at #{path} (#{e.message})" if fatal
+        # silently — right back in. The error still reaches stderr either
+        # way, via #note_rearm_failing below.
         note_rearm_failing(role, path, e)
         false
       end
@@ -297,7 +350,11 @@ module Redoku
       @rearm_retry_at.keys.each do |role|
         due = @rearm_retry_at[role]
         next unless due && now >= due
-        log_line("#{role} watch re-armed on #{target_path(role)}") if reconcile!(role)
+        if role == :config
+          load_config
+        else
+          log_line("#{role} watch re-armed on #{target_path(role)}") if reconcile!(role)
+        end
       end
     end
 
@@ -354,10 +411,59 @@ module Redoku
       log_line("#{role} watch re-armed on #{target_path(role)}") if reconcile!(role)
     end
 
+    # An armed path fired. Not itself the trigger any more (see this file's
+    # header) — first the startup grace, then #genuine_open? decide that.
     def handle_trigger(role, mask)
       path = target_path(role)
       log_line("trigger: #{self.class.decode_mask(mask).join('|')} on #{path} (#{role})")
 
+      since_start = @clock.monotonic_ms - @started_at_ms
+      if since_start >= 0 && since_start < STARTUP_GRACE_MS
+        log_line("swallowed: #{since_start}ms since start, inside the " \
+                  "#{STARTUP_GRACE_MS}ms startup grace")
+        return
+      end
+
+      return unless genuine_open?
+      maybe_spawn
+    end
+
+    # Requirement A. lastOpened unreadable (not configured, file gone,
+    # field missing) falls back to the raw event + the classic debounce —
+    # a broken sidecar must cost redundancy, not the launcher entirely.
+    # Otherwise: unchanged or lower is swallowed (a boot restore, a
+    # thumbnail render, a duplicate hint for the same tap); the FIRST
+    # successful read ever, with no baseline yet, seeds one instead of
+    # spawning — the same "cannot launch anything" guarantee #seed_last_opened
+    # gives eagerly at startup, reached lazily here for the one case that
+    # beat it there (metadata unreadable at #start, readable by the time a
+    # hint arrives); anything higher than the baseline is a real tap.
+    def genuine_open?
+      reading = read_last_opened
+      if reading.nil?
+        if @config.metadata
+          err_line("metadata unreadable (#{@config.metadata}); falling back to the raw trigger")
+        end
+        return fallback_genuine?
+      end
+      if @last_opened_ms.nil?
+        @last_opened_ms = reading
+        log_line("lastOpened baseline seeded at #{reading} (was unset); not spawning")
+        return false
+      end
+      if reading > @last_opened_ms
+        @last_opened_ms = reading
+        log_line("lastOpened increased to #{reading}")
+        return true
+      end
+      log_line("lastOpened unchanged (#{reading}); swallowed")
+      false
+    end
+
+    # The pre-round-2 policy, alive only for when lastOpened cannot be read
+    # at all: PLAN.md §11's "watcher re-trigger loop" rule, DEBOUNCE_MS on
+    # the raw event.
+    def fallback_genuine?
       now = @clock.monotonic_ms
       if @last_trigger_ms
         elapsed = now - @last_trigger_ms
@@ -366,31 +472,78 @@ module Redoku
         # convention for the same clock.
         if elapsed >= 0 && elapsed < DEBOUNCE_MS
           log_line("swallowed: #{elapsed}ms since the last trigger, " \
-                    "inside the #{DEBOUNCE_MS}ms debounce window")
-          return
+                    "inside the #{DEBOUNCE_MS}ms debounce window (fallback)")
+          return false
         end
       end
       @last_trigger_ms = now
-      maybe_spawn
+      true
     end
 
     def maybe_spawn
-      if redoku_running?
-        log_line('redoku is already a client; not spawning')
-        return
-      end
+      return if redoku_suppressed?
       begin
         pid = @spawner.spawn_detached(@config.game)
+        @spawned_once = true
+        @redoku_gone_since_ms = nil # a fresh cooldown starts at the NEXT observed "gone", not this instant
         log_line("spawned #{@config.game} (pid #{pid})")
       rescue StandardError => e
         err_line("spawn failed (#{e.message})")
       end
     end
 
-    # R11: a failing clients check must not block the spawn — the check
-    # exists to prevent a double spawn, not to gate the launch.
-    def redoku_running?
-      @control.clients.any? { |c| c[:name] == 'redoku' }
+    # Keeps @redoku_gone_since_ms honest BETWEEN triggers, once per tick —
+    # not only reactively, inside #redoku_suppressed?, at whatever moment a
+    # trigger next happens to ask. That reactive-only version was tried
+    # first and measured wrong on the host suite before it ever reached a
+    # device: with nothing else polling `clients` in between, the FIRST
+    # trigger after a spawn always finds @redoku_gone_since_ms nil and sets
+    # it to THAT trigger's own clock reading, so `elapsed` is zero at the
+    # exact moment it matters most — the cooldown could never elapse no
+    # matter how long a test (or a device) actually waited between two
+    # trigger events. In production `tick` already runs about once a second
+    # regardless of triggers (`run`'s own loop), so this makes the
+    # observation timely off the real clock instead of off whenever the
+    # next tap happens to land — matching "for a 10s cooldown AFTER it
+    # disappears" instead of "for 10s after this watcher next happens to
+    # look." Silent on failure: a broken control socket here just skips
+    # this tick's nudge — #redoku_suppressed? is still the one authoritative,
+    # LOGGED check at the moment that actually decides a spawn (R11).
+    def note_redoku_presence
+      return unless @spawned_once
+      present = @control.clients.any? { |c| c[:name] == 'redoku' }
+      if present
+        @redoku_gone_since_ms = nil
+      elsif @redoku_gone_since_ms.nil?
+        @redoku_gone_since_ms = @clock.monotonic_ms
+      end
+    rescue StandardError
+      nil
+    end
+
+    # Requirement B: presence is authoritative, and absence still holds the
+    # suppression for COOLDOWN_MS after the first time it was OBSERVED gone
+    # (by #note_redoku_presence, above — not set here, so a raise from THIS
+    # call can never leave @redoku_gone_since_ms stuck mid-update). R11 is
+    # unchanged: a `clients` call that itself raises must not block a spawn
+    # (the check exists to prevent a double spawn, not to gate the launch),
+    # so it counts as "not suppressed," logged as R11 always has.
+    def redoku_suppressed?
+      present = @control.clients.any? { |c| c[:name] == 'redoku' }
+      if present
+        @redoku_gone_since_ms = nil
+        log_line('redoku is already a client; not spawning')
+        return true
+      end
+      if @redoku_gone_since_ms
+        elapsed = @clock.monotonic_ms - @redoku_gone_since_ms
+        if elapsed >= 0 && elapsed < COOLDOWN_MS
+          log_line("swallowed: #{elapsed}ms since redoku was last seen running, " \
+                    "inside the #{COOLDOWN_MS}ms cooldown")
+          return true
+        end
+      end
+      false
     rescue StandardError => e
       err_line("clients check failed (#{e.message}); spawning anyway (R11)")
       false

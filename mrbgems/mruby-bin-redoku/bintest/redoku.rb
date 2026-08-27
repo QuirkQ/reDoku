@@ -58,15 +58,37 @@ assert('redoku --help explains itself and exits 0') do
   assert_include out, '--watch'
 end
 
-assert('redoku --watch --config PATH fails clearly on a bogus config path') do
-  # No rm2fb server and no /home/root exist in the build container either,
-  # but this must fail on the CONFIG, before anything ever touches a
-  # display or a real device path — proving --watch's own argument handling
-  # rather than falling through to some other failure.
-  out, err, status = run_redoku('--watch', '--config', '/tmp/redoku-bintest-no-such-config.conf')
-  assert_equal 1, status
-  assert_equal '', out
-  assert_include err, 'redoku:'
+assert('redoku --watch survives a config that is not there yet, and stops cleanly on SIGTERM') do
+  # M4-HIJACK fix round 2, requirement D: the device measured `/home/root`
+  # mounting AFTER systemd starts this unit (203/EXEC on every boot), so a
+  # config the watcher cannot read yet must not be fatal any more — this is
+  # the opposite assertion from round 1's bintest for the same CLI shape.
+  # `stdout`/`stderr` are read only AFTER the process has been asked to
+  # exit, so this never blocks on a pipe the way run_redoku's helper
+  # explicitly avoids — reading them earlier, while the process is still
+  # alive and still writing, is exactly the hang that helper's own comment
+  # warns about.
+  Open3.popen3(REDOKU, '--watch', '--config', '/tmp/redoku-bintest-no-such-config.conf') do |stdin, stdout, stderr, thread|
+    stdin.close
+    sleep 0.5 # long enough for the first config-read attempt and its log line
+    assert_true thread.alive?, 'redoku --watch should not exit on a missing config'
+
+    Process.kill('TERM', thread.pid)
+    status = nil
+    begin
+      Timeout.timeout(RUN_LIMIT) { status = thread.value.exitstatus }
+    rescue Timeout::Error
+      begin
+        Process.kill('KILL', thread.pid)
+      rescue Errno::ESRCH
+        nil
+      end
+      flunk("redoku --watch did not exit within #{RUN_LIMIT}s of SIGTERM")
+      next
+    end
+    assert_equal 0, status
+    assert_include stderr.read, 'config unreadable'
+  end
 end
 
 assert('redoku fails clearly when no display server is listening') do
