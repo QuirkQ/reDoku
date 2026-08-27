@@ -463,6 +463,27 @@ in_kit_tree() { [ "$IN_KIT" -eq 1 ] || [ "$KIT_ROOT" != "$REPO" ]; }
 # `make build` to offer either, because it has no checkout to run it in.
 game_is_prebuilt() { in_kit_tree || [ "$KIT_VERSION" != dev ]; }
 
+# The command that re-fetches whatever the prebuilt artifacts came from —
+# printed by every "this kit is incomplete or corrupt" message in this file,
+# because a fix that names the wrong command is the class of wrong advice
+# design doc §7's last paragraph exists to eliminate.
+#
+# Two answers, because there are two things a prebuilt tree can be sitting
+# in. A KIT — one this CLI runs from, or one --kit named — has a root, a
+# 'current' symlink and versions to roll between, which is what `redoku
+# upgrade` (a later task in this milestone) operates on. A CHECKOUT that
+# downloaded into build/download/<tag>/ has none of those; the next task
+# makes `upgrade` refuse in a checkout outright, so naming it there would
+# send someone to a command written to turn them away. The command that
+# actually applies is the one that put the tree there in the first place.
+refetch_hint() {
+  if [ "$IN_KIT" -eq 1 ] || [ -n "$KIT_DIR" ]; then
+    printf '%s\n' "redoku upgrade"
+  else
+    printf '%s\n' "bin/redoku install --download"
+  fi
+}
+
 # The cross-built game, into $GAME. Its path is fixed (mruby's rake decides
 # it), so there is nothing to search for and no --artifacts override; it is
 # checked to really be 32-bit ARM like everything else that leaves this
@@ -480,17 +501,19 @@ find_game() {
   # run, so the hint names the build. Where this file shipped prebuilt
   # (design doc §3.2) there is no build to run, so the SAME two conditions
   # instead mean the download is incomplete or corrupt, and the fix is to
-  # re-fetch it — which is what "redoku upgrade" does (added in a later task
-  # of this milestone; naming it here is still correct).
+  # re-fetch it — by whichever command actually applies, which is
+  # refetch_hint's job and not one fixed string's.
   #
   # The question is PROVENANCE, so it goes through game_is_prebuilt, not
   # through $KIT_VERSION alone. A checkout-mode `install --download` unpacks
   # a released game into build/download/<tag>/ while this CLI is still an
   # unstamped dev build; telling that user to "rebuild with: make clean &&
-  # make build" would be advice about a file no build of theirs produced.
+  # make build" would be advice about a file no build of theirs produced —
+  # and telling them "redoku upgrade" would be advice about a kit root they
+  # do not have.
   if [ ! -f "$GAME" ]; then
     if game_is_prebuilt; then
-      GAME_WHY="no game binary at $GAME — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+      GAME_WHY="no game binary at $GAME — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
     else
       GAME_WHY="no game binary at $GAME — cross-build it with:  make build"
     fi
@@ -499,7 +522,7 @@ find_game() {
     # indented continuation line, where an embedded newline would lose its
     # prefix and its indentation.
     if game_is_prebuilt; then
-      GAME_WHY="$GAME is not 32-bit ARM — this kit is corrupt, re-download it with:  redoku upgrade"
+      GAME_WHY="$GAME is not 32-bit ARM — this kit is corrupt, re-download it with:  $(refetch_hint)"
     else
       GAME_WHY="$GAME is not 32-bit ARM (a host build?) — rebuild with:  make clean && make build"
     fi
@@ -568,9 +591,9 @@ build_decoy() {
     # the only thing that helps. Same wording find_game uses for the same
     # reason.
     [ -n "$DECOY_FILES" ] || \
-      die "$DECOY_DIR has none of the expected decoy files (.pdf, .metadata, .content, .pagedata) — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+      die "$DECOY_DIR has none of the expected decoy files (.pdf, .metadata, .content, .pagedata) — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
     [ -f "$DECOY_DIR/watch.conf" ] || \
-      die "$DECOY_DIR/watch.conf is missing — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+      die "$DECOY_DIR/watch.conf is missing — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
   fi
 }
 
@@ -589,6 +612,16 @@ valid_tag() {
     '' | . | ..)       return 1 ;;
     -*)                return 1 ;;  # would be read as an option downstream
     *[!A-Za-z0-9._-]*) return 1 ;;  # anything a path component shouldn't hold
+    # A tag beginning ".staging." is a legal tag by every rule above, and it
+    # would be a version directory sitting in the kit root under the exact
+    # name clean_stale_staging sweeps — so the next download of anything at
+    # all would rm -rf a complete, current version. Both remote sources of a
+    # tag (a Location header, a tarball's VERSION) can produce one, which is
+    # what makes this the same class of guard as §6.2's ^redoku/ check rather
+    # than a tidiness rule. Refusing the tag is the fix rather than teaching
+    # the sweep to look inside candidates: the sweep runs before a download,
+    # when the directory it is looking at may legitimately be half-written.
+    .staging.*)        return 1 ;;
   esac
 }
 
@@ -791,6 +824,22 @@ staging_parent() {
 # $TMPDIR the OS eventually swept those up for us, and inside the user's kit
 # directory nothing does. Named-prefix matched and containment-checked, like
 # every other recursive delete in this file.
+#
+# Two concurrent installs into the same kit root are still not a supported
+# thing to do — they would both repoint `current`, and one of them would win
+# — but "unsupported" must not be allowed to mean "run A's half-finished
+# download is deleted out from under it by run B". Staging under $TMPDIR made
+# that impossible for free; staging in the kit root does not, so the pid in
+# the directory name is checked with `kill -0` and a live one is left alone.
+# Our OWN pid is deliberately not exempted: a leftover carrying it can only be
+# a dead run whose pid was reused, and sweeping it is what keeps the mkdir
+# below from failing on a name we would then never clean up.
+#
+# `kill -0` says "does a process with this pid exist AND could I signal it",
+# so a staging directory belonging to another USER's live install reads as
+# dead here and is swept. That needs two people installing into one shared
+# kit root at the same moment, which is further outside "supported" than the
+# case this guard exists for.
 clean_stale_staging() {
   while IFS= read -r _cs_dir; do
     [ -n "$_cs_dir" ] || continue
@@ -798,6 +847,13 @@ clean_stale_staging() {
       "$1"/.staging.?*) ;;
       *) continue ;;
     esac
+    _cs_pid=${_cs_dir##*/.staging.}
+    if [ "$_cs_pid" != "$$" ]; then
+      case $_cs_pid in
+        '' | *[!0-9]*) ;;  # not pid-shaped at all: nothing is using it
+        *) if kill -0 "$_cs_pid" 2>/dev/null; then continue; fi ;;
+      esac
+    fi
     rm -rf "$_cs_dir" || \
       say "  WARNING: couldn't remove the leftover staging directory $_cs_dir — delete it by hand to reclaim the space"
   done <<EOF
@@ -962,6 +1018,15 @@ fetch_kit() {
     #
     # "Beside it" is the operative word — see staging_parent's header for why
     # this is not $TMPDIR. The rename is only atomic within one filesystem.
+    # In CHECKOUT mode this creates <repo>/build/download/ before the fetch,
+    # where it used to appear only after a verified unpack — so a download
+    # that fails now leaves an empty directory behind. Accepted rather than
+    # unwound: it is inside build/, which is gitignored and is scratch space
+    # by definition, and unwinding it correctly would mean an rmdir on every
+    # one of the dozen `die` paths below, or a trap that has to remember
+    # whether THIS run was the one that created it. Kit mode is unaffected —
+    # the kit root is created before the download either way, which is the
+    # state §7's "kit untouched" rows already describe.
     _fk_stage_parent=$(staging_parent "$_fk_layout" "$_fk_base")
     mkdir -p "$_fk_stage_parent" || \
       die "could not create $_fk_stage_parent to download into — check the path and its permissions"
@@ -1094,11 +1159,21 @@ EOF
     mkdir -p "$(dirname -- "$_fk_dest")" || \
       die "could not create $(dirname -- "$_fk_dest") — check the path and its permissions"
     if [ -e "$_fk_dest" ] || [ -L "$_fk_dest" ]; then
-      # Anything already here failed the reuse check above, i.e. it is a
-      # partial or corrupt earlier download. It has to GO, not be merged
-      # with: `mv` onto an existing directory moves the new tree INSIDE it
-      # rather than replacing it, which is how you end up with <tag>/redoku/
-      # and a kit whose every path resolves one level short.
+      # Whatever is here has to GO, not be merged with: `mv` onto an existing
+      # directory moves the new tree INSIDE it rather than replacing it,
+      # which is how you end up with <tag>/redoku/ and a kit whose every path
+      # resolves one level short.
+      #
+      # It is NOT safe to say it failed the §6.3 reuse check, and the message
+      # below overstates it on one path: that check only runs when steps 1-3
+      # already knew the tag, and on the step-4 path (offline, and every
+      # file:// install) $TAG is empty until the tarball has been unpacked —
+      # so a perfectly complete tree reaches this line and gets replaced with
+      # a freshly downloaded copy of itself. Wasteful rather than wrong, and
+      # measured: two consecutive unpinned installs print "replacing an
+      # incomplete earlier download" on the second. Flagged for the
+      # controller; the wording is not changed here because this round's
+      # instruction was to fix the comment and not the behaviour.
       say "replacing an incomplete earlier download at $_fk_dest"
       rm -rf "$_fk_dest" || \
         die "could not remove the incomplete earlier download at $_fk_dest — remove it by hand and try again"
@@ -1257,6 +1332,12 @@ write_path_entry() {
     rm -f "$_wpe_file.new"
     die "could not write $_wpe_file.new — check permissions on $_wpe_dir, or skip the PATH entry with --no-symlink"
   }
+  # This one branch has no covering test, and cannot have one: `chmod` on a
+  # file you own succeeds whatever the mode of the directory holding it, so
+  # the only way to reach it is a filesystem that refuses chmod outright — and
+  # an unwritable directory fails the redirection above first, never here.
+  # Verified by the reviewer rather than assumed. The rm -f stays because the
+  # branch existing at all is the reason a stray redoku.new would ever appear.
   chmod +x "$_wpe_file.new" || {
     rm -f "$_wpe_file.new"
     die "could not make $_wpe_file.new executable — check permissions on $_wpe_dir, or skip the PATH entry with --no-symlink"
@@ -1408,7 +1489,7 @@ require_device_files() {
     [ ! -f "$KIT_ROOT/device/uninstall.sh" ] || \
     [ ! -f "$KIT_ROOT/device/redoku-watcher.service" ] || return 0
   if in_kit_tree; then
-    die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found in $KIT_ROOT — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+    die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found in $KIT_ROOT — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
   fi
   die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found next to me — run bin/redoku from a reDoku checkout"
 }
@@ -1425,9 +1506,17 @@ require_device_files() {
 # Only ever has anything to say in a checkout, because it needs a $REPO/device
 # to compare against; inside a kit there is nothing to have edited.
 warn_device_scripts_replaced() {
+  # Every other tool this file reaches for is checked before it is used, and
+  # this one has a failure mode worse than being absent: with no `cmp`, the
+  # comparison below fails for all three files and the NOTE fires saying they
+  # differ when none of them do. A warning that goes off when nothing is wrong
+  # is worse than no warning, so with no cmp there is no warning — and nothing
+  # else in this run depends on it.
+  command -v cmp >/dev/null 2>&1 || return 0
   _wdsr_differ=
   for _wdsr_f in install.sh uninstall.sh redoku-watcher.service; do
     [ -f "$REPO/device/$_wdsr_f" ] || continue
+    [ -f "$KIT_ROOT/device/$_wdsr_f" ] || continue
     cmp -s "$REPO/device/$_wdsr_f" "$KIT_ROOT/device/$_wdsr_f" || \
       _wdsr_differ="$_wdsr_differ $_wdsr_f"
   done
@@ -1435,8 +1524,10 @@ warn_device_scripts_replaced() {
   say "NOTE: this checkout's device/ scripts differ from the downloaded kit's:"
   say "     $_wdsr_differ"
   say "     The RELEASED ones are what go on the device — they belong to the same"
-  say "     release as the binaries beside them. To put YOUR versions on instead,"
-  say "     build the binaries here and install without downloading:  make rm2fb"
+  say "     release as the binaries beside them. To put YOUR versions on the"
+  say "     device instead, build the binaries here and install from this"
+  say "     checkout with neither --download nor --kit:"
+  say "       make rm2fb && bin/redoku install"
 }
 
 # ---- commands ----------------------------------------------------------
@@ -1508,7 +1599,7 @@ cmd_install() {
       # nobody ran — it is a download that arrived incomplete, and re-fetching
       # is the only thing that helps. Same wording, for the same reason, as
       # find_game's and build_decoy's kit-mode hints.
-      die "no ARM builds of rm2fb_server_swtcon / librm2fb_client_swtcon.so under $KIT_ROOT/build/rm2fb/dist — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+      die "no ARM builds of rm2fb_server_swtcon / librm2fb_client_swtcon.so under $KIT_ROOT/build/rm2fb/dist — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
     fi
     # Design doc §5.4 inverts what this prompt used to offer, and the
     # inversion IS the point of this milestone: Docker used to be the price

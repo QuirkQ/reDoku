@@ -1823,11 +1823,21 @@ test_find_game_downloaded_into_checkout_message() {
 
   assert_contains "$ASSERT_OUTPUT" "could not connect to root@nowhere" \
     "find_game downloaded-into-checkout: the whole host-side plan ran" || return 1
-  assert_contains "$ASSERT_OUTPUT" "this kit is incomplete or corrupt, re-download it with:  redoku upgrade" \
-    "find_game downloaded-into-checkout: names re-download, not a build" || return 1
+  # The command has to fit the state, not merely the provenance: this tree
+  # sits in a CHECKOUT's build/download/, so it has no kit root, no 'current'
+  # and nothing for `redoku upgrade` to operate on — the next task makes that
+  # command refuse in a checkout outright. What re-fetches this tree is the
+  # command that put it here.
+  assert_contains "$ASSERT_OUTPUT" "this kit is incomplete or corrupt, re-download it with:  bin/redoku install --download" \
+    "find_game downloaded-into-checkout: names the command that fits a checkout" || return 1
   case $ASSERT_OUTPUT in
     *"cross-build it with"*)
       printf 'FAIL: find_game downloaded-into-checkout: gave checkout advice for a downloaded file\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  case $ASSERT_OUTPUT in
+    *"redoku upgrade"*)
+      printf 'FAIL: find_game downloaded-into-checkout: named a kit command in a checkout\n  output: %s\n' "$ASSERT_OUTPUT" >&2
       return 1 ;;
   esac
   # The game came from build/download/, so the path it names must too — this
@@ -1940,13 +1950,24 @@ test_kit_empty_option_values() {
   # empty $REDOKU_HOME is NOT an empty --kit: ${REDOKU_HOME:-} documents it as
   # "unset", and tools/install.sh's own ${REDOKU_HOME:-$HOME/.redoku} reads it
   # the same way. It must keep working, so the guard has to be on the FLAG.
-  # This run is a plain checkout install pointed at --artifacts, so it gets as
-  # far as the device plan; all that matters is that no argument guard stopped
-  # it on the way there.
+  #
+  # Driven through a THROWAWAY checkout, not $REPO/bin/redoku. This is the one
+  # case in this file that gets past argument validation with KIT_ROOT still
+  # equal to $REPO, so it reaches build_decoy — and against the real checkout
+  # that regenerates <repo>/build/decoy/ in the developer's own tree, which
+  # this suite is not allowed to write to (see build_fake_checkout's header).
+  # The two refusals below never get that far, so they can stay on $REPO's own
+  # copy. It dies at the artifact hunt, with --artifacts pointed at a
+  # directory holding no ARM builds.
+  build_fake_checkout "$_w/checkout"
   assert_fails "empty REDOKU_HOME: gets past argument validation" -- \
     env HOME="$_home" REDOKU_BASE_URL="$_nowhere" REDOKU_HOME='' REDOKU_BIN_DIR='' \
-      "$KIT_SH" "$REPO/bin/redoku" install --dry-run --host nowhere --yes \
+      "$KIT_SH" "$_w/checkout/bin/redoku" install --dry-run --host nowhere --yes \
       --artifacts "$_w" < /dev/null || return 1
+  # It really did get past validation and into cmd_install — a run stopped by
+  # an argument guard never reaches the artifact hunt.
+  assert_contains "$ASSERT_OUTPUT" "no ARM builds of rm2fb_server_swtcon" \
+    "empty REDOKU_HOME: the run reached the artifact hunt, not an argument guard" || return 1
   case $ASSERT_OUTPUT in
     *"wants a directory, not an empty value"*)
       printf 'FAIL: an empty $REDOKU_HOME / $REDOKU_BIN_DIR was treated as an empty flag\n  output: %s\n' "$ASSERT_OUTPUT" >&2
@@ -1991,11 +2012,21 @@ test_kit_staging_beside_destination() {
   make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
 
   # A leftover only a SIGKILL could have produced — everything short of that
-  # is covered by fetch_kit's own traps.
+  # is covered by fetch_kit's own traps. 99999 is above the default pid_max on
+  # both macOS (99998) and Linux (32768), so it is reliably a DEAD pid rather
+  # than one that happens to be free right now.
   mkdir -p "$_kit/.staging.99999/half-a-download"
   # …and something that is NOT a staging directory, which must survive.
   mkdir -p "$_kit/notes"
   printf 'keep me\n' > "$_kit/notes/README"
+  # …and one belonging to a process that is still ALIVE, which must survive
+  # too (fix round 2, MINOR E). Staging under $TMPDIR made it impossible for
+  # one install to delete another's half-finished download; staging in the
+  # kit root does not, so the pid is checked before anything is removed.
+  sleep 45 &
+  _live_pid=$!
+  mkdir -p "$_kit/.staging.$_live_pid"
+  printf 'half a download\n' > "$_kit/.staging.$_live_pid/being-downloaded-right-now"
 
   assert_fails "staging: kit-mode run ends at the connect step" -- \
     env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
@@ -2007,6 +2038,10 @@ test_kit_staging_beside_destination() {
     "staging: a leftover staging dir in the KIT ROOT was swept, so that is where staging lives" || return 1
   assert_file "$_kit/notes/README" \
     "staging: a directory that is not a staging dir was left alone" || return 1
+  assert_file "$_kit/.staging.$_live_pid/being-downloaded-right-now" \
+    "staging: a LIVE run's staging directory was not deleted out from under it" || return 1
+  kill "$_live_pid" 2>/dev/null || true
+  rm -rf "$_kit/.staging.$_live_pid"
   _left=$(find "$_kit" -maxdepth 1 -name '.staging.*' 2>/dev/null | wc -l | tr -d ' ')
   assert_eq 0 "$_left" "staging: nothing named .staging.* survives a successful run" || return 1
 
@@ -2068,6 +2103,113 @@ test_kit_reuse_gate_rejects_a_partial_tree() {
     "reuse gate: the partial tree is replaced, not merged with" || return 1
   assert_file "$_kit/v0.1.0/device/install.sh" \
     "reuse gate: the re-fetched tree is complete again" || return 1
+}
+
+# Fix round 2, IMPORTANT A: a tag beginning ".staging." is legal by every
+# other rule valid_tag applies, and it would put a version directory in the
+# kit root under the exact name clean_stale_staging sweeps — so the next
+# download of anything at all would rm -rf a complete, current version.
+#
+# Both remote sources of a tag are covered: $REDOKU_VERSION is the user's own
+# typo, but the tarball's VERSION is bytes off the network, which is what puts
+# this in §6.2's "attacker-controlled input" class rather than tidiness.
+test_kit_staging_shaped_tag_is_refused() {
+  _w=$(mktemp -d "$ROOT/kit-stagingtag.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+
+  # (a) explicit, via $REDOKU_VERSION — refused before anything is fetched.
+  _kit_a=$_w/kit-a
+  assert_fails "staging-shaped tag: REDOKU_VERSION is refused" -- \
+    env REDOKU_BASE_URL="file://$_w/no-such-release" REDOKU_VERSION=.staging.1 \
+      HOME="$_home" "$KIT_SH" "$REPO/bin/redoku" install --download \
+      --kit "$_kit_a" --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "REDOKU_VERSION='.staging.1'" \
+    "staging-shaped tag: the message names the value it refused" || return 1
+  assert_no_file "$_kit_a" "staging-shaped tag: nothing was created for it" || return 1
+
+  # (b) the remote path: the tag comes out of the downloaded tarball's own
+  # VERSION (design doc §6.1 step 4, which is what every file:// install
+  # takes), so the refusal has to happen after the download and before the
+  # unpacked tree is moved into place under that name.
+  _kit_b=$_w/kit-b
+  make_fixture_release "$_w/release" .staging.1 "$_w/cli"
+  assert_fails "staging-shaped tag: a tarball VERSION is refused too" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download \
+      --kit "$_kit_b" --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "carries a VERSION this installer" \
+    "staging-shaped tag: refused at the step-4 fallback, not somewhere else" || return 1
+  assert_contains "$ASSERT_OUTPUT" "('.staging.1')" \
+    "staging-shaped tag: the message names the VERSION it refused" || return 1
+  # The whole point: no directory under that name was ever created, so the
+  # sweep can never be handed a version directory to delete.
+  assert_no_file "$_kit_b/.staging.1" \
+    "staging-shaped tag: no version directory was created under the sweep's own name" || return 1
+  assert_no_file "$_kit_b/current" "staging-shaped tag: current was not repointed" || return 1
+}
+
+# Fix round 2, IMPORTANT D: the `mv`-failure branch, which the previous round
+# claimed had no portable way to be provoked. It does: chmod 555 on the
+# destination's PARENT gives EACCES, while `mkdir -p` on a directory that
+# already exists still succeeds and `[ -e "$_fk_dest" ]` is still false — so
+# the run reaches the mv and the mv fails.
+#
+# What this pins is the message, which used to say "Nothing was installed"
+# while a partial tree could be sitting there. It now removes whatever the mv
+# began to create and says there is nothing to clean up by hand.
+#
+# The `rm -rf` itself cannot be made to matter here, and that is worth saying
+# plainly rather than implying otherwise: staging is a sibling of the
+# destination (fix round 1), so this mv is a rename, and a rename either
+# happens or does not. The assertion below is what would catch debris if a
+# future change reintroduced a cross-filesystem copy; today it is a guard on
+# a case this platform cannot produce.
+test_kit_mv_failure_leaves_nothing_behind() {
+  _w=$(mktemp -d "$ROOT/kit-mvfail.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  build_fake_checkout "$_w/checkout"
+
+  # Pinned, so <tag> is known before the download and this directory can be
+  # pre-created at the exact path the mv will target.
+  _blocked=$_w/checkout/build/download/v0.1.0
+  mkdir -p "$_blocked" || die "test_kit_mv_failure_leaves_nothing_behind: mkdir failed"
+  chmod 555 "$_blocked" || die "test_kit_mv_failure_leaves_nothing_behind: chmod failed"
+
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 \
+    HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" install --download \
+    --host nowhere --yes < /dev/null 2>&1)
+  _mv_rc=$?
+  set -e
+  # Restored before any assertion can return early, so $ROOT's cleanup trap
+  # never meets a directory it cannot remove.
+  chmod 755 "$_blocked"
+
+  [ "$_mv_rc" -ne 0 ] || {
+    printf 'FAIL: mv failure: expected non-zero exit, got 0\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+    return 1
+  }
+  assert_contains "$ASSERT_OUTPUT" "could not move the unpacked kit into" \
+    "mv failure: it is the mv that failed, not something earlier" || return 1
+  assert_contains "$ASSERT_OUTPUT" "no half-installed version to clean up" \
+    "mv failure: the message says what is true about the state it left" || return 1
+  # And it does not still claim "Nothing was installed", which was the false
+  # half of the old wording.
+  case $ASSERT_OUTPUT in
+    *"Nothing was installed."*)
+      printf 'FAIL: mv failure: the message still claims nothing was installed\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_no_file "$_blocked/redoku" "mv failure: no partial tree was left at the destination" || return 1
+  # The staging directory went with it, so a failed run leaves no debris of
+  # its own either.
+  _left=$(find "$_w/checkout/build/download" -maxdepth 1 -name '.staging.*' 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq 0 "$_left" "mv failure: the staging directory was cleaned up" || return 1
 }
 
 # MINOR 9: $KIT_VERSION was the only source of a tag not passed through
@@ -2201,6 +2343,8 @@ test_kit_download_dry_run_writes_nothing
 test_kit_staging_beside_destination
 test_kit_reuse_gate_rejects_a_partial_tree
 test_kit_stamped_version_is_validated
+test_kit_staging_shaped_tag_is_refused
+test_kit_mv_failure_leaves_nothing_behind
 '
 
 for KIT_SH in $KIT_SHELLS; do
