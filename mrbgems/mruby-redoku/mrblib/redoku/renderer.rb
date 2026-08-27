@@ -70,19 +70,70 @@ module Redoku
     # Pinned strings for the same reason SPLASH_TEXT is: Font.draw silently
     # draws NOTHING for a character it has no glyph for, so each literal the
     # menu can print is pinned here once and glyph-asserted together
-    # (test/renderer.rb) instead of trusted at every call site. The chrome
-    # relabels (BACK / DEL / SAVE) are drawn over the play-mode buttons'
-    # rects while the menu is up; PREV/NEXT name their own Layout buttons.
-    MENU_TITLE_TEXT = 'GAMES'
+    # (test/renderer.rb) instead of trusted at every call site.
+    #
+    # SAVES, not GAMES, matching the button that opens it: the screen is a
+    # list of saves, and the SAVE button on it adds one — the noun names the
+    # screen, the verb names the action. The empty state keeps saying GAMES
+    # because that is what a row IS; it is the screen that needed naming.
+    MENU_TITLE_TEXT = 'SAVES'
     MENU_EMPTY_TEXT = 'NO SAVED GAMES'
 
-    # What the play-mode buttons MEAN while the menu is up. Geometry never
-    # moves — Layout.button_at still answers :new over the BACK rect — so
-    # App routes presses through this same mapping, and flash_button needs
-    # it to find the rect an action name flashes.
-    MENU_CHROME_LABELS = {
-      new: 'BACK', level: 'DEL', games: 'SAVE', quit: 'QUIT'
+    # --- WHAT A BUTTON SAYS, one table per screen.
+    #
+    # Three tables because a label can be keyed by two different things, and
+    # conflating them was a bug: the single MENU_CHROME_LABELS these replace
+    # was read BOTH by rect name (draw_menu_buttons) and by press target
+    # (label_of), and for :new/:level/:games those two meanings differ. So
+    # label_of(:new) answered 'BACK' on the PLAY screen — and because
+    # acknowledge(:new) restores with release_button(:new) while new_puzzle
+    # repaints only the board, pressing New LEFT the play screen reading BACK
+    # until the next draw_all. Every table below states what it is keyed by,
+    # and nothing reads one by the other key.
+    #
+    # By RECT NAME — Layout's own :new..:quit, which on this screen are also
+    # the press targets, since target_at answers Layout.button_at directly.
+    #
+    # LEVEL takes the ellipsis every GUI uses for "this opens a chooser":
+    # it does not toggle a setting, it opens a picker whose every row deals a
+    # fresh board, and the bare word read as a toggle. '.' has a glyph.
+    PLAY_LABELS = {
+      new: 'NEW', level: 'LEVEL...', check: 'CHECK',
+      games: 'SAVES', quit: 'QUIT'
     }.freeze
+
+    # By PRESS TARGET — App#menu_target_at's answers — for the saves list.
+    # Geometry never moves (Layout.button_at still answers :new over the BACK
+    # rect), so draw_menu_buttons resolves each target back to its rect
+    # through rect_of, the mapping flash_button already owns.
+    #
+    # DELETE spelled out: the rect is 400 px and the word is 210 at
+    # BUTTON_LABEL_SCALE, so the abbreviation bought nothing. It arms a mode
+    # rather than deleting on the spot, and the inversion is what says armed
+    # (draw_menu_buttons) — a cryptic label was not helping it.
+    MENU_LABELS = {
+      back: 'BACK', del: 'DELETE', save: 'SAVE', quit: 'QUIT'
+    }.freeze
+
+    # Which of those chrome targets each menu actually HAS. A target the
+    # screen does not list is dead there and is therefore never painted: the
+    # picker has no delete, no manual save and no check, and the saves list
+    # has no check (press_in_menu and menu_target_at guard all of them), so
+    # painting them framed and labelled exactly like the two that work was
+    # the same lie PREV/NEXT already refuse to tell — see draw_games_menu on
+    # why controls for something that does not exist are worse than absent.
+    # Both menus open with a full-screen white fill, so an unlisted rect
+    # needs no erasing; it simply comes up blank.
+    #
+    # Derived from MENU_LABELS rather than spelled out again, so a fifth
+    # chrome action cannot reach the saves list and miss this list.
+    SAVES_CHROME = MENU_LABELS.keys.freeze
+    LEVEL_CHROME = [:back, :quit].freeze
+
+    # PREV/NEXT name their own Layout buttons rather than relabelling a
+    # play-mode rect, so they belong to no screen's chrome table and live
+    # here — keyed by press target, like MENU_LABELS.
+    PAGE_LABELS = { prev: 'PREV', next: 'NEXT' }.freeze
 
     # The exact status text shown while the generator digs. A constant
     # rather than a caller-supplied literal because Font.draw silently draws
@@ -242,9 +293,12 @@ module Redoku
       self
     end
 
+    # Every rect Layout knows about, because all five are live in play mode —
+    # iterating Layout rather than PLAY_LABELS is what guarantees a button
+    # added there cannot go unpainted here.
     def draw_buttons
       Layout.buttons.each do |name, x, y, w, h|
-        draw_button(name, x, y, w, h)
+        draw_button(x, y, w, h, PLAY_LABELS[name])
       end
       self
     end
@@ -440,12 +494,13 @@ module Redoku
       self
     end
 
-    # The whole GAMES screen in one paint: header (title + pagination),
+    # The whole SAVES screen in one paint: header (title + pagination),
     # the board area tiled into save rows (or the empty state), and the
-    # chrome relabelled BACK / DEL / SAVE / QUIT. `list` is Store#games'
+    # chrome relabelled BACK / DELETE / SAVE / QUIT — four of the five rects,
+    # since a list of saves has no check. `list` is Store#games'
     # metadata — id, kind, difficulty, achieved_tier, updated_at — ordered
     # by updated_at DESC; `page` indexes it in MENU_ROWS-sized pages;
-    # `delete_mode` holds the DEL button inverted.
+    # `delete_mode` holds the DELETE button inverted.
     #
     # A FULL-screen paint rather than a region patch, on purpose: a menu is
     # a mode change the player reads as one event, and one GC16 SYNC costs
@@ -463,7 +518,7 @@ module Redoku
       @d.fill_rect(0, 0, Layout::SCREEN_W, Layout::SCREEN_H, WHITE)
       draw_menu_header(list)
       draw_game_rows(list, page)
-      draw_menu_buttons(delete_mode)
+      draw_menu_buttons(SAVES_CHROME, delete_mode)
       self
     end
 
@@ -490,7 +545,10 @@ module Redoku
                   Layout::LABEL_SCALE, BLACK)
         @d.fill_rect(x, y + h - 1, w, 1, BLACK)
       end
-      draw_menu_buttons(false)
+      # LEVEL_CHROME, not the saves list's: the picker's only actions are the
+      # way out and the way off. Delete, manual save and check are all dead
+      # here (press_in_menu guards them), so they are not painted.
+      draw_menu_buttons(LEVEL_CHROME, false)
       self
     end
 
@@ -581,14 +639,15 @@ module Redoku
     # is a bug worth seeing immediately.
     def flash_button(name, ink, paper)
       x, y, w, h = rect_of(name)
-      draw_button(name, x, y, w, h, ink, paper, label_of(name))
+      draw_button(x, y, w, h, label_of(name), ink, paper)
       @d.update(x, y, w, h, waveform: RM2::DU, flags: RM2::FAST_DRAW)
     end
 
     # The rect a press target flashes. Menu actions sit on the play-mode
-    # buttons they relabel (MENU_CHROME_LABELS), so BACK inverts the same
-    # 400x140 rect NEW does — geometry never moves between modes, which is
-    # what lets Layout.button_at stay static while meaning changes.
+    # buttons they relabel (MENU_LABELS), so BACK inverts the same 400x140
+    # rect NEW does — geometry never moves between modes, which is what lets
+    # Layout.button_at stay static while meaning changes. draw_menu_buttons
+    # leans on this too, so the target-to-rect mapping exists exactly once.
     def rect_of(target)
       case target
       when Integer then Layout.menu_row_rect(target)
@@ -601,12 +660,22 @@ module Redoku
       end
     end
 
-    # The text a flash paints: a row has none worth printing (its own load
-    # or delete repaints the screen inside the acknowledgement), everything
-    # else prints its name — or its menu label, when the target IS a
-    # relabelled play-mode button.
+    # The text a flash paints, keyed by PRESS TARGET across every screen.
+    #
+    # One lookup chain rather than a fourth table, because the three are
+    # disjoint by construction: the play targets (:new..:games) and the menu
+    # targets (:back/:del/:save) share no symbol, :quit is QUIT on every
+    # screen, and PREV/NEXT are their own buttons. Whichever screen is up,
+    # exactly one table answers — which is what the old single table only
+    # appeared to do (see PLAY_LABELS).
+    #
+    # A menu ROW (an Integer target) matches nothing and gets nil, so its
+    # flash paints the frame alone: its own load or delete repaints the
+    # screen inside the acknowledgement, so there is no text worth printing.
+    # The old fallback painted the row's index there instead — a bare digit
+    # over a save the player was already looking at.
     def label_of(target)
-      MENU_CHROME_LABELS[target] || target.to_s.upcase
+      PLAY_LABELS[target] || MENU_LABELS[target] || PAGE_LABELS[target]
     end
 
     # The weight draw_board gives boundary `i` (0..9): every third boundary is
@@ -673,8 +742,8 @@ module Redoku
       Font.draw(@d, MENU_TITLE_TEXT, Layout::HEADER_X, Layout::HEADER_Y,
                 Layout::TITLE_SCALE, BLACK)
       return unless list.size > MENU_ROWS
-      draw_button(:prev, *Layout.menu_button_rect(:prev))
-      draw_button(:next, *Layout.menu_button_rect(:next))
+      draw_button(*Layout.menu_button_rect(:prev), PAGE_LABELS[:prev])
+      draw_button(*Layout.menu_button_rect(:next), PAGE_LABELS[:next])
     end
 
     # The board area as a white field, then either the empty state centred
@@ -716,39 +785,54 @@ module Redoku
     end
 
     # The chrome with its menu meanings painted on: BACK over New's rect,
-    # DEL over Level's (inverted while delete mode is armed — the inversion
-    # IS the armed state, and it persists until the next row tap spends it),
-    # SAVE over Games', QUIT unchanged.
-    def draw_menu_buttons(delete_mode)
-      Layout.buttons.each do |name, x, y, w, h|
-        label = MENU_CHROME_LABELS[name]
-        if name == :level && delete_mode
-          draw_button(name, x, y, w, h, WHITE, BLACK, label)
+    # DELETE over Level's (inverted while delete mode is armed — the
+    # inversion IS the armed state, and it persists until the next row tap
+    # spends it), SAVE over Games', QUIT unchanged.
+    #
+    # `targets` is the screen's chrome list (SAVES_CHROME / LEVEL_CHROME), so
+    # this iterates the ACTIONS the screen has rather than the rects Layout
+    # owns: a rect the screen gives no action is left blank instead of being
+    # framed and labelled like a live one. rect_of turns each target back
+    # into its rect, so there is no second copy of that mapping here.
+    def draw_menu_buttons(targets, delete_mode)
+      targets.each do |target|
+        x, y, w, h = rect_of(target)
+        label = MENU_LABELS[target]
+        if target == :del && delete_mode
+          draw_button(x, y, w, h, label, WHITE, BLACK)
         else
-          draw_button(name, x, y, w, h, BLACK, WHITE, label)
+          draw_button(x, y, w, h, label, BLACK, WHITE)
         end
       end
+      self
     end
 
     # `ink` and `paper` swap for the pressed state (flash_button). They are
     # the only two grays a button uses, so one pair of arguments inverts the
     # whole thing — frame and label included — with no second code path.
-    # `label` overrides the name-derived text: the GAMES menu draws BACK /
-    # DEL / SAVE over the play-mode buttons' rects (draw_menu_buttons), and
-    # a flash of one of those actions has to paint what the button says,
-    # not what it is called underneath.
-    def draw_button(name, x, y, w, h, ink = BLACK, paper = WHITE,
-                    label = nil)
+    #
+    # `label` is REQUIRED and is the only source of the text. It used to be
+    # optional, falling back to `name.to_s.upcase`, which meant no call site
+    # ever had to say what a button SAID — so the question of which table
+    # answered that was never forced, and text derived from a symbol was text
+    # no glyph assertion covered. It is also how a menu row's flash came to
+    # print its own index (see label_of).
+    #
+    # nil label draws the frame alone, which is what a menu ROW flash wants:
+    # its own load or delete repaints the screen inside the acknowledgement,
+    # so there is no text worth printing (label_of says the same).
+    def draw_button(x, y, w, h, label, ink = BLACK, paper = WHITE)
       @d.fill_rect(x, y, w, h, paper)
       @d.fill_rect(x, y, w, BUTTON_BORDER, ink)              # top
       @d.fill_rect(x, y + h - BUTTON_BORDER, w, BUTTON_BORDER, ink) # bottom
       @d.fill_rect(x, y, BUTTON_BORDER, h, ink)              # left
       @d.fill_rect(x + w - BUTTON_BORDER, y, BUTTON_BORDER, h, ink) # right
+      return self unless label
 
-      text = label || name.to_s.upcase
       scale = Layout::BUTTON_LABEL_SCALE
-      lx, ly = centered_origin(text, scale, x, y, w, h)
-      Font.draw(@d, text, lx, ly, scale, ink)
+      lx, ly = centered_origin(label, scale, x, y, w, h)
+      Font.draw(@d, label, lx, ly, scale, ink)
+      self
     end
 
     # Where to put `text` at `scale` so it lands centred inside the rect

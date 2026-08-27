@@ -978,11 +978,16 @@ module Redoku
     end
 
     # What a press point means on the CURRENT screen: the chrome buttons in
-    # play mode; in the GAMES menu those same rects mean BACK/DEL/SAVE/QUIT,
-    # plus PREV/NEXT in the header band and one row per board band. Both
-    # stroke paths (pen and finger) ask this at pen-down and again at lift,
-    # so a stroke that slides to a different meaning cancels itself exactly
-    # as sliding off a button always has.
+    # play mode; on the saves list those same rects mean BACK/DELETE/SAVE/
+    # QUIT, plus PREV/NEXT in the header band and one row per board band.
+    # Both stroke paths (pen and finger) ask this at pen-down and again at
+    # lift, so a stroke that slides to a different meaning cancels itself
+    # exactly as sliding off a button always has.
+    #
+    # The targets here are what the RENDERER's per-screen label tables are
+    # keyed by, and a rect this answers nothing for is left BLANK rather than
+    # painted (Renderer::MENU_LABELS and the two chrome lists beside it) — so
+    # a dead rect never looks like a live one.
     def target_at(x, y)
       return :win_tap if @screen == :win
       return Layout.button_at(x, y) if @screen == :play
@@ -994,7 +999,10 @@ module Redoku
       when :new   then return :back
       when :level then return :del
       when :games then return :save
-      when :check then return nil  # the saves list has no check: dead there
+      # No check on a list of saves. Dead here AND unpainted here: the rect
+      # carried a framed CHECK label for as long as the renderer walked
+      # Layout's buttons instead of the screen's own actions.
+      when :check then return nil
       when :quit  then return :quit
       end
       b = Layout.menu_button_at(x, y)
@@ -1044,7 +1052,7 @@ module Redoku
     #   either way the flash is gone under the repaint, and painting it "back"
     #   would flush stale pixels over whatever the action just put there.
     #
-    # DEL acknowledges nothing: its feedback is PERSISTENT, not transient —
+    # DELETE acknowledges nothing: its feedback is PERSISTENT, not transient —
     # the armed state is the label sitting inverted (draw_menu_buttons), and
     # refresh_menu paints exactly that. A press-flash under it would be two
     # inversions racing to one panel, and a release would un-arm the mode on
@@ -1052,8 +1060,12 @@ module Redoku
     #
     # The row-index case dispatches on @screen, because menu_target_at is
     # shared: an Integer row means "load this save" in :menu but "deal at
-    # this tier" in :levels. The GAMES-only actions (DEL/SAVE/PREV/NEXT) are
-    # dead on the picker rather than falling through to their GAMES meanings.
+    # this tier" in :levels. The saves-list-only actions (:del/:save/:prev/
+    # :next) are dead on the picker rather than falling through to their
+    # saves-list meanings — and the picker does not PAINT them either, which
+    # is the half this guard used to carry alone: Renderer::LEVEL_CHROME
+    # lists the two the picker has, so a guard here and a blank rect there
+    # say the same thing to the player as to the code.
     #
     # An unknown target cannot reach here (both stroke paths latch nil for
     # dead space and nil never presses), so the case simply falls through.

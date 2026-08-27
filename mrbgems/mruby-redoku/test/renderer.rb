@@ -30,6 +30,29 @@ assert('Renderer#draw_board frames every edge of the board') do
   assert_equal 0, d.gray_at(x + w - 1, y + h - 1) # bottom-right
 end
 
+# The leftmost column of LABEL ink inside a button rect. draw_button paints
+# every frame piece from the rect's own x, and Font.draw emits one rect per
+# lit glyph pixel starting at the text origin (and 'B', 'N', 'S' and 'L' all
+# light column 0), so the smallest x past that left edge is where the text
+# begins — which pins WHICH text was drawn, since two different words centre
+# in the same 400 px rect at two different origins. `ink` is the label's own
+# gray: black on a resting button, white on an inverted one.
+def label_left(d, x, y, w, h, ink)
+  lefts = []
+  d.rects.each do |rx, ry, rw, rh, gray|
+    next unless gray == ink
+    next unless rx > x && rx + rw <= x + w && ry >= y && ry + rh <= y + h
+    lefts << rx
+  end
+  lefts.min
+end
+
+# Where `text` would start if it were centred in the rect: what label_left
+# should answer.
+def label_origin(text, x, w)
+  x + (w - Redoku::Font.width(text, Redoku::Layout::BUTTON_LABEL_SCALE)) / 2
+end
+
 assert('Renderer#draw_buttons frames each button and centres its label') do
   d = TestDisplay.new
   Redoku::Renderer.new(d).draw_buttons
@@ -45,6 +68,40 @@ assert('Renderer#draw_buttons frames each button and centres its label') do
   assert_equal 0, d.gray_at(left, by + (bh - Redoku::Font::HEIGHT *
     Redoku::Layout::BUTTON_LABEL_SCALE) / 2)
   assert_true label_w < bw
+
+  # Each rect says what PLAY_LABELS says it says, checked by where the text
+  # starts: Level opens a picker rather than toggling a setting, so it takes
+  # the ellipsis, and the button onto the saves list is named for what the
+  # screen it opens IS.
+  Redoku::Renderer::PLAY_LABELS.each do |name, text|
+    x, y, w, h = Redoku::Layout.button_rect(name)
+    assert_equal label_origin(text, x, w), label_left(d, x, y, w, h, 0),
+                 "#{name} should read #{text}"
+    assert_true Redoku::Font.width(text,
+                                  Redoku::Layout::BUTTON_LABEL_SCALE) < w
+  end
+end
+
+assert('a pressed play button flashes ITS OWN label, not a menu meaning') do
+  # The regression this exists for: label_of used to resolve a flash through
+  # the menu's chrome table, which is keyed by RECT NAME — so pressing New on
+  # the play screen painted 'BACK'. And because App#acknowledge restores with
+  # release_button while new_puzzle repaints only the board, that BACK STAYED
+  # on the glass until the next full repaint. Both halves of the flash are
+  # asserted, since the restore is the half that persisted.
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  x, y, w, h = Redoku::Layout.button_rect(:new)
+  want = label_origin('NEW', x, w)
+  # What the bug painted. Asserted to differ, so neither check can pass by
+  # coincidence: 'NEW' centres at 149 px into the rect, 'BACK' at 131.
+  assert_true want != label_origin('BACK', x, w)
+
+  r.press_button(:new)
+  assert_equal want, label_left(d, x, y, w, h, 255) # inverted: white label
+  d.clear_calls
+  r.release_button(:new)
+  assert_equal want, label_left(d, x, y, w, h, 0)   # restored: black label
 end
 
 assert('Renderer#draw_header shows the title and the difficulty') do
@@ -550,7 +607,7 @@ assert('the progress bar flushes as ink, not as chrome') do
   assert_equal(1, d.updates.size)
 end
 
-# --- the GAMES menu (M3a). Rows, pagination visibility, the DEL inversion,
+# --- the SAVES menu (M3a). Rows, pagination visibility, the DELETE inversion,
 # and every string the menu can print pinned against the font's glyph set.
 
 def game_meta(id, tier)
@@ -584,13 +641,21 @@ assert('Renderer.format_stamp renders epochs by hand, correctly') do
   end
 end
 
-assert('every character the GAMES menu can print has a glyph') do
+assert('every character a button or menu can print has a glyph') do
   # Font.draw silently draws NOTHING for an unknown character, so every
   # literal AND every dynamically composed string is walked here. A tier
   # added later with a character the font lacks fails HERE rather than
   # painting blank rows on the device.
-  literals = ['GAMES', 'PREV', 'NEXT', 'NO SAVED GAMES'] +
-             Redoku::Renderer::MENU_CHROME_LABELS.values
+  #
+  # Every label table, not just the menu's: PLAY_LABELS is the play screen's
+  # only source of button text, so 'LEVEL...' brings a '.' onto the chrome
+  # that nothing else printed there before.
+  literals = [Redoku::Renderer::MENU_TITLE_TEXT,
+              Redoku::Renderer::MENU_EMPTY_TEXT,
+              Redoku::Renderer::LEVEL_TITLE] +
+             Redoku::Renderer::PLAY_LABELS.values +
+             Redoku::Renderer::MENU_LABELS.values +
+             Redoku::Renderer::PAGE_LABELS.values
   stamps = [0, 951782400, 1787668200, 4102444800].map do |e|
     Redoku::Renderer.format_stamp(e)
   end
@@ -667,7 +732,7 @@ assert('draw_games_menu paginates and shows PREV/NEXT only when needed') do
   assert_false menu_ink_in?(d, xr, yr, wr, hr), 'page 1 should stop at row 2'
 end
 
-assert('draw_games_menu relabels the chrome and inverts DEL when armed') do
+assert('draw_games_menu relabels the chrome and inverts DELETE when armed') do
   d = TestDisplay.new
   r = Redoku::Renderer.new(d)
   list = [game_meta(1, :easy)]
@@ -676,11 +741,47 @@ assert('draw_games_menu relabels the chrome and inverts DEL when armed') do
   bx, by, bw, bh = Redoku::Layout.button_rect(:new)
   assert_equal 255, d.gray_at(bx + 10, by + bh / 2) # BACK: white paper
   lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
-  assert_equal 255, d.gray_at(lx + 10, ly + lh / 2) # DEL: white paper
+  assert_equal 255, d.gray_at(lx + 10, ly + lh / 2) # DELETE: white paper
 
   r.draw_games_menu(list, 0, true)
   assert_equal 0, d.gray_at(lx + 10, ly + lh / 2)   # armed: inverted
   assert_equal 255, d.gray_at(lx, ly)               # border reads white
+end
+
+assert('the saves list leaves the Check rect blank: no check on a list') do
+  # menu_target_at answers nil over that rect (App), so a framed, labelled
+  # CHECK there was a button that looked exactly like the four that work and
+  # did nothing. The screen opens with a full-panel white fill, so "not
+  # painted" is the whole implementation — this asserts the fill is the last
+  # word in that rect.
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  r.draw_games_menu([game_meta(1, :easy)], 0, false)
+  cx, cy, cw, ch = Redoku::Layout.button_rect(:check)
+  assert_false menu_ink_in?(d, cx, cy, cw, ch), 'CHECK should be absent'
+  assert_equal 255, d.gray_at(cx, cy)                   # no frame
+  assert_equal 255, d.gray_at(cx + cw / 2, cy + ch / 2) # no label
+end
+
+assert('the LEVEL picker paints only the two buttons that do anything') do
+  # BACK and QUIT are live on the picker; Delete, Save and Check are all
+  # guarded to the saves list (App#press_in_menu), so three of the five rects
+  # used to carry labels for actions the screen does not have.
+  d = TestDisplay.new
+  r = Redoku::Renderer.new(d)
+  r.draw_levels_menu(Redoku::Sudoku::Rater::TIERS, :medium)
+
+  bx, by, bw, bh = Redoku::Layout.button_rect(:new)   # BACK
+  assert_true menu_ink_in?(d, bx, by, bw, bh), 'BACK missing'
+  qx, qy, qw, qh = Redoku::Layout.button_rect(:quit)  # QUIT
+  assert_true menu_ink_in?(d, qx, qy, qw, qh), 'QUIT missing'
+
+  [:level, :check, :games].each do |dead|
+    x, y, w, h = Redoku::Layout.button_rect(dead)
+    assert_false menu_ink_in?(d, x, y, w, h),
+                 "#{dead}'s rect should be blank on the picker"
+    assert_equal 255, d.gray_at(x, y)
+  end
 end
 
 # --- verdict marks (M3b Task 7). draw_mark paints ONLY the mark — the path
