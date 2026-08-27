@@ -23,7 +23,7 @@ DOCKER_RUN := docker run --rm --platform $(PLATFORM) \
 
 RAKE := rake MRUBY_CONFIG=/work/build_config.rb MRUBY_BUILD_DIR=/work/build
 
-.PHONY: image build test rm2fb sqlite shell clean
+.PHONY: image build test test-tools rm2fb sqlite shell clean
 
 image:
 	docker build --platform $(PLATFORM) -t $(IMAGE) docker
@@ -33,6 +33,17 @@ build: image | $(MRUBY_DIR)
 
 test: image | $(MRUBY_DIR)
 	$(DOCKER_RUN) $(RAKE) test
+
+# tools/ is host-side CRuby (stdlib only — bin/redoku install runs it on the
+# owner's Mac), not mruby: no gem to build, nothing to cross-compile. This
+# only needs the image's plain "ruby", so — unlike `test` above — it does
+# NOT depend on $(MRUBY_DIR) or mount it; a bare checkout with no sibling
+# mruby/rM2-stuff can still run it.
+test-tools: image
+	docker run --rm --platform $(PLATFORM) \
+		-v $(CURDIR):/work \
+		-w /work $(IMAGE) \
+		ruby tools/test/mkdecoy_test.rb
 
 tmp/mruby:
 	git clone --depth 1 --branch $(MRUBY_REF) https://github.com/mruby/mruby.git $@
