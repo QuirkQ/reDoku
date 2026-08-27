@@ -804,27 +804,42 @@ assert('every button acknowledges its press, at the button, for the same 200 ms'
   end
 end
 
-assert('New and Level come back up; Quit stays down because it is leaving') do
-  [:new, :level].each do |name|
-    app, d, = new_app
-    bx, by, bw, bh = Redoku::Layout.button_rect(name)
-    d.clear_calls
-    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
-    app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
-    assert_true app.running?, name.to_s
-    # Neither action leaves the button inverted: new_puzzle flushes the board,
-    # open_levels the whole panel — either way every pixel of the pressed
-    # button has just been repainted over, but only by paints that are
-    # already ordered before the release, so the release of its own is what
-    # guarantees the button comes back up.
-    assert_equal [bx, by, bw, bh, RM2::DU, RM2::FAST_DRAW],
-                 d.updates[d.updates.size - 1], name.to_s
-    # Same waveform in both directions, so the flash is symmetric: a press
-    # arriving in a tenth of a second and a release fading back over a
-    # GL16's half second would not read as one gesture.
-    assert_equal 0, d.gray_at(bx, by), name.to_s               # border black
-    assert_equal 255, d.gray_at(bx + 10, by + bh / 2), name.to_s # paper white
-  end
+assert('New comes back up; Level hands its rect over; Quit stays down') do
+  # NEW stays on the play screen: new_puzzle repaints the board region and
+  # nothing else, so every pixel of the pressed button has just been painted
+  # over only by paints ordered BEFORE the release — the release of its own is
+  # what guarantees the button comes back up.
+  app, d, = new_app
+  bx, by, bw, bh = Redoku::Layout.button_rect(:new)
+  d.clear_calls
+  app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, true))
+  app.handle_sample(pen_sample(bx + bw / 2, by + bh / 2, false))
+  assert_true app.running?
+  assert_equal [bx, by, bw, bh, RM2::DU, RM2::FAST_DRAW],
+               d.updates[d.updates.size - 1]
+  # Same waveform in both directions, so the flash is symmetric: a press
+  # arriving in a tenth of a second and a release fading back over a
+  # GL16's half second would not read as one gesture.
+  assert_equal 0, d.gray_at(bx, by)                # border black
+  assert_equal 255, d.gray_at(bx + 10, by + bh / 2) # paper white
+
+  # LEVEL is NOT that case, and this test used to loop it in as though it
+  # were. Its action opens the picker: a full-panel paint that gives this rect
+  # no button at all, because the picker has no delete. So the press must not
+  # be restored — the picker's paint is the last word, and the rect it leaves
+  # behind is blank. Restoring it painted 'LEVEL...' onto that blank and left
+  # a button there that does nothing.
+  app, d, = new_app
+  lx, ly, lw, lh = Redoku::Layout.button_rect(:level)
+  d.clear_calls
+  app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, true))
+  app.handle_sample(pen_sample(lx + lw / 2, ly + lh / 2, false))
+  assert_equal :levels, app.screen
+  u = d.updates[d.updates.size - 1]
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H],
+               [u[0], u[1], u[2], u[3]]
+  assert_equal 255, d.gray_at(lx, ly)          # no frame
+  assert_nil label_left(d, lx, ly, lw, lh, 0)  # and no label
 
   # Quit is the exception, and the one that must NOT be put back: e-ink
   # holds the last image it was given, so the inverted button is the
@@ -897,18 +912,22 @@ assert('the acknowledgement runs each action exactly once') do
     # One picker per tap: a press that ran open_levels twice would paint two
     # full screens, and one that dropped it would leave the board showing.
     assert_equal :levels, app.screen
-    # Exactly three updates per tap: the press flash at the button (DU), ONE
+    # Exactly two updates per tap: the press flash at the button (DU) and ONE
     # whole-screen GC16 carrying the picker — a menu is a mode change and
-    # arrives in one paint, exactly as the GAMES menu does — and the release
-    # flash. Counted by region rather than trusting the total alone.
-    assert_equal 3, d.updates.size
+    # arrives in one paint, exactly as the saves list does. Counted by region
+    # rather than trusting the total alone.
+    #
+    # There was a third here, a release flash, and it was the bug: the picker
+    # leaves Level's rect blank (it has no delete), and the release painted
+    # 'LEVEL...' straight back onto that blank. A press whose action changes
+    # screens is not restored at all now — see App#acknowledge.
+    assert_equal 2, d.updates.size
     assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
     u = d.updates[1]
     assert_equal [0, 0], [u[0], u[1]]
     assert_equal [Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H],
                  [u[2], u[3]]
     assert_equal RM2::GC16, u[4]
-    assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
     # And BACK out again, so the next round presses Level on :play, where it
     # means the picker — on :menu and :levels that rect belongs to the menu.
     d.clear_calls
@@ -1053,15 +1072,15 @@ assert('a tap on Level opens the picker instead of digging') do
   # not to opening the list.
   assert_equal :easy, app.difficulty
   assert_nil app.grid
-  # press flash, whole-screen GC16 carrying the picker, release flash. Same
-  # shape as the GAMES menu's arrival, because it is the same kind of event.
-  assert_equal 3, d.updates.size
+  # Press flash, then the whole-screen GC16 carrying the picker. Same shape as
+  # the saves list's arrival, because it is the same kind of event — and no
+  # release flash, because the picker owns that rect now (App#acknowledge).
+  assert_equal 2, d.updates.size
   assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[0]
   u = d.updates[1]
   assert_equal [0, 0], [u[0], u[1]]
   assert_equal [Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H], [u[2], u[3]]
   assert_equal RM2::GC16, u[4]
-  assert_equal [lx, ly, lw, lh, RM2::DU, RM2::FAST_DRAW], d.updates[2]
 end
 
 assert('a tap on New clears the ink and repaints the board') do
@@ -1595,6 +1614,72 @@ assert('BACK leaves the picker without changing the tier or the board') do
   assert_equal before_board, app.grid.givens_s
 end
 
+# --- LEAVING a screen puts the NEW screen's chrome up, and only that.
+#
+# Both halves of the owner's 2026-08-27 report, which was: after a save and a
+# level change, the play screen read BACK / LEVEL... / QUIT with no SAVES and
+# no CHECK, on a board that was clearly a new game.
+#
+# Half one: an acknowledgement's restore paints the label of the target that
+# was PRESSED, after the action has run — so an action that changes screens
+# had its old label stamped back onto the new screen (release_button in
+# App#acknowledge). Half two: level_chosen and the win tap reached :play
+# through new_puzzle, which paints and flushes board_rect alone, so the
+# picker's title and chrome simply stayed on the glass.
+
+assert('opening the picker leaves no label on the rects it kills') do
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  d.clear_calls
+  press_level(app)
+  assert_equal :levels, app.screen
+  # Level's own rect is dead on the picker it opens (App#press_in_menu guards
+  # :del to the saves list), so the picker paints it blank — and the press
+  # acknowledgement must not paint 'LEVEL...' back over that blank.
+  [:level, :check, :games].each do |dead|
+    x, y, w, h = Redoku::Layout.button_rect(dead)
+    assert_nil label_left(d, x, y, w, h, 0),
+               "#{dead} should carry no label on the picker"
+  end
+end
+
+assert('picking a level leaves a whole play screen, not the picker chrome') do
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  press_level(app)
+  d.clear_calls                 # only what the row tap itself paints
+  tap_menu_row(app, 3)          # :expert, TIERS[3]
+  assert_equal :play, app.screen
+  assert_play_chrome(d, 'after picking a level')
+  # And the header is the play screen's again, not the picker's title: the
+  # right-aligned tier label is text draw_levels_menu never paints, so its
+  # presence is proof draw_header ran.
+  right = Redoku::Layout::BOARD_X + Redoku::Layout::BOARD_W
+  label_w = Redoku::Font.width('EXPERT', Redoku::Layout::LABEL_SCALE)
+  assert_equal 0, d.gray_at(right - label_w, Redoku::Layout::HEADER_Y)
+end
+
+assert('the saves list says SAVE on Games\' rect, not SAVES') do
+  app, d, = new_app
+  d.clear_calls
+  tap_button(app, :games)
+  assert_equal :menu, app.screen
+  # SAVES is the play screen's word for the button that OPENS this list; the
+  # button on the list is the verb. The press that got here must not leave
+  # the former sitting on the latter.
+  x, y, w, h = Redoku::Layout.button_rect(:games)
+  assert_equal label_origin('SAVE', x, w), label_left(d, x, y, w, h, 0)
+end
+
+assert('BACK from the saves list leaves NEW on New\'s rect') do
+  app, d, = new_app
+  tap_button(app, :games)
+  d.clear_calls
+  tap_menu_action(app, :back)
+  assert_equal :play, app.screen
+  assert_play_chrome(d, 'after BACK out of the saves list')
+end
+
 assert('every tier label has a glyph for every character') do
   allowed = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -:.?'
   Redoku::Sudoku::Rater::TIERS.each do |t|
@@ -2075,14 +2160,19 @@ assert('BACK leaves the menu and repaints the board') do
   d.clear_calls
   tap_menu_action(app, :back)
   assert_equal :play, app.screen
-  # BACK's action is close_menu: press flash first, then a full play-mode
-  # repaint, and the release flash lands on a button that is NEW again by
-  # the time it flushes.
+  # BACK's action is close_menu: the press flash first, then one full
+  # play-mode repaint — and that repaint is the LAST word on the panel.
+  #
+  # It used to be followed by a release flash on New's rect, which this test
+  # asserted for, on the comment's reasoning that the flash "lands on a button
+  # that is NEW again by the time it flushes". It did not: release_button
+  # paints the label of the target that was PRESSED, so it painted BACK back
+  # over the NEW that draw_all had just put there, and left it. A press whose
+  # action changes screens is not restored at all now (App#acknowledge), so
+  # the full repaint is where the sequence ends.
   assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H,
                 RM2::GC16, RM2::SYNC], d.updates[1]
-  nx, ny, nw, nh = Redoku::Layout.button_rect(:new)
-  assert_equal [nx, ny, nw, nh, RM2::DU, RM2::FAST_DRAW],
-               d.updates[d.updates.size - 1]
+  assert_equal 2, d.updates.size
 end
 
 assert('the GAMES menu is not a writing surface') do
@@ -3005,6 +3095,46 @@ assert('a tap on the win screen deals a new puzzle') do
   assert_equal :play, app.screen
   assert_false before == app.grid.givens_s
   assert_equal 0, app.checks         # a new puzzle is a new sitting
+end
+
+assert('a tap on the win screen leaves a whole play screen') do
+  # draw_win paints a white panel and three lines of text — no chrome at all
+  # — so reaching :play through new_puzzle, which paints and flushes
+  # board_rect alone, left a new game with no buttons and no header on it.
+  # Same defect as the LEVEL picker's (see the block above the tier-glyph
+  # assertion): entering :play has to repaint the play screen.
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  fill_board_correctly(app)
+  app.run_check
+  assert_equal :win, app.screen
+  d.clear_calls
+  app.handle_sample(pen_sample(700, 900, true))
+  app.handle_sample(pen_sample(700, 900, false))
+  assert_equal :play, app.screen
+  assert_play_chrome(d, 'after a tap on the win screen')
+end
+
+assert('winning through the CHECK button leaves no button on the win screen') do
+  # The fourth instance of the restore bug (App#acknowledge): CHECK's action
+  # can END on the win screen, which draw_win paints as a bare white panel
+  # with three lines of text — so a release flash afterwards planted a framed
+  # CHECK button on it. Unlike the other three this one was invisible to the
+  # existing win tests, because they call run_check directly rather than
+  # pressing the button that runs it.
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  fill_board_correctly(app)
+  d.clear_calls
+  press_check(app)
+  assert_equal :win, app.screen
+  cx, cy, cw, ch = Redoku::Layout.button_rect(:check)
+  assert_equal 255, d.gray_at(cx, cy)           # no frame
+  assert_nil label_left(d, cx, cy, cw, ch, 0)   # no label
+  # The full-screen GC16 the win arrives in is the last word on the panel.
+  u = d.updates[d.updates.size - 1]
+  assert_equal [0, 0, Redoku::Layout::SCREEN_W, Redoku::Layout::SCREEN_H],
+               [u[0], u[1], u[2], u[3]]
 end
 
 assert('the win screen text stays inside the font charset') do

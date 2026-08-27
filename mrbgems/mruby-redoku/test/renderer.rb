@@ -30,29 +30,6 @@ assert('Renderer#draw_board frames every edge of the board') do
   assert_equal 0, d.gray_at(x + w - 1, y + h - 1) # bottom-right
 end
 
-# The leftmost column of LABEL ink inside a button rect. draw_button paints
-# every frame piece from the rect's own x, and Font.draw emits one rect per
-# lit glyph pixel starting at the text origin (and 'B', 'N', 'S' and 'L' all
-# light column 0), so the smallest x past that left edge is where the text
-# begins — which pins WHICH text was drawn, since two different words centre
-# in the same 400 px rect at two different origins. `ink` is the label's own
-# gray: black on a resting button, white on an inverted one.
-def label_left(d, x, y, w, h, ink)
-  lefts = []
-  d.rects.each do |rx, ry, rw, rh, gray|
-    next unless gray == ink
-    next unless rx > x && rx + rw <= x + w && ry >= y && ry + rh <= y + h
-    lefts << rx
-  end
-  lefts.min
-end
-
-# Where `text` would start if it were centred in the rect: what label_left
-# should answer.
-def label_origin(text, x, w)
-  x + (w - Redoku::Font.width(text, Redoku::Layout::BUTTON_LABEL_SCALE)) / 2
-end
-
 assert('Renderer#draw_buttons frames each button and centres its label') do
   d = TestDisplay.new
   Redoku::Renderer.new(d).draw_buttons

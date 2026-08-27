@@ -357,6 +357,50 @@ def r_shuffle_with_seed(list, seed)
   Redoku::Rng.new(seed).shuffle(list)
 end
 
+# --- WHICH TEXT a button is carrying. Here rather than in test/renderer.rb
+# because test/app.rb needs it too, and mrbtest runs each file's asserts as it
+# loads it — app.rb sorts first, so a helper defined in renderer.rb does not
+# exist yet by the time app.rb's blocks run. _support.rb sorts before both.
+
+# The leftmost column of LABEL ink inside a button rect. draw_button paints
+# every frame piece from the rect's own x, and Font.draw emits one rect per
+# lit glyph pixel starting at the text origin (and 'B', 'N', 'S', 'C', 'Q'
+# and 'L' all light column 0), so the smallest x past that left edge is where
+# the text begins — which pins WHICH text was drawn, since two different
+# words centre in the same 400 px rect at two different origins. `ink` is the
+# label's own gray: black on a resting button, white on an inverted one.
+#
+# nil means no label ink at all in that rect, which is what an unpainted
+# button (a dead rect on a menu) answers.
+def label_left(d, x, y, w, h, ink)
+  lefts = []
+  d.rects.each do |rx, ry, rw, rh, gray|
+    next unless gray == ink
+    next unless rx > x && rx + rw <= x + w && ry >= y && ry + rh <= y + h
+    lefts << rx
+  end
+  lefts.min
+end
+
+# Where `text` would start if it were centred in the rect: what label_left
+# should answer.
+def label_origin(text, x, w)
+  x + (w - Redoku::Font.width(text, Redoku::Layout::BUTTON_LABEL_SCALE)) / 2
+end
+
+# Every play-mode button reads what PLAY_LABELS says it reads. The assertion
+# a screen-transition test wants: three of the five rects carry a different
+# word on the menus, so a stale menu label or a rect the play screen never
+# repainted both show up here.
+def assert_play_chrome(d, context)
+  Redoku::Renderer::PLAY_LABELS.each do |name, text|
+    x, y, w, h = Redoku::Layout.button_rect(name)
+    got = label_left(d, x, y, w, h, 0)
+    assert_equal label_origin(text, x, w), got,
+                 "#{name} should read #{text} #{context}"
+  end
+end
+
 # The inverse of Grid#entries_s: '.' is empty, '?' is unreadable (M3b), and
 # anything else is a digit. Distinct from values_of, which has no '?' case
 # because givens and solutions can never hold one.

@@ -431,12 +431,26 @@ module Redoku
     # same reason run does it: it costs no extra refresh, and a bar that
     # appears from nowhere partway through a search reads worse than one that
     # was always there waiting to move.
-    def new_puzzle
+    # `full` is for a deal that ENTERS :play from another screen — the LEVEL
+    # picker (level_chosen) and the win screen's tap. Both of those screens
+    # are full-panel paints that replace the header and the chrome, so the
+    # board-region repaint below would leave their title and their buttons
+    # sitting around a brand-new game: that is how a picked level landed on a
+    # play screen reading BACK / LEVEL... / QUIT with no SAVES and no CHECK,
+    # and how a win tap dealt a board with no buttons at all. draw_all is the
+    # only thing that puts the play screen back, and the two transitions that
+    # already got this right (load_game, close_menu) call it by hand.
+    #
+    # run's cold-start branch spells the same sequence out for itself, because
+    # it also has a restore_saved path that shares the draw_all; if a third
+    # caller ever needs it, that is the moment to collapse the two.
+    def new_puzzle(full: false)
       @ink_dirty = nil
+      @renderer.draw_all(@difficulty) if full
       @renderer.draw_splash
       reset_progress
       @renderer.draw_progress(0, 1)
-      @renderer.flush_board
+      full ? @renderer.flush_all : @renderer.flush_board
       fill_board
       self
     end
@@ -1034,19 +1048,29 @@ module Redoku
         # @checks is per-board, not a lifetime score (spec §3).
         @screen = :play
         @checks = 0
-        new_puzzle
+        # full: the win screen painted over the header and every button.
+        new_puzzle(full: true)
       end
     end
 
-    # Menu presses, for both menus (:menu GAMES, :levels LEVEL). Every action
+    # Menu presses, for both menus (:menu SAVES, :levels LEVEL). Every action
     # repaints its own result (refresh_menu / the picker's full paint or a
     # full play-mode repaint), which is why the repainting ones run inside
     # acknowledge like every other press — and why the acknowledgement's
     # restore half is what decides whether the flash survives its own
     # action:
     #
-    # - BACK/SAVE/PREV/NEXT come back up, because their actions repaint
-    #   regions that include their buttons but no button pass repaints them;
+    # - PREV/NEXT come back up. Their action repaints the whole list, their
+    #   own buttons included, so the restore is only belt-and-braces — but it
+    #   paints the same word over the same rect, so it costs one DU flush and
+    #   cannot be wrong.
+    # - BACK does NOT, and the reasoning here used to say otherwise: "their
+    #   actions repaint regions that include their buttons but no button pass
+    #   repaints them" was untrue of it, because close_menu calls draw_all,
+    #   which calls draw_buttons. Restoring after a SCREEN CHANGE painted
+    #   BACK onto the play screen's New button and left it there;
+    #   acknowledge now drops the restore whenever @screen moved, so this is
+    #   no longer a per-call-site judgement to get wrong.
     # - a ROW stays down (restore: false): loading a save, dealing at a tier
     #   and deleting all repaint everything the inverted row covered —
     #   either way the flash is gone under the repaint, and painting it "back"
@@ -1100,14 +1124,16 @@ module Redoku
     end
 
     # A tapped row means "deal at this tier". Out of range is a no-op, never
-    # a crash. The dig IS the transition: new_puzzle repaints the board
-    # itself, hence restore: false back in press_in_menu.
+    # a crash. The dig IS the transition, and it repaints the WHOLE play
+    # screen: the picker owned the header and the chrome, so a board-only
+    # repaint left its title and its buttons around the new game (see
+    # new_puzzle). @difficulty is set first, because draw_all prints it.
     def level_chosen(n)
       tier = Sudoku::Rater::TIERS[n]
       return unless tier
       @difficulty = tier
       @screen = :play
-      new_puzzle          # repaints the board itself, hence restore: false
+      new_puzzle(full: true)
       self
     end
 
@@ -1308,9 +1334,32 @@ module Redoku
     # on the way out. Containing that means making main.rb close the display
     # come what may, which is a change to the entry point, not to this
     # method.
+    # A SCREEN CHANGE CANCELS THE RESTORE, whatever the caller asked for.
+    #
+    # `name` is the target that was pressed on the screen we were on, and
+    # release_button paints THAT target's label (Renderer#label_of). An action
+    # that changed screens has already repainted the whole panel, its own
+    # chrome included, so a restore afterwards stamps the label of the screen
+    # we LEFT onto the screen we are now on. Every instance the owner found on
+    # 2026-08-27 was this one bug:
+    #
+    #   :back  -> close_menu   left BACK on the play screen's New button
+    #   :level -> open_levels  left LEVEL... on a picker rect that is dead
+    #   :games -> open_menu    left SAVES over the saves list's own SAVE
+    #   :check -> a win        left a CHECK button on the win screen
+    #
+    # Deciding this here rather than by hand at each call site is the point:
+    # press_in_menu used to pass restore: true for BACK on the reasoning that
+    # "no button pass repaints them", which was simply untrue — close_menu
+    # calls draw_all, which calls draw_buttons. The screen is the fact; the
+    # flag is a guess. What the flag still decides is the case where the
+    # screen does NOT change: New and Check repaint the board region alone and
+    # nothing else puts their button back, so they must be restored.
     def acknowledge(name, restore: true)
+      screen_before = @screen
       pressed = show_press(name)
       yield
+      restore &&= @screen == screen_before
       finish_press(name, restore) if pressed
       self
     end
