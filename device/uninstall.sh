@@ -90,12 +90,29 @@ say "removing the decoy document"
 # restarts below, there is no rm2fb left for it to race against.
 DECOY_REMOVED=0
 if [ -f "$WATCH_CONF" ]; then
-  DECOY_PDF=$(sed -n 's/^pdf=//p' "$WATCH_CONF")
+  # head -n 1: fix round 2, item 6 — a watch.conf with two 'pdf=' lines
+  # (corrupt, or hand-edited) would otherwise make DECOY_PDF hold both,
+  # joined by an embedded newline; first line wins, always (matches the
+  # same fix in install.sh).
+  DECOY_PDF=$(sed -n 's/^pdf=//p' "$WATCH_CONF" | head -n 1)
   case $DECOY_PDF in
     "$XOCHITL_DIR"/*.pdf)
       DECOY_BASE=${DECOY_PDF%.pdf}
       DECOY_UUID=${DECOY_BASE##*/}
       if looks_like_uuid "$DECOY_UUID"; then
+        # Recomposed from $XOCHITL_DIR (a fixed constant) + the
+        # just-validated $DECOY_UUID, never from $DECOY_BASE directly —
+        # fix round 2, item 6: a traversal payload whose *basename*
+        # happens to be uuid-shaped (pdf=$XOCHITL_DIR/../../../../etc/
+        # <uuid>.pdf) would still pass looks_like_uuid on that basename
+        # while $DECOY_BASE itself points at /etc/<uuid> — rm -rf on
+        # $DECOY_BASE would then escape $XOCHITL_DIR entirely.
+        # install.sh's own decoy-copy step already builds these same six
+        # paths this way; this is the same recomposition on the removal
+        # side, closing the same class of bug Critical 2 closed for the
+        # uuid itself.
+        DECOY_TARGET=$XOCHITL_DIR/$DECOY_UUID
+
         # This IS the <uuid>/ ink directory install.sh creates (the base
         # path with no suffix) — rm -rf, not rmdir, because it may hold
         # the player's own annotations on the decoy by now. <uuid>.
@@ -103,12 +120,66 @@ if [ -f "$WATCH_CONF" ]; then
         # create — but it IS this script's to remove: xochitl only reaps
         # a document's thumbnails when IT deletes the document, and here
         # the document vanishes out from under it instead, so nothing
-        # else will ever collect this one. Six entries now, not five —
-        # the sixth found by a reviewer reading uninstall.sh's own "no
-        # trace left" promise against what it actually left behind.
-        rm -f "$DECOY_BASE.pdf" "$DECOY_BASE.metadata" "$DECOY_BASE.content" "$DECOY_BASE.pagedata"
-        rm -rf "$DECOY_BASE" "$DECOY_BASE.thumbnails"
-        DECOY_REMOVED=1
+        # else will ever collect this one. Six entries, not five — the
+        # sixth found by a reviewer reading uninstall.sh's own "no trace
+        # left" promise against what it actually left behind.
+        rm -f "$DECOY_TARGET.pdf" "$DECOY_TARGET.metadata" "$DECOY_TARGET.content" "$DECOY_TARGET.pagedata"
+        rm -rf "$DECOY_TARGET" "$DECOY_TARGET.thumbnails"
+
+        # Fix round 2, finding 3: check that the FIRST removal actually
+        # worked before doing anything xochitl-related. A failed rm
+        # (permissions, a read-only filesystem) must not be mistaken for
+        # something xochitl needs blaming for, and must not cost the
+        # operator the only record of the uuid — watch.conf, removed
+        # further down only when DECOY_REMOVED ends up 1.
+        _still_present=0
+        for _f in "$DECOY_TARGET.pdf" "$DECOY_TARGET.metadata" "$DECOY_TARGET.content" \
+                  "$DECOY_TARGET.pagedata" "$DECOY_TARGET" "$DECOY_TARGET.thumbnails"; do
+          [ -e "$_f" ] && _still_present=1
+        done
+
+        if [ "$_still_present" = 1 ]; then
+          say "  WARNING: removal failed — some decoy files are still on disk after rm (permissions? read-only filesystem?); leaving $WATCH_CONF so the uuid record survives to retry"
+        else
+          # Fix round 2, findings 4/5: `systemctl restart` is a stop job
+          # THEN a start job — the dying xochitl's own shutdown flush
+          # completes BEFORE the new process starts, so if it was
+          # holding the decoy in memory at the moment of the rm above,
+          # the flush recreates the files and the FRESH process then
+          # scans the library and ADOPTS what its predecessor just wrote
+          # back (fix round 1's "the now-running xochitl never loaded
+          # the decoy" had this backwards). One restart cannot outrun
+          # that sequence; a second one, after the resurrected files are
+          # gone again, is what finally gives a process nothing left to
+          # adopt. Restart-only per the standing constraint — see the
+          # "NEVER stop" comment below.
+          systemctl restart xochitl.service
+          sleep 3
+          _resurrected=0
+          for _f in "$DECOY_TARGET.pdf" "$DECOY_TARGET.metadata" "$DECOY_TARGET.content" \
+                    "$DECOY_TARGET.pagedata" "$DECOY_TARGET" "$DECOY_TARGET.thumbnails"; do
+            [ -e "$_f" ] || continue
+            _resurrected=1
+            rm -rf "$_f"
+          done
+          if [ "$_resurrected" = 1 ]; then
+            say "  xochitl recreated some decoy files from its in-memory model — removed them again and restarting once more so the next process has nothing left to adopt"
+            systemctl restart xochitl.service
+            sleep 3
+          fi
+
+          _still_present=0
+          for _f in "$DECOY_TARGET.pdf" "$DECOY_TARGET.metadata" "$DECOY_TARGET.content" \
+                    "$DECOY_TARGET.pagedata" "$DECOY_TARGET" "$DECOY_TARGET.thumbnails"; do
+            [ -e "$_f" ] && _still_present=1
+          done
+          if [ "$_still_present" = 1 ]; then
+            say "  WARNING: decoy files reappeared a second time after removal — leaving $WATCH_CONF; investigate by hand (systemctl status xochitl) rather than re-running blindly"
+          else
+            say "  removed $DECOY_TARGET.{pdf,metadata,content,pagedata,thumbnails} and its ink directory"
+            DECOY_REMOVED=1
+          fi
+        fi
       else
         say "  WARNING: $WATCH_CONF's pdf= line ($DECOY_PDF) doesn't have a uuid-shaped basename — leaving $WATCH_CONF, check by hand"
       fi
@@ -135,30 +206,11 @@ systemctl reset-failed xochitl.service 2>/dev/null || true
 systemctl restart xochitl.service
 sleep 3
 
+# Fix round 2, finding 3: gated on DECOY_REMOVED as it stands AFTER the
+# full removal-verify(-retry) sequence above, not right after the first
+# rm — a failed removal, or one still unresolved after the resurrection
+# retry, must keep watch.conf so the uuid record survives to try again.
 if [ "$DECOY_REMOVED" = 1 ]; then
-  # Fix round 1, finding 1: if xochitl was still alive with the decoy in
-  # its own in-memory model at the moment of the rm above, it can flush
-  # that model back to disk on its own initiative — confirmed on-device:
-  # deleting these same four files under a live xochitl recreated
-  # .content and .pagedata from memory a moment later, with the library
-  # row surviving. The restart just above is what forces the point: once
-  # its new process has started, it has scanned a library that no longer
-  # has the decoy in it — it never loaded the document in the first
-  # place, so nothing is left to resurrect from here on. Then verify — a
-  # reviewer's whole point was that this script used to just assume `rm`
-  # won.
-  _resurrected=0
-  for _f in "$DECOY_BASE.pdf" "$DECOY_BASE.metadata" "$DECOY_BASE.content" \
-            "$DECOY_BASE.pagedata" "$DECOY_BASE" "$DECOY_BASE.thumbnails"; do
-    [ -e "$_f" ] || continue
-    _resurrected=1
-    rm -rf "$_f"
-  done
-  if [ "$_resurrected" = 1 ]; then
-    say "  WARNING: xochitl recreated some decoy files after the first removal — removed them again; the now-running xochitl never loaded the decoy, so this should be the last time"
-  else
-    say "  removed $DECOY_BASE.{pdf,metadata,content,pagedata,thumbnails} and its ink directory"
-  fi
   rm -f "$WATCH_CONF"
 fi
 

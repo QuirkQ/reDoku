@@ -46,9 +46,14 @@
 #
 # bin/redoku also stages /home/root/redoku/bin/redoku (the game) alongside
 # these, but this script neither needs it nor reads it for the display
-# server or decoy/watcher steps — they install the same way with or
-# without a game build, on purpose. (The watcher will simply have nothing
-# to spawn until the game binary is staged, e.g. via `bin/redoku play`.)
+# server or decoy steps — they install the same way with or without a
+# game build, on purpose. redoku-watcher.service's ExecStart is that same
+# binary (`redoku --watch`), though, so it genuinely cannot START without
+# one — fix round 2, finding 1: the unit is still written and enabled
+# either way (ready for the next boot, or the next install once a build
+# exists), but is only STARTED, and only then hard-verified, when the
+# binary is actually present. A watcher with nothing to spawn must not
+# roll back an otherwise healthy display-server install.
 #
 # Usage: install.sh [--force]
 #   --force   proceed even if the firmware version differs from the
@@ -79,12 +84,63 @@ WATCH_CONF=$REDOKU_DIR/watch.conf
 DECOY_DIR=$REDOKU_DIR/decoy
 WATCHER_UNIT_SRC=$REDOKU_DIR/redoku-watcher.service
 WATCHER_UNIT=/etc/systemd/system/redoku-watcher.service
+# redoku-watcher.service's ExecStart, spelled out here too (fix round 2,
+# finding 1): whether this file exists on the device is what decides
+# whether the watcher can be STARTED today or only enabled for later.
+GAME_BIN=$REDOKU_DIR/bin/redoku
+
+# Fix round 2, finding 2: how long wait_for_active (below) will wait for a
+# unit to settle before giving up, per service. Named so every call site
+# says the same number for the same reason, not a fresh guess each time.
+# 60s, not 15: the exact line the owner's one real install run died at was
+# a single `systemctl is-active` sample 15s after a restart, and their own
+# device journal shows xochitl can take multi-second network timeouts
+# during a normal startup — indistinguishable, at one sample, from a unit
+# that is never coming back.
+WAIT_BUDGET=60
 
 FORCE=0
 [ "${1:-}" = --force ] && FORCE=1
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Fix round 2, finding 2: `systemctl is-active --quiet` is one sample —
+# it returns non-zero for "activating" and for the "auto-restart" substate
+# (a Restart=on-failure unit sitting in its RestartSec backoff between a
+# crash and its next retry) exactly the same as for a unit that is
+# permanently gone, so a single sample partway through a restart cannot
+# tell "still coming up" apart from "never coming back". wait_for_active
+# polls once a second up to a budget instead: ActiveState=active is
+# success, ActiveState=failed is a real terminal failure worth reporting
+# immediately (no reason to burn the rest of the budget on a unit that has
+# already given up), and everything else — activating, the auto-restart
+# substate, reloading, deactivating — is "keep waiting". Logs what it last
+# saw whichever way it ends, so a real failure is diagnosable instead of
+# guessed at.
+wait_for_active() { # wait_for_active <unit> <budget_seconds>
+  _unit=$1
+  _budget=$2
+  _waited=0
+  while :; do
+    _show=$(systemctl show -p ActiveState -p SubState -p NRestarts "$_unit" 2>/dev/null)
+    _state=$(printf '%s\n' "$_show" | sed -n 's/^ActiveState=//p')
+    _sub=$(printf '%s\n' "$_show" | sed -n 's/^SubState=//p')
+    _nrestarts=$(printf '%s\n' "$_show" | sed -n 's/^NRestarts=//p')
+    [ "$_state" = active ] && return 0
+    if [ "$_state" = failed ]; then
+      printf 'ERROR: %s failed (ActiveState=%s SubState=%s NRestarts=%s)\n' \
+        "$_unit" "$_state" "$_sub" "$_nrestarts" >&2
+      return 1
+    fi
+    [ "$_waited" -lt "$_budget" ] || break
+    sleep 1
+    _waited=$((_waited + 1))
+  done
+  printf 'ERROR: %s did not become active within %ss (ActiveState=%s SubState=%s NRestarts=%s)\n' \
+    "$_unit" "$_budget" "$_state" "$_sub" "$_nrestarts" >&2
+  return 1
+}
 
 # Fix round 1, Critical 2: a `case … "$XOCHITL_DIR"/*.pdf)` glob is not a
 # validator — `*` also matches the EMPTY string (pdf=$XOCHITL_DIR/.pdf
@@ -175,7 +231,12 @@ fi
 # --- M4 preflight: decoy document + watcher -----------------------------
 [ -f "$WATCH_CONF" ] || \
   die "missing $WATCH_CONF — deploy the decoy files first (bin/redoku install stages them)"
-DECOY_PDF=$(sed -n 's/^pdf=//p' "$WATCH_CONF")
+# head -n 1: fix round 2, item 6 — a watch.conf with two 'pdf=' lines
+# (corrupt, or hand-edited) would otherwise make DECOY_PDF hold both,
+# joined by an embedded newline, which the glob below can still match
+# (glob `*` matches newlines) while every later use of the value breaks
+# in stranger ways than a clean refusal would. First line wins, always.
+DECOY_PDF=$(sed -n 's/^pdf=//p' "$WATCH_CONF" | head -n 1)
 [ -n "$DECOY_PDF" ] || die "$WATCH_CONF has no 'pdf=' line — corrupt, or hand-edited?"
 case $DECOY_PDF in
   "$XOCHITL_DIR"/*.pdf) ;;
@@ -258,19 +319,35 @@ rollback() {
   systemctl restart xochitl.service || true
   sleep 3
 
-  # Fix round 1, finding 1: the same resurrection risk uninstall.sh's
-  # decoy removal carries (see its comment for the on-device evidence) —
-  # if xochitl was alive with the decoy in its in-memory model at the
-  # moment of the rm above, this restart's own shutdown-of-the-old-
-  # process phase can flush it straight back to disk. Re-check and
-  # re-remove once, best-effort: rollback must not itself fail, so
-  # nothing here is allowed to die.
+  # Fix round 1, finding 1 (corrected in fix round 2, finding 4): the
+  # same resurrection risk uninstall.sh's decoy removal carries (see its
+  # comment for the on-device evidence and the corrected reasoning) — a
+  # `systemctl restart` is a stop job THEN a start job, so if xochitl was
+  # alive with the decoy in its in-memory model at the moment of the rm
+  # above, its shutdown flush completes BEFORE the new process starts and
+  # scans the library — the fresh process can adopt exactly what its
+  # predecessor just wrote back. One restart cannot outrun that sequence;
+  # a second one, after the resurrected files are gone again, is what
+  # finally gives a process nothing left to adopt. Best-effort throughout:
+  # rollback must not itself fail, so nothing here is allowed to die.
+  _resurrected=0
   for _f in "$XOCHITL_DIR/$DECOY_UUID.pdf" "$XOCHITL_DIR/$DECOY_UUID.metadata" \
             "$XOCHITL_DIR/$DECOY_UUID.content" "$XOCHITL_DIR/$DECOY_UUID.pagedata" \
             "$XOCHITL_DIR/$DECOY_UUID" "$XOCHITL_DIR/$DECOY_UUID.thumbnails"; do
     [ -e "$_f" ] || continue
+    _resurrected=1
     rm -rf "$_f" 2>/dev/null || true
   done
+  if [ "$_resurrected" = 1 ]; then
+    systemctl restart xochitl.service || true
+    sleep 3
+    for _f in "$XOCHITL_DIR/$DECOY_UUID.pdf" "$XOCHITL_DIR/$DECOY_UUID.metadata" \
+              "$XOCHITL_DIR/$DECOY_UUID.content" "$XOCHITL_DIR/$DECOY_UUID.pagedata" \
+              "$XOCHITL_DIR/$DECOY_UUID" "$XOCHITL_DIR/$DECOY_UUID.thumbnails"; do
+      [ -e "$_f" ] || continue
+      rm -rf "$_f" 2>/dev/null || true
+    done
+  fi
   say "rollback done — check with: systemctl status xochitl"
 }
 STATUS=fail
@@ -331,14 +408,23 @@ say "reloading systemd"
 systemctl daemon-reload
 
 say "installing the decoy document into $XOCHITL_DIR"
-# Before either service starts, on purpose (fix round 1, Critical 1): the
-# watcher's own startup (Watcher#start -> reconcile!(:pdf, fatal: true) in
-# watcher.rb) calls inotify_add_watch on the pdf path and treats a missing
-# target as fatal — Linux requires the watched path to already exist. The
-# previous ordering here started the watcher first and copied the decoy
-# in afterwards, racing the shell script against the watcher's own
-# (usually much faster) mruby-VM boot: a service must not be started
-# before the thing it exists to watch, race or no race.
+# Before either service starts, on purpose (fix round 1, Critical 1;
+# corrected in fix round 2, finding 5 — the reason below used to be
+# wrong). The right reason: a service must not be started before the
+# thing it exists to watch, independent of whether missing it is fatal —
+# and it is not. watcher.rb's Watcher#start never raises for a missing
+# pdf= target ("Requirement D: never raises... a watcher that exits at
+# boot because a mount lost a race is a launcher that only works after a
+# manual restart, and that defeats the entire point of this milestone" —
+# watcher.rb's own comment on #start); a missing target just makes
+# reconcile! fail quietly and retry every REARM_RETRY_MS (5s) until the
+# file shows up — exactly what the device journal measured (91s alive
+# with the pdf target absent, no crash, M4-HIJACK device-watcher-
+# journal.txt). Starting the watcher first still costs something real,
+# though: every REARM_RETRY_MS window before the file exists is a window
+# the watcher cannot see a tap in at all, since the watch was never
+# armed — silent, no crash, but still a gap this hijack cannot afford at
+# the one moment (right after install) a tap is most likely.
 #
 # Plain overwrite (see the header comment on what that does and doesn't
 # reset). Copied, not moved, so a re-run's staged files under $DECOY_DIR
@@ -370,9 +456,9 @@ done
 # Tiny race accepted here: if the server dies between this check and
 # xochitl's first preload connect, xochitl can crash-loop once into a
 # reboot — after which the arming file guarantees a stock, working boot.
-systemctl is-active --quiet rm2fb.service || die "rm2fb.service is not active"
+wait_for_active rm2fb.service "$WAIT_BUDGET" || die "rm2fb.service is not active"
 
-say "enabling + starting redoku-watcher.service"
+say "enabling redoku-watcher.service"
 # reset-failed first (fix round 1, Important 3): systemd's start-limit
 # counter survives stop/disable and clears only via reset-failed or the
 # 600s StartLimitIntervalSec window expiring on its own. Without this, a
@@ -382,8 +468,26 @@ say "enabling + starting redoku-watcher.service"
 # counter and has nothing to do with whatever this attempt actually did.
 systemctl reset-failed redoku-watcher.service 2>/dev/null || true
 systemctl enable redoku-watcher.service
-systemctl restart redoku-watcher.service
-systemctl is-active --quiet redoku-watcher.service || die "redoku-watcher.service is not active"
+
+# Fix round 2, finding 1: redoku-watcher.service's ExecStart is
+# $GAME_BIN itself ("redoku --watch") — the header's old claim that the
+# decoy/watcher install "the same way with or without a game build" was
+# never true for the watcher specifically, and starting a unit whose
+# binary does not exist is 203/EXEC, not a graceful no-op. Enabling it
+# regardless means it starts on its own at the next boot, or the next
+# time this script runs after a build exists; STARTING (and therefore
+# hard-verifying) it only happens when there is something to start. A
+# watcher with nothing to spawn must not roll back an otherwise healthy
+# display-server install.
+if [ -x "$GAME_BIN" ]; then
+  say "starting redoku-watcher.service"
+  systemctl restart redoku-watcher.service
+  wait_for_active redoku-watcher.service "$WAIT_BUDGET" || die "redoku-watcher.service is not active"
+  WATCHER_STARTED=1
+else
+  say "no game binary at $GAME_BIN yet — redoku-watcher.service is enabled for the next boot (or the next 'bin/redoku install' once 'make build' has produced one), not started now"
+  WATCHER_STARTED=0
+fi
 
 say "restarting xochitl with the rm2fb client preloaded — this also indexes the decoy"
 # NEVER `stop` xochitl.service here or anywhere in this script — an
@@ -394,15 +498,25 @@ say "restarting xochitl with the rm2fb client preloaded — this also indexes th
 # here and is what must stay.
 systemctl restart xochitl.service
 
-say "verifying (15 s settle)"
-sleep 15
-systemctl is-active --quiet rm2fb.service || die "rm2fb.service died after the xochitl restart"
-systemctl is-active --quiet redoku-watcher.service || die "redoku-watcher.service died after the xochitl restart"
-systemctl is-active --quiet xochitl.service || die "xochitl isn't running"
+say "verifying (bounded poll, up to ${WAIT_BUDGET}s per service)"
+# Fix round 2, finding 2: this is the exact line the owner's one real
+# install run died at — a single is-active sample, 15s after the xochitl
+# restart, that cannot tell "still coming up" from "gone for good" apart
+# (see wait_for_active's own comment). Bounded polls per service now,
+# not one blind sleep plus one sample.
+wait_for_active rm2fb.service "$WAIT_BUDGET" || die "rm2fb.service did not settle after the xochitl restart"
+if [ "$WATCHER_STARTED" = 1 ]; then
+  wait_for_active redoku-watcher.service "$WAIT_BUDGET" || die "redoku-watcher.service did not settle after the xochitl restart"
+fi
+wait_for_active xochitl.service "$WAIT_BUDGET" || die "xochitl did not settle after its restart"
 
 STATUS=ok
 say "SUCCESS — rm2fb is installed, the decoy is in the library, and xochitl is running through it"
 say "  server status : systemctl status rm2fb"
-say "  watcher status: systemctl status redoku-watcher"
+if [ "$WATCHER_STARTED" = 1 ]; then
+  say "  watcher status: systemctl status redoku-watcher"
+else
+  say "  watcher status: enabled, not started (no game binary yet) — starts on the next boot, or re-run install once one exists"
+fi
 say "  client socket : $SOCKET"
 say "  back to stock : sh $REDOKU_DIR/uninstall.sh"
