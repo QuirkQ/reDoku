@@ -86,6 +86,27 @@ FORCE=0
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Fix round 1, Critical 2: a `case … "$XOCHITL_DIR"/*.pdf)` glob is not a
+# validator — `*` also matches the EMPTY string (pdf=$XOCHITL_DIR/.pdf
+# derives an empty uuid) and matches `..`/`/` (a pdf= line escaping the
+# directory entirely), and either one reaching `rm -rf "$XOCHITL_DIR/$
+# DECOY_UUID"` below is `rm -rf` on $XOCHITL_DIR itself or worse — a
+# reviewer demonstrated exactly that against the previous version of this
+# script. A uuid is 8-4-4-4-12 lowercase-or-uppercase hex (mkdecoy.rb's
+# own UUID_RE); `case` glob character classes need no external tool
+# (grep -E/expr are not guaranteed present in every BusyBox build) and,
+# unlike a partial regex match, a shell `case` pattern must match the
+# WHOLE string — too short, too long, or the wrong characters all fail
+# closed. Called before ANY path is built from a watch.conf-derived uuid.
+looks_like_uuid() {
+  case $1 in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
 # ---- preflight: read-only checks, abort before touching anything ----
 
 [ "$(id -u)" = 0 ] || die "must run as root"
@@ -165,6 +186,24 @@ esac
 # (and out of rollback(), which reuses these same variables).
 DECOY_BASE=${DECOY_PDF%.pdf}
 DECOY_UUID=${DECOY_BASE##*/}
+looks_like_uuid "$DECOY_UUID" || \
+  die "$WATCH_CONF's pdf= path ($DECOY_PDF) doesn't have a uuid-shaped basename (got '$DECOY_UUID') — refusing to build a path from it"
+
+# PLAN.md's M4 backup mandate, cheapest resolution: the installer only
+# ever ADDS a document (R9's fixed uuid means a re-run's cp is safe — see
+# the header — but a real document colliding with our fixed uuid, however
+# astronomically unlikely per mkdecoy.rb's own DEFAULT_UUID comment, would
+# otherwise get silently overwritten and later rm -rf'd by rollback/
+# uninstall). If something is already at this path, it must be OUR decoy
+# — verified the cheap way, by content, not by trusting the uuid alone.
+if [ -f "$XOCHITL_DIR/$DECOY_UUID.metadata" ] && \
+   ! grep -q '"visibleName": "Sudoku"' "$XOCHITL_DIR/$DECOY_UUID.metadata"; then
+  die "$XOCHITL_DIR/$DECOY_UUID.metadata exists and is not the reDoku decoy \
+(no Sudoku visibleName) — refusing to overwrite what looks like a real \
+document; this uuid collision should be essentially impossible, so \
+investigate by hand before doing anything else"
+fi
+
 DECOY_STAGED_PDF=$DECOY_DIR/$DECOY_UUID.pdf
 DECOY_STAGED_METADATA=$DECOY_DIR/$DECOY_UUID.metadata
 DECOY_STAGED_CONTENT=$DECOY_DIR/$DECOY_UUID.content
@@ -191,18 +230,47 @@ rollback() {
   systemctl disable --now rm2fb.service >/dev/null 2>&1 || true
   rm -f "$UNIT" "$DROPIN" "$WATCHER_UNIT"
   rmdir "$DROPIN_DIR" 2>/dev/null || true
-  # DECOY_UUID is always set by here — it's derived from $WATCH_CONF
-  # during preflight, which runs to completion before this trap is even
-  # armed (below). "Back to stock" means no trace of the decoy either,
-  # so this is unconditional, exactly like the rm2fb/dropin removal
-  # above — including on a re-run of an install that had already
-  # succeeded once.
+  # DECOY_UUID is always set (and shape-checked by looks_like_uuid) by
+  # here — derived from $WATCH_CONF during preflight, which runs to
+  # completion before this trap is even armed (below). "Back to stock"
+  # means no trace of the decoy either, so this is unconditional, exactly
+  # like the rm2fb/dropin removal above — including on a re-run of an
+  # install that had already succeeded once. .thumbnails/ included: if
+  # xochitl got far enough to thumbnail the decoy before this attempt
+  # failed, nothing else will ever collect it (uninstall.sh's reasoning
+  # for the same removal applies identically here).
   rm -f "$XOCHITL_DIR/$DECOY_UUID.pdf" "$XOCHITL_DIR/$DECOY_UUID.metadata" \
         "$XOCHITL_DIR/$DECOY_UUID.content" "$XOCHITL_DIR/$DECOY_UUID.pagedata"
-  rm -rf "$XOCHITL_DIR/$DECOY_UUID"
+  rm -rf "$XOCHITL_DIR/$DECOY_UUID" "$XOCHITL_DIR/$DECOY_UUID.thumbnails"
   systemctl daemon-reload
+  # Leaves the device's failure-counter state clean, not just stopped —
+  # symmetric with the reset-failed added before the watcher's own start
+  # above (Important 3): a rollback is exactly the situation that leaves
+  # a stale counter behind for the next attempt to trip over.
+  systemctl reset-failed redoku-watcher.service 2>/dev/null || true
   systemctl reset-failed xochitl.service 2>/dev/null || true
+  # NEVER `stop` xochitl.service here or anywhere in this script — an
+  # on-device test this round found that stopping it over this same
+  # SSH-over-USB session kills the session itself (port 22 refuses
+  # instantly), taking the rest of the script down with it and leaving
+  # xochitl stopped until a power cycle. `restart` is what has always
+  # been here and is what must stay.
   systemctl restart xochitl.service || true
+  sleep 3
+
+  # Fix round 1, finding 1: the same resurrection risk uninstall.sh's
+  # decoy removal carries (see its comment for the on-device evidence) —
+  # if xochitl was alive with the decoy in its in-memory model at the
+  # moment of the rm above, this restart's own shutdown-of-the-old-
+  # process phase can flush it straight back to disk. Re-check and
+  # re-remove once, best-effort: rollback must not itself fail, so
+  # nothing here is allowed to die.
+  for _f in "$XOCHITL_DIR/$DECOY_UUID.pdf" "$XOCHITL_DIR/$DECOY_UUID.metadata" \
+            "$XOCHITL_DIR/$DECOY_UUID.content" "$XOCHITL_DIR/$DECOY_UUID.pagedata" \
+            "$XOCHITL_DIR/$DECOY_UUID" "$XOCHITL_DIR/$DECOY_UUID.thumbnails"; do
+    [ -e "$_f" ] || continue
+    rm -rf "$_f" 2>/dev/null || true
+  done
   say "rollback done — check with: systemctl status xochitl"
 }
 STATUS=fail
@@ -262,13 +330,34 @@ cp "$WATCHER_UNIT_SRC" "$WATCHER_UNIT"
 say "reloading systemd"
 systemctl daemon-reload
 
+say "installing the decoy document into $XOCHITL_DIR"
+# Before either service starts, on purpose (fix round 1, Critical 1): the
+# watcher's own startup (Watcher#start -> reconcile!(:pdf, fatal: true) in
+# watcher.rb) calls inotify_add_watch on the pdf path and treats a missing
+# target as fatal — Linux requires the watched path to already exist. The
+# previous ordering here started the watcher first and copied the decoy
+# in afterwards, racing the shell script against the watcher's own
+# (usually much faster) mruby-VM boot: a service must not be started
+# before the thing it exists to watch, race or no race.
+#
+# Plain overwrite (see the header comment on what that does and doesn't
+# reset). Copied, not moved, so a re-run's staged files under $DECOY_DIR
+# stay put for the next run rather than only existing once.
+cp "$DECOY_STAGED_PDF" "$XOCHITL_DIR/$DECOY_UUID.pdf"
+cp "$DECOY_STAGED_METADATA" "$XOCHITL_DIR/$DECOY_UUID.metadata"
+cp "$DECOY_STAGED_CONTENT" "$XOCHITL_DIR/$DECOY_UUID.content"
+cp "$DECOY_STAGED_PAGEDATA" "$XOCHITL_DIR/$DECOY_UUID.pagedata"
+# The per-page ink dir a real document has (xochitl-3.27-format.md): empty
+# on a fresh install, but mkdir -p is a no-op if the player already wrote
+# on the decoy in a previous install, so their ink is never touched here.
+# xochitl's own <uuid>.thumbnails/ cache is left alone entirely by this
+# script, on either an install or a re-run — uninstall.sh is what reaps
+# it, once the document is gone from under xochitl for good.
+mkdir -p "$XOCHITL_DIR/$DECOY_UUID"
+
 say "enabling + starting rm2fb.service"
 systemctl enable rm2fb.service
 systemctl restart rm2fb.service
-
-say "enabling + starting redoku-watcher.service"
-systemctl enable redoku-watcher.service
-systemctl restart redoku-watcher.service
 
 say "waiting for $SOCKET"
 i=0
@@ -282,24 +371,27 @@ done
 # xochitl's first preload connect, xochitl can crash-loop once into a
 # reboot — after which the arming file guarantees a stock, working boot.
 systemctl is-active --quiet rm2fb.service || die "rm2fb.service is not active"
+
+say "enabling + starting redoku-watcher.service"
+# reset-failed first (fix round 1, Important 3): systemd's start-limit
+# counter survives stop/disable and clears only via reset-failed or the
+# 600s StartLimitIntervalSec window expiring on its own. Without this, a
+# watcher that burned its StartLimitBurst on an earlier failed attempt
+# fails every retry inside that window with "start request repeated too
+# quickly" — a die below, and a rollback, whose real cause is a stale
+# counter and has nothing to do with whatever this attempt actually did.
+systemctl reset-failed redoku-watcher.service 2>/dev/null || true
+systemctl enable redoku-watcher.service
+systemctl restart redoku-watcher.service
 systemctl is-active --quiet redoku-watcher.service || die "redoku-watcher.service is not active"
 
-say "installing the decoy document into $XOCHITL_DIR"
-# Plain overwrite (see the header comment on what that does and doesn't
-# reset). Copied, not moved, so a re-run's staged files under $DECOY_DIR
-# stay put for the next run rather than only existing once.
-cp "$DECOY_STAGED_PDF" "$XOCHITL_DIR/$DECOY_UUID.pdf"
-cp "$DECOY_STAGED_METADATA" "$XOCHITL_DIR/$DECOY_UUID.metadata"
-cp "$DECOY_STAGED_CONTENT" "$XOCHITL_DIR/$DECOY_UUID.content"
-cp "$DECOY_STAGED_PAGEDATA" "$XOCHITL_DIR/$DECOY_UUID.pagedata"
-# The per-page ink dir a real document has (xochitl-3.27-format.md): empty
-# on a fresh install, but mkdir -p is a no-op if the player already wrote
-# on the decoy in a previous install, so their ink is never touched here.
-# xochitl's own <uuid>.thumbnails/ cache is left alone entirely — this
-# script never creates or touches it, on either an install or a re-run.
-mkdir -p "$XOCHITL_DIR/$DECOY_UUID"
-
 say "restarting xochitl with the rm2fb client preloaded — this also indexes the decoy"
+# NEVER `stop` xochitl.service here or anywhere in this script — an
+# on-device test this round found that stopping it over this same
+# SSH-over-USB session kills the session itself (port 22 refuses
+# instantly), taking the rest of the script down with it and leaving
+# xochitl stopped until a power cycle. `restart` is what has always been
+# here and is what must stay.
 systemctl restart xochitl.service
 
 say "verifying (15 s settle)"

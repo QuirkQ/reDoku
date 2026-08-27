@@ -28,6 +28,20 @@ After=rm2fb.service
 # looping forever after the other has given up.
 StartLimitIntervalSec=600
 StartLimitBurst=4
+# /home/root lives on its own partition (/dev/mmcblk2p4, confirmed on the
+# owner's device) that is not guaranteed mounted yet when systemd runs
+# this unit's ExecStart for the very first time at boot — measured, not
+# theoretical: the first start after every boot in
+# .superpowers/sdd/M4-HIJACK/device-watcher-journal.txt failed
+# 203/EXEC (the binary not reachable yet), self-healing ~8s later only
+# because Restart=on-failure happened to retry after the mount caught up.
+# RequiresMountsFor orders this unit after (and requires) whatever mount
+# unit covers this path — both the binary and watch.conf live under it —
+# so the first start is a real one instead of a guaranteed, silently
+# tolerated failure. (rm2fb.service's ExecStart is under the same
+# partition and has the identical latent bug — flagged in this round's
+# report, not fixed here: out of scope for this file.)
+RequiresMountsFor=/home/root/redoku
 
 [Service]
 ExecStart=/home/root/redoku/bin/redoku --watch
