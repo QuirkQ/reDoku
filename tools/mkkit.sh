@@ -51,12 +51,12 @@ usage:
   tools/mkkit.sh [--version VERSION] [--out DIR] [--build-dir DIR]
 
 options:
-  --version VERSION   stamped into KIT_VERSION and VERSION (default: dev)
-  --out DIR            where the five assets land, flat (default: dist/)
-  --build-dir DIR      the build/ tree to read rm2/bin/ and rm2fb/dist/
-                        from (default: build/ — what 'make build' and
-                        'make rm2fb' populate)
-  -h, --help            this help
+  --version VERSION  stamped into KIT_VERSION and VERSION (default: dev)
+  --out DIR          where the five assets land, flat (default: dist/)
+  --build-dir DIR    the build/ tree to read rm2/bin/ and rm2fb/dist/
+                     from (default: build/ — what 'make build' and
+                     'make rm2fb' populate)
+  -h, --help         this help
 EOF
 }
 
@@ -66,9 +66,9 @@ BUILD_DIR=$REPO/build
 
 while [ $# -gt 0 ]; do
   case $1 in
-    --version)   [ $# -ge 2 ] || die "$1 needs a value"; VERSION=$2; shift ;;
-    --out)       [ $# -ge 2 ] || die "$1 needs a value"; OUT=$2; shift ;;
-    --build-dir) [ $# -ge 2 ] || die "$1 needs a value"; BUILD_DIR=$2; shift ;;
+    --version)   [ $# -ge 2 ] || die "--version needs a value — e.g. --version v0.3.0; omit --version entirely for 'dev'"; VERSION=$2; shift ;;
+    --out)       [ $# -ge 2 ] || die "--out needs a value — e.g. --out dist"; OUT=$2; shift ;;
+    --build-dir) [ $# -ge 2 ] || die "--build-dir needs a value — e.g. --build-dir build"; BUILD_DIR=$2; shift ;;
     -h|--help)   usage; exit 0 ;;
     *)           die "unknown argument '$1' — see tools/mkkit.sh --help" ;;
   esac
@@ -82,7 +82,17 @@ done
 # those, and --out is a real deliverable directory a caller may reuse
 # across runs (e.g. release.yml's dist/).
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT INT HUP TERM
+# EXIT alone just cleans up (the shell is already on its way out). INT,
+# HUP and TERM need their own traps that ALSO exit — a POSIX shell resumes
+# the script after a signal handler returns, and resuming into whatever
+# came next (with $T already deleted out from under it) is not what a
+# signal handler is for. 130/129/143 are the conventional 128+signal exit
+# codes (SIGINT=2, SIGHUP=1, SIGTERM=15), so a caller's $? still reports
+# which signal actually ended the run.
+trap 'rm -rf "$T"' EXIT
+trap 'rm -rf "$T"; exit 130' INT
+trap 'rm -rf "$T"; exit 129' HUP
+trap 'rm -rf "$T"; exit 143' TERM
 TREE=$T/redoku
 
 # ---- shared digest helper -------------------------------------------------
@@ -96,22 +106,28 @@ TREE=$T/redoku
 mkkit_digest() { # mkkit_digest <file> — prints its sha256 as lowercase hex
   _mkd_file=$1
   if command -v shasum >/dev/null 2>&1; then
-    _mkd_line=$(shasum -a 256 "$_mkd_file") || die "shasum failed on $_mkd_file"
+    _mkd_line=$(shasum -a 256 "$_mkd_file") || die "shasum failed on $_mkd_file — its own error is above"
     _mkd_hex=${_mkd_line%% *}
   elif command -v sha256sum >/dev/null 2>&1; then
-    _mkd_line=$(sha256sum "$_mkd_file") || die "sha256sum failed on $_mkd_file"
+    _mkd_line=$(sha256sum "$_mkd_file") || die "sha256sum failed on $_mkd_file — its own error is above"
     _mkd_hex=${_mkd_line%% *}
   elif command -v openssl >/dev/null 2>&1; then
     # shasum/sha256sum print "<hex>  <path>" (hex first field); openssl
     # prints "SHA2-256(<path>)= <hex>" (hex LAST field, and the label
     # before it differs between OpenSSL and LibreSSL) — one "first field"
     # rule can't cover both shapes.
-    _mkd_line=$(openssl dgst -sha256 "$_mkd_file") || die "openssl dgst failed on $_mkd_file"
+    _mkd_line=$(openssl dgst -sha256 "$_mkd_file") || die "openssl dgst failed on $_mkd_file — its own error is above"
     _mkd_hex=${_mkd_line##* }
   else
     die "no sha256 tool (shasum, sha256sum, or openssl) on this machine — install one and try again"
   fi
-  printf '%s\n' "$_mkd_hex" | tr 'A-F' 'a-f'
+  # [:upper:]/[:lower:] rather than the A-F/a-f range form: POSIX leaves
+  # range-expression collation locale-dependent, so A-F is not guaranteed
+  # portable everywhere tr runs, even though every one of the three tools
+  # above already emits lowercase and this line can only ever be a no-op
+  # in practice — which is exactly why it should be written the form that
+  # cannot misfire, not the form that happens to work here.
+  printf '%s\n' "$_mkd_hex" | tr '[:upper:]' '[:lower:]'
 }
 
 # ---- (1) assemble the §3.2 tree from build/rm2/bin/ and build/rm2fb/dist/
@@ -182,11 +198,14 @@ chmod +x "$STAMPED"
 
 # Stamp once, copy the stamped file to both destinations — so the (4) cmp
 # below cannot fail for the silly reason of two independent stamping runs
-# producing merely-equivalent-but-not-identical bytes.
-mkdir -p "$OUT"
-cp "$STAMPED" "$OUT/redoku"
+# producing merely-equivalent-but-not-identical bytes. ASSET_REDOKU is the
+# future $OUT/redoku, staged in $T like every other asset below — nothing
+# is written to --out until every assertion in this script has passed
+# (see the publish step at the very end).
+ASSET_REDOKU=$T/asset-redoku
+cp "$STAMPED" "$ASSET_REDOKU"
 cp "$STAMPED" "$TREE/bin/redoku"
-chmod +x "$OUT/redoku" "$TREE/bin/redoku"
+chmod +x "$ASSET_REDOKU" "$TREE/bin/redoku"
 
 printf '%s\n' "$VERSION" > "$TREE/VERSION"
 
@@ -208,36 +227,73 @@ ruby "$REPO/tools/mkdecoy.rb" --out "$TREE/build/decoy" >/dev/null || \
 
 DECOY_CHECK=$T/decoy-determinism-check
 ruby "$REPO/tools/mkdecoy.rb" --out "$DECOY_CHECK" >/dev/null || \
-  die "tools/mkdecoy.rb failed on its second (determinism-check) run into $DECOY_CHECK"
+  die "tools/mkdecoy.rb failed on its second (determinism-check) run into $DECOY_CHECK — re-run it directly for the full error: ruby $REPO/tools/mkdecoy.rb --out $DECOY_CHECK"
 
 diff -r "$TREE/build/decoy" "$DECOY_CHECK" >/dev/null || \
   die "tools/mkdecoy.rb produced different output on two runs into separate directories — the decoy is supposed to be byte-identical every time (DEFAULT_UUID/PAGE_UUID are fixed constants in tools/mkdecoy.rb). Compare $TREE/build/decoy and $DECOY_CHECK to see what changed."
 
 # ---- (4) cmp the standalone redoku against the in-tarball bin/redoku
 
-cmp "$OUT/redoku" "$TREE/bin/redoku" || \
-  die "internal error: $OUT/redoku and $TREE/bin/redoku differ — they were supposed to be the exact same stamped copy (see step 2 above)"
+cmp "$ASSET_REDOKU" "$TREE/bin/redoku" || \
+  die "internal error: $ASSET_REDOKU and $TREE/bin/redoku differ — they were supposed to be the exact same stamped copy (see step 2 above)"
 
-# ---- (5) emit redoku-rm2.tar.gz and both .sha256 files
+# ---- (5) emit redoku-rm2.tar.gz and both .sha256 files, staged in $T
 #
 # The tarball's single top-level entry is redoku/ (the consumer refuses
 # any entry not matching ^redoku/) — building it as `-C "$T" redoku`
 # rather than `-C "$TREE" .` is what guarantees that.
 
-say "packing $OUT/redoku-rm2.tar.gz"
-tar -czf "$OUT/redoku-rm2.tar.gz" -C "$T" redoku || \
-  die "tar failed building $OUT/redoku-rm2.tar.gz"
+say "packing redoku-rm2.tar.gz"
+ASSET_TARBALL=$T/asset-redoku-rm2.tar.gz
+tar -czf "$ASSET_TARBALL" -C "$T" redoku || \
+  die "tar failed building redoku-rm2.tar.gz — its own error is above; check that $T is writable and there's free disk space"
 
-printf '%s  redoku\n' "$(mkkit_digest "$OUT/redoku")" > "$OUT/redoku.sha256"
-printf '%s  redoku-rm2.tar.gz\n' "$(mkkit_digest "$OUT/redoku-rm2.tar.gz")" \
-  > "$OUT/redoku-rm2.tar.gz.sha256"
+ASSET_REDOKU_SHA256=$T/asset-redoku.sha256
+ASSET_TARBALL_SHA256=$T/asset-redoku-rm2.tar.gz.sha256
+printf '%s  redoku\n' "$(mkkit_digest "$ASSET_REDOKU")" > "$ASSET_REDOKU_SHA256"
+printf '%s  redoku-rm2.tar.gz\n' "$(mkkit_digest "$ASSET_TARBALL")" \
+  > "$ASSET_TARBALL_SHA256"
 
-# ---- (6) copy tools/install.sh out as the fifth asset
+# ---- (6) stage tools/install.sh as the fifth asset
 #
 # No install.sh.sha256 — design doc §3.1: you cannot verify the thing you
 # are already piping into a shell, and publishing a checksum that protects
 # nothing is worse than publishing none.
 
-cp "$REPO/tools/install.sh" "$OUT/install.sh"
+ASSET_INSTALL_SH=$T/asset-install.sh
+cp "$REPO/tools/install.sh" "$ASSET_INSTALL_SH"
+
+# ---- publish: nothing above touched --out. Every assertion in this
+# script — the six missing-input checks, the KIT_VERSION stamp, the decoy
+# determinism diff, the cmp above — has now passed, so this is the first
+# and only point where --out is written. A run that dies at any point
+# before this line leaves --out completely untouched: no fresh asset ever
+# sits beside a stale one from an earlier run (design doc §3.4: "failing
+# any assertion fails the build").
+mkdir -p "$OUT"
+cp "$ASSET_INSTALL_SH"     "$OUT/install.sh"
+cp "$ASSET_REDOKU"         "$OUT/redoku"
+cp "$ASSET_REDOKU_SHA256"  "$OUT/redoku.sha256"
+cp "$ASSET_TARBALL"        "$OUT/redoku-rm2.tar.gz"
+cp "$ASSET_TARBALL_SHA256" "$OUT/redoku-rm2.tar.gz.sha256"
+chmod +x "$OUT/redoku"
+
+# Audit --out itself, not just what this run staged: a stale file already
+# sitting in --out from an unrelated earlier run (a hand-planted
+# install.sh.sha256, a leftover from a different --version) must fail a
+# build that would otherwise look completely successful — "no sixth
+# asset" is part of the §3.1 contract, not just something the test suite
+# happens to check in a directory it always starts empty.
+OUT_EXPECTED='install.sh
+redoku
+redoku-rm2.tar.gz
+redoku-rm2.tar.gz.sha256
+redoku.sha256'
+OUT_ACTUAL=$(find "$OUT" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
+[ "$OUT_ACTUAL" = "$OUT_EXPECTED" ] || \
+  die "internal error: $OUT holds unexpected contents after what should have been a clean build.
+  expected exactly: install.sh redoku redoku.sha256 redoku-rm2.tar.gz redoku-rm2.tar.gz.sha256
+  actually found:   $(printf '%s' "$OUT_ACTUAL" | tr '\n' ' ')
+  Remove any stale files from $OUT (e.g. left over from an earlier or unrelated run) and re-run."
 
 say "done — five assets in $OUT: install.sh redoku redoku.sha256 redoku-rm2.tar.gz redoku-rm2.tar.gz.sha256"

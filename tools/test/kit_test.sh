@@ -266,6 +266,16 @@ STUBEOF
 # the padding in between and after — not a hand-counted single printf
 # string, which is exactly the kind of off-by-one that is invisible on
 # sight and only shows up as is_arm_elf inexplicably failing.
+#
+# Self-checked on every call, not just trusted to have worked: this file
+# is explicitly load-bearing for a LATER task (pick_artifact / is_arm_elf
+# there select only files that check out as 32-bit ARM), so a shell whose
+# printf mishandles or truncates the octal escapes above must fail LOUDLY
+# here, not surface three tasks from now as a mysterious is_arm_elf
+# rejection nobody can explain. The check re-reads the same two offsets
+# bin/redoku's own is_arm_elf reads (dd + od -An -tx1, the same technique
+# its _hex_at helper uses) — an independent re-derivation of "did this
+# actually come out right", not a trust-the-loop-above assumption.
 make_fake_arm_elf() {
   _mfae_path=$1
   mkdir -p "$(dirname -- "$_mfae_path")" || \
@@ -276,6 +286,16 @@ make_fake_arm_elf() {
     printf '\050\000'                     # offset 18-19: e_machine = EM_ARM (LE)
     dd if=/dev/zero bs=1 count=44 2>/dev/null   # offset 20-63: padding to 64 bytes
   } > "$_mfae_path" || die "make_fake_arm_elf: write $_mfae_path failed"
+
+  _mfae_size=$(wc -c < "$_mfae_path" | tr -d '[:space:]')
+  [ "$_mfae_size" -ge 64 ] || \
+    die "make_fake_arm_elf: $_mfae_path is $_mfae_size bytes, expected >= 64 — this shell's printf may have mishandled the octal escapes above"
+  _mfae_magic=$(dd if="$_mfae_path" bs=1 skip=0 count=5 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  [ "$_mfae_magic" = 7f454c4601 ] || \
+    die "make_fake_arm_elf: $_mfae_path has $_mfae_magic at offset 0-4, expected 7f454c4601 — bin/redoku's is_arm_elf would reject this file"
+  _mfae_machine=$(dd if="$_mfae_path" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  [ "$_mfae_machine" = 2800 ] || \
+    die "make_fake_arm_elf: $_mfae_path has $_mfae_machine at offset 18-19, expected 2800 — bin/redoku's is_arm_elf would reject this file"
 }
 
 # ---- the fixture-release builder ---------------------------------------
@@ -889,9 +909,12 @@ test_mkkit_stamp_landed() {
     die "test_mkkit_stamp_landed: tar -x failed"
 
   _cli=$_extract/redoku/bin/redoku
-  if grep -qx 'KIT_VERSION=v0.5.2' "$_cli"; then _stamped=0; else _stamped=1; fi
+  # -F (fixed string), matching mkkit.sh's own grep -qxF for this exact
+  # check: without it, the '.'s in "v0.5.2" are BRE wildcards, so e.g.
+  # "KIT_VERSION=v0X5X2" would satisfy this pattern too.
+  if grep -qxF 'KIT_VERSION=v0.5.2' "$_cli"; then _stamped=0; else _stamped=1; fi
   assert_eq 0 "$_stamped" "stamp: redoku/bin/redoku contains the line KIT_VERSION=v0.5.2" || return 1
-  if grep -qx 'KIT_VERSION=dev' "$_cli"; then _still_dev=1; else _still_dev=0; fi
+  if grep -qxF 'KIT_VERSION=dev' "$_cli"; then _still_dev=1; else _still_dev=0; fi
   assert_eq 0 "$_still_dev" "stamp: redoku/bin/redoku no longer contains KIT_VERSION=dev" || return 1
 }
 
@@ -934,6 +957,120 @@ test_mkkit_missing_input_names_file() {
     "mkkit missing input: message names the make target that produces it" || return 1
 }
 
+# Regression test for the review's IMPORTANT finding: a stale file already
+# sitting in --out from an unrelated earlier run (planted here exactly as
+# the reviewer constructed it: a hand-written install.sh.sha256, which
+# mkkit.sh itself never emits) must fail an otherwise-clean build, not
+# ship silently as a sixth asset beside the real five.
+test_mkkit_stale_sixth_asset_fails() {
+  _w=$(mktemp -d "$ROOT/mkkit-stale.XXXXXX")
+  build_fake_kit_inputs "$_w/build"
+  _out=$_w/out
+  mkdir -p "$_out"
+  printf 'bogus\n' > "$_out/install.sh.sha256"
+
+  assert_fails "mkkit stale sixth asset: exits non-zero despite an otherwise-clean build" -- \
+    "$KIT_SH" "$REPO/tools/mkkit.sh" --version v0.2.0 --out "$_out" --build-dir "$_w/build" || return 1
+
+  assert_contains "$ASSERT_OUTPUT" "unexpected contents" \
+    "mkkit stale sixth asset: message says --out holds unexpected contents" || return 1
+  assert_contains "$ASSERT_OUTPUT" "install.sh.sha256" \
+    "mkkit stale sixth asset: message names the stale file found" || return 1
+}
+
+# ---- find_game tests (bin/redoku, both KIT_VERSION branches) ------------
+#
+# find_game's two GAME_WHY messages became conditional on KIT_VERSION in
+# this task (bin/redoku), and until now nothing tested either branch —
+# confirmed with `grep -rn "cross-build it with"` over the repo, which
+# returns only bin/redoku itself and the design doc. The kit-mode branch
+# is the one an actual end user hits (a corrupt or partial download), and
+# had zero coverage. Both get a dedicated test here.
+#
+# Each test compares a SINGLE grep'd line ("^ERROR: no game binary") for
+# EXACT equality against the full expected message, not a substring
+# check: find_game's contract requires GAME_WHY stay one line, because
+# both callers print it as a single indented continuation line. die()'s
+# printf would still emit an embedded newline verbatim if GAME_WHY ever
+# grew one — grep would then only capture the truncated first physical
+# line, and the exact-equality assertion below would fail against the
+# full expected string. So this one assertion proves both the message's
+# CONTENT and its single-line-ness; a substring assert_contains would
+# have proven neither reliably.
+
+# build_fake_checkout <dir> — a throwaway KIT_VERSION=dev checkout: this
+# repo's own bin/redoku (unmodified), device/*, tools/mkdecoy.rb, and NO
+# build/ tree at all — so find_game's "no game binary" branch fires
+# without ever touching this repo's REAL build/ (which may hold a real
+# cross-compiled game binary a developer built earlier; deleting or
+# moving it would be destructive and is not this suite's place to do).
+build_fake_checkout() {
+  _bfc_dir=$1
+  mkdir -p "$_bfc_dir/bin" "$_bfc_dir/device" "$_bfc_dir/tools"
+  cp "$REPO/bin/redoku" "$_bfc_dir/bin/redoku"
+  chmod +x "$_bfc_dir/bin/redoku"
+  cp "$REPO/device/install.sh" "$_bfc_dir/device/install.sh"
+  cp "$REPO/device/uninstall.sh" "$_bfc_dir/device/uninstall.sh"
+  cp "$REPO/device/redoku-watcher.service" "$_bfc_dir/device/redoku-watcher.service"
+  cp "$REPO/tools/mkdecoy.rb" "$_bfc_dir/tools/mkdecoy.rb"
+}
+
+test_find_game_checkout_mode_message() {
+  _w=$(mktemp -d "$ROOT/findgame-checkout.XXXXXX")
+  build_fake_checkout "$_w/checkout"
+  _checkout_repo=$(CDPATH= cd -- "$_w/checkout" && pwd) || \
+    die "test_find_game_checkout_mode_message: cd failed"
+
+  # 'play' calls find_game before anything else and dies with $GAME_WHY —
+  # no device, no network, reached instantly.
+  assert_fails "find_game checkout-mode: play dies with GAME_WHY" -- \
+    "$KIT_SH" "$_w/checkout/bin/redoku" play --dry-run --host 127.0.0.1 || return 1
+
+  _expected="ERROR: no game binary at $_checkout_repo/build/rm2/bin/redoku — cross-build it with:  make build"
+  _actual=$(printf '%s\n' "$ASSERT_OUTPUT" | grep '^ERROR: no game binary')
+  assert_eq "$_expected" "$_actual" \
+    "find_game checkout-mode: byte-identical legacy message, proven single-line" || return 1
+  # "make build" is the needle for checkout-mode: it never appears in the
+  # kit-mode branch's wording.
+  assert_contains "$ASSERT_OUTPUT" "make build" \
+    "find_game checkout-mode: names the fix, make build" || return 1
+}
+
+test_find_game_kit_mode_message() {
+  _w=$(mktemp -d "$ROOT/findgame-kit.XXXXXX")
+  build_fake_kit_inputs "$_w/build"
+  _out=$_w/out
+
+  "$KIT_SH" "$REPO/tools/mkkit.sh" --version v0.9.9 --out "$_out" --build-dir "$_w/build" \
+    >/dev/null || die "test_find_game_kit_mode_message: mkkit.sh failed"
+
+  _extract=$_w/extract
+  mkdir -p "$_extract"
+  tar -xzf "$_out/redoku-rm2.tar.gz" -C "$_extract" || \
+    die "test_find_game_kit_mode_message: tar -x failed"
+  # The reviewer's exact scenario: a real, extracted fixture kit, missing
+  # its game binary — a corrupt or partial download, not a missing build
+  # step, which is precisely why the message must differ from checkout
+  # mode's.
+  rm -f "$_extract/redoku/build/rm2/bin/redoku"
+
+  _kit_repo=$(CDPATH= cd -- "$_extract/redoku" && pwd) || \
+    die "test_find_game_kit_mode_message: cd failed"
+
+  assert_fails "find_game kit-mode: play dies with GAME_WHY" -- \
+    "$KIT_SH" "$_extract/redoku/bin/redoku" play --dry-run --host 127.0.0.1 || return 1
+
+  _expected="ERROR: no game binary at $_kit_repo/build/rm2/bin/redoku — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+  _actual=$(printf '%s\n' "$ASSERT_OUTPUT" | grep '^ERROR: no game binary')
+  assert_eq "$_expected" "$_actual" \
+    "find_game kit-mode: exact message, proven single-line" || return 1
+  # "redoku upgrade" is the needle for kit-mode: unlike a bare "redoku"
+  # substring (present all over this output — the binary's own name),
+  # this exact two-word phrase never appears in the checkout-mode branch.
+  assert_contains "$ASSERT_OUTPUT" "redoku upgrade" \
+    "find_game kit-mode: names the fix, redoku upgrade" || return 1
+}
+
 # ---- main -----------------------------------------------------------------
 
 TESTS='
@@ -960,6 +1097,12 @@ test_mkkit_version_file
 test_mkkit_stamp_landed
 test_mkkit_checksums_verify
 test_mkkit_missing_input_names_file
+test_mkkit_stale_sixth_asset_fails
+'
+
+FIND_GAME_TESTS='
+test_find_game_checkout_mode_message
+test_find_game_kit_mode_message
 '
 
 for KIT_SH in $KIT_SHELLS; do
@@ -972,6 +1115,13 @@ done
 for KIT_SH in $KIT_SHELLS; do
   printf '=== mkkit.sh tests under KIT_SH=%s ===\n' "$KIT_SH"
   for _t in $MKKIT_TESTS; do
+    run_test "$_t"
+  done
+done
+
+for KIT_SH in $KIT_SHELLS; do
+  printf '=== find_game tests under KIT_SH=%s ===\n' "$KIT_SH"
+  for _t in $FIND_GAME_TESTS; do
     run_test "$_t"
   done
 done
