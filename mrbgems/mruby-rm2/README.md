@@ -70,7 +70,8 @@ busy-spin.
 RM2::Control.clients        # => [{pid: 1232, active: true, name: "xochitl"}, ...]
 RM2::Control.switch_to(pid) # hand the panel to another client
 
-RM2.setup_signals           # SIGTERM/SIGINT -> RM2.terminated?, SIGCONT -> RM2.resumed?
+RM2.setup_signals           # SIGTERM/SIGINT -> RM2.terminated?, SIGCONT -> RM2.resumed?,
+                             # SIGHUP -> RM2.reload?
 RM2.monotonic_ms            # ms on a clock that never steps; differences only
 ```
 
@@ -96,13 +97,77 @@ counts awake milliseconds, not wall time.
 `terminated?` is sticky — once the process has been asked to quit it stays
 true. `resumed?` is consumed on read: each SIGCONT is reported exactly once,
 which is the cue to repaint everything rather than trust what is on the
-panel. Handlers are installed without `SA_RESTART`, so a signal cuts a
-blocking `RM2::Input.wait` short and the event loop gets a turn to look at
-the flags. `setup_signals` also ignores SIGPIPE, so a dead server surfaces as
-a `SystemCallError` from the next `#update` instead of killing the process.
+panel. `reload?` is consumed on read the same way, and for the same reason:
+unlike "asked to quit," "config changed" is not a fact that becomes
+permanently true the first time it happens — a daemon that gets SIGHUP twice
+must re-read twice. It has nothing to do with a display client's own
+lifecycle; it exists for the hijack watcher (`redoku --watch`, PLAN.md §10),
+which has no controlling terminal to hang up and repurposes SIGHUP the
+conventional daemon way, "re-read your config." Handlers are installed
+without `SA_RESTART`, so a signal cuts a blocking `RM2::Input.wait` (or
+`RM2::Inotify#wait`) short and the event loop gets a turn to look at the
+flags. `setup_signals` also ignores SIGPIPE, so a dead server surfaces as a
+`SystemCallError` from the next `#update` instead of killing the process.
+
+```ruby
+iw = RM2::Inotify.init
+wd = iw.watch('/home/.../decoy.pdf', RM2::Inotify::IN_OPEN)
+while iw.wait(1000)             # real poll, timeout paces the loop
+  iw.read_events.each do |wd, mask, cookie, name|
+    next unless (mask & RM2::Inotify::IN_OPEN) != 0
+    RM2.spawn_detached('/home/root/redoku/bin/redoku')
+  end
+end
+```
+
+`RM2::Inotify` is the hijack watcher's other half: `.init` opens an
+`inotify_init1(IN_CLOEXEC | IN_NONBLOCK)` fd (CLOEXEC so a spawned game never
+inherits the watch; NONBLOCK so `#read_events` can never park the watcher's
+one thread), `#watch(path, mask)` adds a watch and returns its watch
+descriptor, and `#read_events` decodes every pending `struct inotify_event`
+into `[wd, mask, cookie, name]` arrays — `name` is `""` for a watch on a file
+directly (no child to name) and the child's basename for a watch on a
+directory. It never raises for "nothing happened yet": with no fd data
+ready it returns `[]`. `#wait(timeout_ms)` is a real `poll()` with a
+timeout, the same EINTR-returns-false/timeout-validation pattern as
+`RM2::Input.wait`, scoped to the one fd an `Inotify` owns (a watcher never
+needs to wait on several at once, unlike `Input`'s pen-and-touch pair).
+Mask constants live on the class: `IN_OPEN`, `IN_CLOSE_WRITE`, `IN_MODIFY`,
+`IN_Q_OVERFLOW`, `IN_IGNORED`, `IN_DELETE_SELF`, `IN_MOVE_SELF` — the exact
+literal `<sys/inotify.h>` values, stable kernel-userspace ABI, so a mask read
+back from `#read_events` can be decoded into names without hardcoding
+numbers. `IN_OPEN` (on the decoy's `.pdf`) and `IN_CLOSE_WRITE` (on its
+`.metadata`, for a `lastOpened` write) are both exposed because which one
+xochitl actually fires is a hardware fact this gem cannot verify — see
+PLAN.md §10.
+
+```ruby
+pid = RM2.spawn_detached('/home/root/redoku/bin/redoku')
+```
+
+`RM2.spawn_detached(path, *argv)` launches `path` as a process that survives
+whatever happens to its caller's process group — the primitive the hijack
+watcher uses to start the game, because `IO.popen` (mruby's only built-in
+spawn primitive) leaves its child in the parent's process group, and the
+server SIGSTOPs the whole process group of any display client it demotes; a
+game spawned that way would freeze the watcher along with itself the first
+time it lost focus. A double fork (`caller -> intermediate -> setsid() ->
+grandchild -> exec`) puts the grandchild in a session and process group of
+its own before anything execs, and returns the grandchild's pid. It never
+leaves a zombie: the short-lived intermediate is `waitpid()`-reaped inside
+the call, and the grandchild — never the caller's own child — is reparented
+to init the instant the intermediate exits. If `execv` fails, the call
+raises `SystemCallError` with the child's own `errno`, carried back across
+the fork by a pipe closed on successful exec (`FD_CLOEXEC`) and written to
+on failure — the caller finds out; it does not silently spawn nothing.
+Stdio is left exactly as inherited, so a systemd-run watcher's journald
+capture also covers whatever the spawned process prints.
 
 Tests run against a fake protocol server (`test/fake_server.c`, forked by
 mrbtest via the `mrb_mruby_rm2_gem_test` hook) — see `test/display.rb`. The
 control socket has its own independent fake in the same file
-(`start_control`/`stop_control`) — see `test/control.rb`.
+(`start_control`/`stop_control`) — see `test/control.rb`. `RM2::Inotify` and
+`RM2.spawn_detached` need no fake: both are exercised against the real
+kernel facility inside the Docker test container (Linux either way) — see
+`test/inotify.rb` and `test/spawn.rb`.
 Protocol reference: `PLAN.md` §3 in the repo root.
