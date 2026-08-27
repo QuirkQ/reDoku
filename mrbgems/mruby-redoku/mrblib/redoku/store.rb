@@ -24,13 +24,37 @@ module Redoku
   # mrb_str_new_cstr for SQLITE_TEXT), so a binary encoding could not
   # round-trip through it.
   #
+  # Schema v4 carries no DDL change at all: it exists purely to repair the
+  # timestamps every v1..v3 build corrupted (see EPOCH_FLOOR and
+  # repair_stamps). A version bump is the right mechanism even so, because
+  # the repair must run exactly once per file rather than on every open.
+  #
   # Caps keep a pathological session from bloating the file for ever:
   # STROKES_CAP rows per game (oldest dropped, logged) and MAX_STROKE_POINTS
   # recorded points per stroke (App stops recording past it; live ink keeps
   # flowing either way).
   class Store
-    VERSION = 3
+    VERSION = 4
     MANUAL_CAP = 50
+
+    # The earliest stamp this schema could honestly have written: 2026-08-25
+    # 00:00:00 UTC, the day the games table was born (schema v1, commit
+    # 4b851e2). A row cannot predate the code that inserted it, so anything
+    # below this line is IMPOSSIBLE rather than merely old — which is what
+    # makes it a safe test for corruption instead of a guess.
+    #
+    # It exists because every v1..v3 build wrote garbage here. mruby's
+    # SQLite binding used the immediate-only integer accessors, so under
+    # MRB_WORD_BOXING on the 32-bit device every epoch (~1.79e9, past the
+    # 1_073_741_823 immediate ceiling) went into the file as half a heap
+    # ADDRESS — see mrbgems/mruby-sqlite3/README.md. Saved games listed as
+    # 1970. The v3 -> v4 migration (repair_stamps) restamps what it finds
+    # below the line.
+    #
+    # A device whose clock had not synced yet would also land below it, and
+    # wants exactly the same treatment, so the test is deliberately about
+    # the VALUE and not about the schema version that wrote it.
+    EPOCH_FLOOR = 1_787_616_000
     STROKES_CAP = 2000
     MAX_STROKE_POINTS = 2048
 
@@ -473,7 +497,64 @@ module Redoku
       # the ALTER on those would raise "duplicate column name".
       @db.exec('ALTER TABLE strokes ADD COLUMN retired INTEGER NOT NULL ' \
                'DEFAULT 0') if version == 2
+      # v4 repairs the timestamps v1..v3 corrupted. Gated on `existed`
+      # because a file this process just created has no rows to repair, and
+      # on `version < VERSION` because it is a one-time migration, not a
+      # per-launch scan — a query on every open would cost the launch path
+      # a table walk for ever to catch a bug that cannot recur.
+      repair_stamps if existed && version < VERSION
       @db.exec('PRAGMA user_version = ' + VERSION.to_s)
+    end
+
+    # Restamps every timestamp below EPOCH_FLOOR. The true times are GONE —
+    # the number stored was a pointer, not a clock — so this reconstructs the
+    # one fact still knowable: rowids are monotonic, so id order IS save
+    # order. Rows are restamped from the floor UPWARD in id order, which
+    # buys two things a simpler choice does not:
+    #
+    #   * they keep their relative sequence, so the GAMES list still reads
+    #     oldest-to-newest among them;
+    #   * they sort BELOW every correctly stamped save. That is not a
+    #     cosmetic preference but a fact: a corrupted row was necessarily
+    #     written by a pre-v4 build, therefore before any row a fixed build
+    #     wrote. Restamping to Time.now instead — the obvious first
+    #     instinct — would claim these are the NEWEST saves and put them
+    #     permanently at the top of the list, wrong from the first save
+    #     after the upgrade onward.
+    #
+    # A column that is already a plausible epoch is left alone (the CASE),
+    # so a file that was only half corrupt keeps the half that was fine.
+    #
+    # Failure is logged and swallowed, per this class's prime directive: a
+    # cosmetically wrong date must never be the reason the game will not
+    # start. The version bump goes ahead either way — retrying a repair that
+    # cannot succeed would just log on every launch for ever.
+    def repair_stamps
+      ids = @db.execute(
+        'SELECT id FROM games WHERE created_at < ? OR updated_at < ? ' \
+        'ORDER BY id ASC', [EPOCH_FLOOR, EPOCH_FLOOR]).map { |r| r[0] }
+      inked = @db.execute(
+        'SELECT COUNT(*) FROM strokes WHERE created_at < ?',
+        [EPOCH_FLOOR])[0][0]
+      return if ids.empty? && inked == 0
+      ids.each_with_index do |id, i|
+        stamp = EPOCH_FLOOR + i
+        @db.execute(
+          'UPDATE games SET ' \
+          'created_at = CASE WHEN created_at < ? THEN ? ELSE created_at END, ' \
+          'updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END ' \
+          'WHERE id = ?',
+          [EPOCH_FLOOR, stamp, EPOCH_FLOOR, stamp, id])
+      end
+      # Nothing reads a stroke's created_at (the journal orders by seq, id),
+      # so one blanket UPDATE is enough here — there is no order to preserve.
+      @db.execute('UPDATE strokes SET created_at = ? WHERE created_at < ?',
+                  [EPOCH_FLOOR, EPOCH_FLOOR]) if inked > 0
+      log_line('repaired ' + ids.size.to_s + ' saved-game and ' +
+               inked.to_s + ' stroke timestamp(s) that a pre-v4 build wrote' \
+               ' corrupted; their real times could not be recovered')
+    rescue StandardError => e
+      log_line('could not repair corrupted timestamps (' + e.message + ')')
     end
 
     def read_version

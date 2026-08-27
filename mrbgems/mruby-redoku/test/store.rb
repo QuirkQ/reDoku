@@ -615,6 +615,40 @@ V2_SCHEMA_SQL = <<~SQL
   CREATE INDEX IF NOT EXISTS idx_strokes_game ON strokes(game_id, seq);
 SQL
 
+# V3_SCHEMA_SQL is v3 as shipped in f87b7f8 + the `retired` column. v4 adds
+# no DDL of its own — it is a data repair (Store#repair_stamps) — so this is
+# byte-for-byte what Store::SCHEMA_SQL holds today. It is still pinned by
+# hand on purpose: the moment v5 changes the DDL, a v3 fixture built from
+# the live SCHEMA_SQL would stop being a v3 fixture and the migration
+# assertion below would quietly test nothing.
+V3_SCHEMA_SQL = <<~SQL
+  PRAGMA synchronous = FULL;
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE IF NOT EXISTS games (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT    NOT NULL CHECK (kind IN ('autosave','manual')),
+    difficulty    TEXT    NOT NULL,
+    achieved_tier TEXT    NOT NULL,
+    givens        TEXT    NOT NULL,
+    entries       TEXT    NOT NULL,
+    solution      TEXT    NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_games_updated ON games(updated_at DESC);
+  CREATE TABLE IF NOT EXISTS strokes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    color      INTEGER NOT NULL,
+    width      INTEGER NOT NULL,
+    pts        TEXT    NOT NULL,
+    retired    INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_strokes_game ON strokes(game_id, seq);
+SQL
+
 assert('journal_stroke returns the row id it wrote') do
   path = store_db('journal_id')
   remove_store_db(path)
@@ -677,7 +711,7 @@ assert('retire_strokes and delete_strokes tolerate an empty list') do
   remove_store_db(path)
 end
 
-assert('a v2 file migrates to v3 with every stroke still live') do
+assert('a v2 file migrates to the current schema, every stroke still live') do
   path = store_db('v2_to_v3')
   remove_store_db(path)
 
@@ -686,7 +720,9 @@ assert('a v2 file migrates to v3 with every stroke still live') do
   db = SQLite3::Database.open(path)
   db.exec(V2_SCHEMA_SQL) # pinned copy, see above
   db.exec('PRAGMA user_version = 2')
-  now = 1_700_000_000
+  # A VALID epoch: above Store::EPOCH_FLOOR, so the v4 repair leaves it
+  # alone and this assertion stays about strokes surviving the migration.
+  now = 1_787_700_000
   db.execute('INSERT INTO games (kind, difficulty, achieved_tier, givens, ' \
              'entries, solution, created_at, updated_at) VALUES ' \
              "('autosave','easy','easy',?,?,?,?,?)",
@@ -697,7 +733,7 @@ assert('a v2 file migrates to v3 with every stroke still live') do
   db.close
 
   store = Redoku::Store.open(path, log: nil)
-  assert_equal 3, store.instance_variable_get(:@db)
+  assert_equal Redoku::Store::VERSION, store.instance_variable_get(:@db)
                        .execute('PRAGMA user_version')[0][0]
   got = store.strokes(gid)
   assert_equal 1, got.size            # survived the migration
@@ -707,7 +743,76 @@ assert('a v2 file migrates to v3 with every stroke still live') do
   remove_store_db(path)
 end
 
-assert('a v1 file migrates straight to v3') do
+# --- schema v4: repairing the timestamps v1..v3 corrupted. The numbers in
+# this fixture are REAL ones lifted off a device that ran a v3 build: the
+# SQLite binding wrote half a heap address instead of the epoch, so
+# format_stamp rendered them as 1970 (13_920_630 is 1970-06-11 02:50).
+assert('a v3 file has its corrupted timestamps repaired, in save order') do
+  path = store_db('v3_stamp_repair')
+  remove_store_db(path)
+
+  db = SQLite3::Database.open(path)
+  db.exec(V3_SCHEMA_SQL) # pinned copy, see above
+  db.exec('PRAGMA user_version = 3')
+  # Inserted OLDEST first, so id order is save order — the only chronology
+  # the repair can still recover. The garbage deliberately does NOT ascend
+  # with id (heap addresses have no reason to), which is exactly why the
+  # repair must go by id and not by the corrupt value.
+  [[1_580_950, 1_580_950], [3_332_806, 13_920_630]].each do |c, u|
+    db.execute('INSERT INTO games (kind, difficulty, achieved_tier, givens, ' \
+               'entries, solution, created_at, updated_at) VALUES ' \
+               "('manual','easy','easy',?,?,?,?,?)",
+               ['.' * 81, '.' * 81, '1' * 81, c, u])
+  end
+  # A row whose stamps are already fine must survive untouched.
+  good = 1_787_700_000
+  db.execute('INSERT INTO games (kind, difficulty, achieved_tier, givens, ' \
+             'entries, solution, created_at, updated_at) VALUES ' \
+             "('autosave','easy','easy',?,?,?,?,?)",
+             ['.' * 81, '.' * 81, '1' * 81, good, good])
+  gid = db.last_insert_rowid
+  db.execute('INSERT INTO strokes (game_id, seq, color, width, pts, ' \
+             'created_at, retired) VALUES (?,1,96,3,?,?,0)',
+             [gid, '10,10 20,20', 1_580_740])
+  db.close
+
+  store = Redoku::Store.open(path, log: nil)
+  floor = Redoku::Store::EPOCH_FLOOR
+  rows = store.instance_variable_get(:@db).execute(
+    'SELECT id, created_at, updated_at FROM games ORDER BY id ASC')
+
+  # Restamped from the floor upward, in id order: sequence preserved...
+  assert_equal [1, floor, floor], rows[0]
+  assert_equal [2, floor + 1, floor + 1], rows[1]
+  # ...and the already-valid row untouched, above them both.
+  assert_equal [3, good, good], rows[2]
+  # ...which is the point: the repaired rows sort BELOW every good save.
+  assert_true rows[0][2] < good && rows[1][2] < good
+
+  # Every stamp in the file is now a plausible epoch.
+  assert_equal 0, store.instance_variable_get(:@db).execute(
+    'SELECT COUNT(*) FROM games WHERE created_at < ? OR updated_at < ?',
+    [floor, floor])[0][0]
+  assert_equal 0, store.instance_variable_get(:@db).execute(
+    'SELECT COUNT(*) FROM strokes WHERE created_at < ?', [floor])[0][0]
+
+  # The repair is data-only: the ink it belongs to is still there and live.
+  assert_equal 1, store.strokes(gid).size
+  assert_equal Redoku::Store::VERSION, store.instance_variable_get(:@db)
+                                            .execute('PRAGMA user_version')[0][0]
+  store.close
+
+  # Idempotent across a reopen: at v4 the migration must not run again, and
+  # must certainly not walk the good stamps down to the floor.
+  store = Redoku::Store.open(path, log: nil)
+  again = store.instance_variable_get(:@db).execute(
+    'SELECT id, created_at, updated_at FROM games ORDER BY id ASC')
+  assert_equal rows, again
+  store.close
+  remove_store_db(path)
+end
+
+assert('a v1 file migrates straight to the current schema') do
   path = store_db('v1_to_v3')
   remove_store_db(path)
   db = SQLite3::Database.open(path)
@@ -715,7 +820,7 @@ assert('a v1 file migrates straight to v3') do
   db.exec('PRAGMA user_version = 1')
   db.close
   store = Redoku::Store.open(path, log: nil)
-  assert_equal 3, store.instance_variable_get(:@db)
+  assert_equal Redoku::Store::VERSION, store.instance_variable_get(:@db)
                        .execute('PRAGMA user_version')[0][0]
   # The strokes table was CREATEd fresh, so it already has `retired` and
   # needs no ALTER — the migration must not run one and must not raise.
@@ -724,11 +829,14 @@ assert('a v1 file migrates straight to v3') do
   remove_store_db(path)
 end
 
-assert('a version ABOVE v3 is still quarantined') do
-  path = store_db('v4')
+assert('a version ABOVE the current schema is still quarantined') do
+  path = store_db('above_current')
   remove_store_db(path)
   db = SQLite3::Database.open(path)
-  db.exec('PRAGMA user_version = 4')
+  # VERSION + 1, derived: this assertion is about "one past what we know how
+  # to read", and hardcoding it made the next schema bump silently turn it
+  # into a test that the CURRENT version gets quarantined.
+  db.exec('PRAGMA user_version = ' + (Redoku::Store::VERSION + 1).to_s)
   db.close
   store = Redoku::Store.open(path, log: nil)
   assert_true Dir.entries(File.dirname(path))

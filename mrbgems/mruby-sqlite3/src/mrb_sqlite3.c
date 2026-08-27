@@ -110,7 +110,16 @@ bind_values(mrb_state* mrb, sqlite3* db, sqlite3_stmt* stmt, int argc, mrb_value
       rv = sqlite3_bind_text(stmt, i+1, RSTRING_PTR(argv[i]), RSTRING_LEN(argv[i]), NULL);
       break;
     case MRB_TT_FIXNUM:
-      rv = sqlite3_bind_int64(stmt, i+1, mrb_fixnum(argv[i]));
+      /* reDoku edit: mrb_integer, NOT mrb_fixnum. mruby defaults to
+       * MRB_WORD_BOXING, which packs an Integer into the mrb_value word
+       * behind a 1-bit tag, so the immediate range is MRB_FIXNUM_MAX =
+       * INT32_MAX >> 1 (1_073_741_823) on the 32-bit armv7 device. Past
+       * that line mruby allocates an RInteger on the heap and the word
+       * holds a POINTER; mrb_fixnum() shifts it anyway and yields half an
+       * address. A Unix epoch (~1.79e9) is past the line, which is how
+       * saved games came back stamped 1970. mrb_integer() checks
+       * mrb_immediate_p() first and reads the boxed value properly. */
+      rv = sqlite3_bind_int64(stmt, i+1, mrb_integer(argv[i]));
       break;
     case MRB_TT_FLOAT:
       rv = sqlite3_bind_double(stmt, i+1, mrb_float(argv[i]));
@@ -146,7 +155,11 @@ row_to_value(mrb_state* mrb, sqlite3_stmt* stmt) {
     case SQLITE_INTEGER:
       {
         sqlite3_int64 value = sqlite3_column_int64(stmt, i);
-        mrb_ary_push(mrb, a, mrb_fixnum_value((mrb_int) value));
+        /* reDoku edit: mrb_int_value, NOT mrb_fixnum_value — the read half
+         * of the same defect. mrb_fixnum_value() re-tags the word with no
+         * range check, so a value past MRB_FIXNUM_MAX comes back with its
+         * top bit gone even when the column holds it correctly. */
+        mrb_ary_push(mrb, a, mrb_int_value(mrb, (mrb_int) value));
       }
       break;
     case SQLITE_FLOAT:
@@ -327,7 +340,8 @@ mrb_sqlite3_database_execute_batch(mrb_state *mrb, mrb_value self) {
     }
   }
   free(top);
-  return mrb_fixnum_value(sqlite3_changes(db->db));
+  /* reDoku edit: mrb_int_value — see bind_values. */
+  return mrb_int_value(mrb, sqlite3_changes(db->db));
 }
 
 static mrb_value
@@ -360,7 +374,10 @@ mrb_sqlite3_database_last_insert_rowid(mrb_state *mrb, mrb_value self) {
   if (!db) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid argument");
   }
-  return mrb_fixnum_value((mrb_int) sqlite3_last_insert_rowid(db->db));
+  /* reDoku edit: mrb_int_value — see bind_values. A rowid is the id Store
+   * hangs the stroke journal off, so a silently mangled one would attach
+   * ink to the wrong game rather than merely misdate it. */
+  return mrb_int_value(mrb, (mrb_int) sqlite3_last_insert_rowid(db->db));
 }
 
 static mrb_value
@@ -371,7 +388,8 @@ mrb_sqlite3_database_changes(mrb_state *mrb, mrb_value self) {
   if (!db) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid argument");
   }
-  return mrb_fixnum_value(sqlite3_changes(db->db));
+  /* reDoku edit: mrb_int_value — see bind_values. */
+  return mrb_int_value(mrb, sqlite3_changes(db->db));
 }
 
 static mrb_value
