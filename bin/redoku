@@ -123,6 +123,8 @@ FETCH_TAG=
 FETCH_TREE=
 FETCH_BASE=
 FETCH_TMP=
+FETCH_LAYOUT=
+FETCH_TARGET=
 SHA256_TOOL=
 
 say()  { printf '==> %s\n' "$*"; }
@@ -189,7 +191,7 @@ options:
   -h, --help              this help
 
 environment:
-  REDOKU_HOME             kit root, same as --kit DIR   (default: ~/.redoku)
+  REDOKU_HOME             kit root, same as --kit DIR   (no default — see --kit)
   REDOKU_BIN_DIR          PATH entry dir, same as --bin-dir DIR
   REDOKU_VERSION          pin a release tag instead of taking the latest
   REDOKU_BASE_URL         where releases are fetched from — for a fork, a
@@ -256,6 +258,18 @@ command -v ssh >/dev/null 2>&1 || die "no 'ssh' on this machine"
 # going unused.
 [ "$BIN_DIR_SET" -eq 0 ] || [ "$NO_SYMLINK" -eq 0 ] || \
   die "--bin-dir and --no-symlink contradict each other — pass --bin-dir DIR to move the PATH entry, or --no-symlink to write none, not both"
+# The same standard --seconds sets a few lines below, for the same reason it
+# gives: an option handed an EMPTY value must not fall through to meaning "not
+# given at all". "--kit ''" would silently switch a kit install into checkout
+# mode — the mode is decided by whether --kit is present (design doc §5.2), so
+# an empty one decides the opposite of what was asked — and "--bin-dir ''"
+# resolves to $PWD/ and drops the wrapper in whatever directory you happened
+# to be standing in. Checked on the FLAG, not on the value, so an unset or
+# empty $REDOKU_HOME still means "no --kit" as its ${:-} default says.
+[ "$KIT_DIR_SET" -eq 0 ] || [ -n "$KIT_DIR" ] || \
+  die "--kit wants a directory, not an empty value — e.g. --kit ~/.redoku"
+[ "$BIN_DIR_SET" -eq 0 ] || [ -n "$BIN_DIR" ] || \
+  die "--bin-dir wants a directory, not an empty value — e.g. --bin-dir ~/.local/bin"
 # It ends up as 'sleep N' on the device, which wants a plain whole number.
 # Checked whenever --seconds was given at all (PLAY_SECS_SET), not just when
 # its value happens to be non-empty — "--seconds ''" must not silently fall
@@ -420,13 +434,34 @@ pick_artifact() { # $1 = filename; prints the path
   pick_in "${ARTIFACTS:-$KIT_ROOT/build/rm2fb/dist}" "$1"
 }
 
-# Are the binaries this run installs coming out of a released kit — the one
-# this CLI is running from, or one it just downloaded — rather than out of a
-# checkout's own build/ tree? Three messages need to name a different fix for
-# each case: in a checkout, missing artifacts mean a build step nobody ran;
-# in a kit, the very same absence means a download that arrived incomplete,
-# and 'make rm2fb' is not advice anyone there can act on.
+# Three rules in this file answer three DIFFERENT questions about "am I in a
+# kit?", and confusing them produces wrong advice, so each says which question
+# it answers:
+#
+#   in_kit_tree      — where did the artifacts this run installs come from?
+#                      A kit around me, or one I just downloaded. This is the
+#                      PROVENANCE question, and it is the one every "how do I
+#                      fix a missing file" message needs.
+#   $KIT_VERSION     — am I, this script, a release build? (design doc §5.1's
+#                      marker 1.) It answers "which version am I", not "where
+#                      did these binaries come from".
+#   $REPO/tools/mkdecoy.rb (build_decoy) — is a GENERATOR available to
+#                      regenerate with? That is a third question again, and
+#                      the only one whose answer is a tool rather than a
+#                      provenance.
+#
+# in_kit_tree is true both when this CLI is running from inside a kit
+# (marker 2) and when a download moved KIT_ROOT off $REPO — a checkout-mode
+# `install --download` unpacks to build/download/<tag>/, and a game that came
+# out of THAT tarball must not be met with "make clean && make build" either.
 in_kit_tree() { [ "$IN_KIT" -eq 1 ] || [ "$KIT_ROOT" != "$REPO" ]; }
+
+# Did the artifacts this run installs ship prebuilt, rather than come out of a
+# local build? in_kit_tree is the primary answer — but $KIT_VERSION still
+# counts for one state it cannot see: a STAMPED CLI running with no kit around
+# it and nothing downloaded yet (the bootstrap's temp directory) has no
+# `make build` to offer either, because it has no checkout to run it in.
+game_is_prebuilt() { in_kit_tree || [ "$KIT_VERSION" != dev ]; }
 
 # The cross-built game, into $GAME. Its path is fixed (mruby's rake decides
 # it), so there is nothing to search for and no --artifacts override; it is
@@ -441,27 +476,32 @@ in_kit_tree() { [ "$IN_KIT" -eq 1 ] || [ "$KIT_ROOT" != "$REPO" ]; }
 find_game() {
   GAME=$KIT_ROOT/build/rm2/bin/redoku
   GAME_WHY=
-  # In a checkout (KIT_VERSION=dev) a missing or wrong-arch game means a
-  # build step was never run, so the hint names the build. Inside a
-  # released kit (KIT_VERSION stamped) there is no build to run — this
-  # exact file shipped prebuilt (design doc §3.2) — so the SAME two
-  # conditions instead mean the download is incomplete or corrupt, and the
-  # fix is to re-fetch it, which is what "redoku upgrade" does (added in a
-  # later task of this milestone; naming it here is still correct).
+  # In a checkout a missing or wrong-arch game means a build step was never
+  # run, so the hint names the build. Where this file shipped prebuilt
+  # (design doc §3.2) there is no build to run, so the SAME two conditions
+  # instead mean the download is incomplete or corrupt, and the fix is to
+  # re-fetch it — which is what "redoku upgrade" does (added in a later task
+  # of this milestone; naming it here is still correct).
+  #
+  # The question is PROVENANCE, so it goes through game_is_prebuilt, not
+  # through $KIT_VERSION alone. A checkout-mode `install --download` unpacks
+  # a released game into build/download/<tag>/ while this CLI is still an
+  # unstamped dev build; telling that user to "rebuild with: make clean &&
+  # make build" would be advice about a file no build of theirs produced.
   if [ ! -f "$GAME" ]; then
-    if [ "$KIT_VERSION" = dev ]; then
-      GAME_WHY="no game binary at $GAME — cross-build it with:  make build"
-    else
+    if game_is_prebuilt; then
       GAME_WHY="no game binary at $GAME — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+    else
+      GAME_WHY="no game binary at $GAME — cross-build it with:  make build"
     fi
   elif ! is_arm_elf "$GAME"; then
     # One line, like the message above it: both callers print it as a single
     # indented continuation line, where an embedded newline would lose its
     # prefix and its indentation.
-    if [ "$KIT_VERSION" = dev ]; then
-      GAME_WHY="$GAME is not 32-bit ARM (a host build?) — rebuild with:  make clean && make build"
-    else
+    if game_is_prebuilt; then
       GAME_WHY="$GAME is not 32-bit ARM — this kit is corrupt, re-download it with:  redoku upgrade"
+    else
+      GAME_WHY="$GAME is not 32-bit ARM (a host build?) — rebuild with:  make clean && make build"
     fi
   fi
   [ -z "$GAME_WHY" ] || { GAME=; return 1; }
@@ -670,7 +710,16 @@ resolve_tag() {
   fi
   # 2. A released CLI fetches its OWN tag, so the common path — someone
   #    re-running a kit's own installer — resolves nothing at all (§3.3).
+  #    Checked like every other source of a tag even though tools/mkkit.sh
+  #    stamped it: the point of a guard that runs on every path is that no
+  #    path has to be trusted, and a stamp is one `--version` typo away from
+  #    putting a slash in a directory name.
   if [ "$KIT_VERSION" != dev ]; then
+    valid_tag "$KIT_VERSION" || \
+      die "this copy of redoku was stamped KIT_VERSION='$KIT_VERSION', which can't be
+  used as a release tag — it becomes a directory name and a URL component, so it
+  may only hold letters, digits, '.', '_' and '-'. The release is mis-stamped;
+  pin a known-good one with REDOKU_VERSION=<tag> instead."
     TAG=$KIT_VERSION
     return 0
   fi
@@ -700,14 +749,93 @@ resolve_tag() {
 }
 
 # kit_dest <layout> <base> <tag> — where fetch_kit puts the unpacked tree.
-# The two layouts differ only here, which is why fetch_kit itself can be one
-# function serving both.
+# The two layouts differ only here (and in staging_parent below), which is why
+# fetch_kit itself can be one function serving both — and why plan_download
+# calls this rather than re-deriving the same two shapes inline, so the
+# --dry-run plan and the fetch it describes cannot drift apart.
 kit_dest() {
   case $1 in
     kit)      printf '%s\n' "$2/$3" ;;
     checkout) printf '%s\n' "$2/build/download/$3/redoku" ;;
     *)        die "internal error: unknown fetch_kit layout '$1'" ;;
   esac
+}
+
+# staging_parent <layout> <base> — the directory fetch_kit downloads and
+# unpacks INTO, before renaming the finished tree to kit_dest's answer.
+#
+# It is a sibling of the destination, deliberately, and NOT $TMPDIR. `mv` is
+# only atomic within one filesystem: on a stock Linux box /tmp is very often
+# tmpfs while ~/.redoku is on the root filesystem, so staging under $TMPDIR
+# turns the final `mv` into a recursive copy on the DEFAULT path, not an
+# exotic one — and a copy interrupted by a full disk or a Ctrl-C leaves a
+# half-populated <kit>/<tag>/ behind, which is exactly what design doc §6.2's
+# temp-dir-then-mv shape exists to make impossible. Staging beside the
+# destination makes the rename a rename again.
+#
+# ($TMPDIR would have been the obvious home, and `mktemp -d` with a template
+# pointed here would have been the obvious way to name it, but a template is
+# ruled out on portability grounds — hence the explicit ".staging.<pid>"
+# below, swept by clean_stale_staging.)
+staging_parent() {
+  case $1 in
+    kit)      printf '%s\n' "$2" ;;
+    checkout) printf '%s\n' "$2/build/download" ;;
+    *)        die "internal error: unknown fetch_kit layout '$1'" ;;
+  esac
+}
+
+# clean_stale_staging <dir> — remove staging directories a killed run left
+# behind. Everything short of SIGKILL is covered by fetch_kit's own traps, so
+# this only ever has work to do after a `kill -9` or a power cut — but under
+# $TMPDIR the OS eventually swept those up for us, and inside the user's kit
+# directory nothing does. Named-prefix matched and containment-checked, like
+# every other recursive delete in this file.
+clean_stale_staging() {
+  while IFS= read -r _cs_dir; do
+    [ -n "$_cs_dir" ] || continue
+    case $_cs_dir in
+      "$1"/.staging.?*) ;;
+      *) continue ;;
+    esac
+    rm -rf "$_cs_dir" || \
+      say "  WARNING: couldn't remove the leftover staging directory $_cs_dir — delete it by hand to reclaim the space"
+  done <<EOF
+$(find "$1" -mindepth 1 -maxdepth 1 -type d -name '.staging.*' 2>/dev/null)
+EOF
+}
+
+# The directory every release asset for this run hangs off. One definition,
+# read by both fetch_kit and plan_download.
+asset_url_dir() {
+  if [ -n "$TAG" ]; then
+    printf '%s\n' "$BASE_URL/download/$TAG"
+  else
+    printf '%s\n' "$BASE_URL/latest/download"
+  fi
+}
+
+# Which layout and base a download in THIS run would use — design doc §5.2's
+# "--kit alone decides it", in one place so the --dry-run plan and the fetch
+# that follows it cannot disagree about where the tree lands. Sets
+# $FETCH_LAYOUT and $FETCH_TARGET.
+fetch_target() {
+  if [ -n "$KIT_DIR" ]; then
+    FETCH_LAYOUT=kit
+    FETCH_TARGET=$KIT_DIR
+  else
+    FETCH_LAYOUT=checkout
+    FETCH_TARGET=$REPO
+  fi
+}
+
+# There is no way to fetch a release without curl (design doc §7). One
+# message, called by fetch_kit and by the --dry-run plan, so a dry run cannot
+# promise an install this machine could not perform.
+require_curl() {
+  command -v curl >/dev/null 2>&1 || \
+    die "no 'curl' on this machine, so there is no way to fetch a release —
+  $OFFLINE_ROUTES."
 }
 
 # prune_kit <kit-root> <keep> <keep-too> — delete every OTHER version
@@ -773,9 +901,7 @@ fetch_kit() {
 
   # Both preflight checks run before anything is fetched, created or written,
   # so a machine that cannot download or cannot verify never starts either.
-  command -v curl >/dev/null 2>&1 || \
-    die "no 'curl' on this machine, so there is no way to fetch a release —
-  $OFFLINE_ROUTES."
+  require_curl
   sha256_tool
 
   resolve_tag
@@ -795,35 +921,60 @@ fetch_kit() {
 
   # design doc §6.3. 'install' is documented as safe to re-run from any
   # state, and bolting a network fetch onto it must not weaken that: a
-  # version already on disk, complete enough that its game binary passes the
-  # same 32-bit-ARM gate everything else here has to pass, is reused rather
-  # than re-fetched. Only reachable when steps 1-3 already know the tag —
-  # step 4 reads it out of the tarball, by which point the download has
-  # happened anyway. The repoint below still runs: reusing a tree is not the
-  # same as leaving 'current' where it was.
+  # version already on disk is reused rather than re-fetched. Only reachable
+  # when steps 1-3 already know the tag — step 4 reads it out of the tarball,
+  # by which point the download has happened anyway. The repoint below still
+  # runs: reusing a tree is not the same as leaving 'current' where it was.
+  #
+  # "Already on disk" is checked across the WHOLE §3.2 tree, not just VERSION
+  # plus the ARM gate. is_arm_elf reads bytes 0-4 and 18-19 only, so a game
+  # binary truncated anywhere past byte 20 passes it — and a tree that got as
+  # far as copying VERSION and the head of the game would then be adopted,
+  # `current` repointed at it and a truncated binary pushed to the device.
+  # Since the staging move below made a half-copied destination unreachable
+  # this is belt and braces, but it is the gate that decides whether a
+  # download is skipped, so it checks files spread across the tree rather
+  # than a prefix of it.
   _fk_reuse=0
   if [ -n "$TAG" ]; then
     _fk_dest=$(kit_dest "$_fk_layout" "$_fk_base" "$TAG")
-    if [ -f "$_fk_dest/VERSION" ] && is_arm_elf "$_fk_dest/build/rm2/bin/redoku"; then
+    if [ -f "$_fk_dest/VERSION" ] && \
+       [ -f "$_fk_dest/bin/redoku" ] && \
+       [ -f "$_fk_dest/device/install.sh" ] && \
+       [ -f "$_fk_dest/device/uninstall.sh" ] && \
+       [ -f "$_fk_dest/device/redoku-watcher.service" ] && \
+       [ -f "$_fk_dest/build/decoy/watch.conf" ] && \
+       [ -f "$_fk_dest/build/rm2fb/dist/rm2fb_server_swtcon" ] && \
+       is_arm_elf "$_fk_dest/build/rm2/bin/redoku"; then
       say "$TAG is already unpacked at $_fk_dest — reusing it, nothing to download"
       _fk_reuse=1
     fi
   fi
 
   if [ "$_fk_reuse" -eq 0 ]; then
-    if [ -n "$TAG" ]; then
-      _fk_url=$BASE_URL/download/$TAG
-    else
-      _fk_url=$BASE_URL/latest/download
-    fi
+    _fk_url=$(asset_url_dir)
 
-    # Everything lands in a temp dir first and is renamed into place at the
-    # very end (§6.2). That is what makes an interrupt, a full disk or a
-    # truncated stream unable to leave <base>/<tag> half-populated: nothing
-    # under <base> is written until a complete, checksum-verified tree
-    # already exists somewhere else.
-    FETCH_TMP=$(mktemp -d) || \
-      die "could not create a temporary directory to download into — is \$TMPDIR set to somewhere writable?"
+    # Everything lands in a staging directory first and is renamed into place
+    # at the very end (§6.2). That is what makes an interrupt, a full disk or
+    # a truncated stream unable to leave <base>/<tag> half-populated: nothing
+    # at the destination is written until a complete, checksum-verified tree
+    # already exists beside it.
+    #
+    # "Beside it" is the operative word — see staging_parent's header for why
+    # this is not $TMPDIR. The rename is only atomic within one filesystem.
+    _fk_stage_parent=$(staging_parent "$_fk_layout" "$_fk_base")
+    mkdir -p "$_fk_stage_parent" || \
+      die "could not create $_fk_stage_parent to download into — check the path and its permissions"
+    clean_stale_staging "$_fk_stage_parent"
+    FETCH_TMP=$_fk_stage_parent/.staging.$$
+    # Same belt-and-braces containment check the destination gets below: this
+    # path is handed to rm -rf, by the traps and by the cleanup at the end.
+    case $FETCH_TMP in
+      "$_fk_base"/?*) ;;
+      *) die "internal error: refusing to stage a download outside $_fk_base: '$FETCH_TMP'" ;;
+    esac
+    mkdir "$FETCH_TMP" || \
+      die "could not create $FETCH_TMP to download into — if something is already there, remove it and try again"
     # EXIT alone just cleans up (the shell is on its way out anyway). INT,
     # HUP and TERM need traps that ALSO exit: a POSIX shell resumes the
     # script where it left off once a handler returns, and resuming with the
@@ -943,18 +1094,37 @@ EOF
     mkdir -p "$(dirname -- "$_fk_dest")" || \
       die "could not create $(dirname -- "$_fk_dest") — check the path and its permissions"
     if [ -e "$_fk_dest" ] || [ -L "$_fk_dest" ]; then
-      # Anything already here failed the reuse check above (no VERSION, or a
-      # game binary that is not 32-bit ARM), i.e. it is a partial or corrupt
-      # earlier download. It has to GO, not be merged with: `mv` onto an
-      # existing directory moves the new tree INSIDE it rather than replacing
-      # it, which is how you end up with <tag>/redoku/ and a kit whose every
-      # path resolves one level short.
+      # Anything already here failed the reuse check above, i.e. it is a
+      # partial or corrupt earlier download. It has to GO, not be merged
+      # with: `mv` onto an existing directory moves the new tree INSIDE it
+      # rather than replacing it, which is how you end up with <tag>/redoku/
+      # and a kit whose every path resolves one level short.
       say "replacing an incomplete earlier download at $_fk_dest"
       rm -rf "$_fk_dest" || \
         die "could not remove the incomplete earlier download at $_fk_dest — remove it by hand and try again"
     fi
-    mv "$FETCH_TMP/redoku" "$_fk_dest" || \
-      die "could not move the unpacked kit into $_fk_dest — check permissions and free space. Nothing was installed."
+    # Staging is a sibling of this destination, so this is a rename, not a
+    # copy — see staging_parent. It can still fail (permissions, or a `build/`
+    # somebody mounted separately), and if it fails partway the fix is not to
+    # describe the wreckage but to remove it: a half-populated <tag>/ left
+    # lying around is a tree a later run could adopt, and §7's preamble says
+    # no failure leaves a partial install behind. The message then says what
+    # is true, which is that there is nothing to clean up by hand.
+    mv "$FETCH_TMP/redoku" "$_fk_dest" || {
+      rm -rf "$_fk_dest"
+      die "could not move the unpacked kit into $_fk_dest — check permissions and free space.
+  Anything that had begun to appear there has been removed and nothing else was
+  changed, so there is no half-installed version to clean up. Try again."
+    }
+
+    # The staging directory has done its job. Drop it and its traps together,
+    # here rather than at the end of this function, so that the repoint and
+    # prune below run against a kit root holding nothing but version
+    # directories and 'current' — and so a Ctrl-C from this point on behaves
+    # exactly as it did before this function existed.
+    rm -rf "$FETCH_TMP"
+    FETCH_TMP=
+    trap - EXIT INT HUP TERM
   fi
 
   if [ "$_fk_layout" = kit ]; then
@@ -1011,15 +1181,6 @@ EOF
 
   FETCH_TAG=$TAG
   FETCH_TREE=$_fk_dest
-
-  # The temp dir has done its job. Drop it and its traps together, so a
-  # Ctrl-C during the device install that follows behaves exactly as it did
-  # before this function existed.
-  if [ -n "$FETCH_TMP" ]; then
-    rm -rf "$FETCH_TMP"
-    FETCH_TMP=
-    trap - EXIT INT HUP TERM
-  fi
 }
 
 # ---- the PATH entry (design doc §5.3) ------------------------------------
@@ -1085,14 +1246,25 @@ write_path_entry() {
   # same never-a-half-written-file reasoning as the kit tree itself, and it
   # also means a wrapper that is executing RIGHT NOW gets replaced by a fresh
   # inode instead of being truncated under its own feet.
+  # Each failure below removes the half-written sibling before it dies. A
+  # leftover `redoku.new` in someone's ~/.local/bin is litter this installer
+  # would never clean up again, and it is one tab-completion away from being
+  # run by mistake.
   {
     printf '#!/bin/sh\n'
     kit_exec_line "$_wpe_kit"
-  } > "$_wpe_file.new" || \
+  } > "$_wpe_file.new" || {
+    rm -f "$_wpe_file.new"
     die "could not write $_wpe_file.new — check permissions on $_wpe_dir, or skip the PATH entry with --no-symlink"
-  chmod +x "$_wpe_file.new" || die "could not make $_wpe_file.new executable"
-  mv -f "$_wpe_file.new" "$_wpe_file" || \
-    die "could not put the PATH entry at $_wpe_file — check permissions on $_wpe_dir"
+  }
+  chmod +x "$_wpe_file.new" || {
+    rm -f "$_wpe_file.new"
+    die "could not make $_wpe_file.new executable — check permissions on $_wpe_dir, or skip the PATH entry with --no-symlink"
+  }
+  mv -f "$_wpe_file.new" "$_wpe_file" || {
+    rm -f "$_wpe_file.new"
+    die "could not put the PATH entry at $_wpe_file — check permissions on $_wpe_dir, or skip it with --no-symlink"
+  }
   say "PATH entry: $_wpe_file  ->  $_wpe_kit/current/bin/redoku"
 
   # ~/.local/bin over /usr/local/bin: no sudo, ever. A script you piped from
@@ -1167,19 +1339,22 @@ resolve_kit_mode() {
 # every artifact path there would be a path inside a kit that has not arrived
 # yet; where it names such a path it says so rather than implying otherwise.
 plan_download() {
-  command -v curl >/dev/null 2>&1 || \
-    die "no 'curl' on this machine, so there is no way to fetch a release —
-  $OFFLINE_ROUTES."
+  require_curl
   sha256_tool
   resolve_tag
 
+  # Every value below comes from the same helpers fetch_kit calls, so the plan
+  # cannot describe one destination and the fetch produce another. The tag is
+  # the only placeholder: with no REDOKU_VERSION, no stamp and no usable
+  # redirect it is inside the tarball, and reading it means downloading it.
+  fetch_target
+  _pd_url=$(asset_url_dir)
   if [ -n "$TAG" ]; then
-    _pd_url=$BASE_URL/download/$TAG
     _pd_tag=$TAG
   else
-    _pd_url=$BASE_URL/latest/download
     _pd_tag='<tag>'
   fi
+  _pd_dest=$(kit_dest "$FETCH_LAYOUT" "$FETCH_TARGET" "$_pd_tag")
 
   say "this will:"
   if [ -n "$TAG" ]; then
@@ -1190,18 +1365,17 @@ plan_download() {
   fi
   say "  download: $_pd_url/redoku-rm2.tar.gz"
   say "            plus its .sha256, which has to match before anything unpacks"
-  if [ -n "$KIT_DIR" ]; then
-    say "  unpack  : $KIT_DIR/$_pd_tag/"
-    say "  current : $KIT_DIR/current -> $_pd_tag"
-    say "  prune   : older versions under $KIT_DIR, keeping the new one and the"
-    say "            one 'current' points at now (a rollback stays one swap)"
+  say "  unpack  : $_pd_dest/"
+  if [ "$FETCH_LAYOUT" = kit ]; then
+    say "  current : $FETCH_TARGET/current -> $_pd_tag"
+    say "  prune   : older versions under $FETCH_TARGET, keeping the new one and"
+    say "            the one 'current' points at now (a rollback stays one swap)"
     if [ "$NO_SYMLINK" -eq 1 ]; then
       say "  PATH    : nothing — --no-symlink"
     else
-      say "  PATH    : $BIN_DIR/redoku, a two-line wrapper for $KIT_DIR/current/bin/redoku"
+      say "  PATH    : $BIN_DIR/redoku, a two-line wrapper for $FETCH_TARGET/current/bin/redoku"
     fi
   else
-    say "  unpack  : $REPO/build/download/$_pd_tag/redoku/"
     say "            never build/rm2/ or build/rm2fb/ — a release binary must"
     say "            not be able to pass for one you built"
     say "  PATH    : nothing — a PATH entry only comes with --kit (see --help)"
@@ -1217,6 +1391,54 @@ plan_download() {
   say "[dry-run] stops here — nothing above actually ran"
 }
 
+# The three files cmd_install pushes verbatim have to exist before any of the
+# plan below can be believed. Asked of $KIT_ROOT, not $REPO: under the curl|sh
+# bootstrap $REPO is a temp directory's parent and holds nothing at all, so as
+# an opening line of cmd_install this fired before a single byte was fetched.
+#
+# A function rather than a block, because it has to run once per possible
+# value of $KIT_ROOT — a download moves it, and the PROMPT path downloads
+# after this has already run once against the checkout.
+#
+# Its message names a different fix for each case: inside a kit or a
+# downloaded tree these files shipped with it (§3.2), so their absence means
+# the download arrived incomplete; in a checkout it means what it always did.
+require_device_files() {
+  [ ! -f "$KIT_ROOT/device/install.sh" ] || \
+    [ ! -f "$KIT_ROOT/device/uninstall.sh" ] || \
+    [ ! -f "$KIT_ROOT/device/redoku-watcher.service" ] || return 0
+  if in_kit_tree; then
+    die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found in $KIT_ROOT — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
+  fi
+  die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found next to me — run bin/redoku from a reDoku checkout"
+}
+
+# design doc §5.4 — "a local build is never silently replaced" — for the one
+# part of it a precedence rule cannot carry. Controller ruling 3 made the
+# three device scripts come from $KIT_ROOT, so after a download in a checkout
+# the scripts that go on the device are the RELEASED ones, not the ones the
+# developer has been editing. That is correct (they belong to the same release
+# as the binaries beside them, and mixing halves is how you get a kit that
+# half-satisfies its own layout) — but it must not be SILENT, which is the
+# word §5.4 actually uses. So: compare, and say so when they differ.
+#
+# Only ever has anything to say in a checkout, because it needs a $REPO/device
+# to compare against; inside a kit there is nothing to have edited.
+warn_device_scripts_replaced() {
+  _wdsr_differ=
+  for _wdsr_f in install.sh uninstall.sh redoku-watcher.service; do
+    [ -f "$REPO/device/$_wdsr_f" ] || continue
+    cmp -s "$REPO/device/$_wdsr_f" "$KIT_ROOT/device/$_wdsr_f" || \
+      _wdsr_differ="$_wdsr_differ $_wdsr_f"
+  done
+  [ -n "$_wdsr_differ" ] || return 0
+  say "NOTE: this checkout's device/ scripts differ from the downloaded kit's:"
+  say "     $_wdsr_differ"
+  say "     The RELEASED ones are what go on the device — they belong to the same"
+  say "     release as the binaries beside them. To put YOUR versions on instead,"
+  say "     build the binaries here and install without downloading:  make rm2fb"
+}
+
 # ---- commands ----------------------------------------------------------
 
 cmd_install() {
@@ -1228,13 +1450,14 @@ cmd_install() {
       plan_download
       return 0
     fi
-    if [ -n "$KIT_DIR" ]; then
-      fetch_kit kit "$KIT_DIR"
+    # Through fetch_target, the same helper plan_download uses, so a dry run
+    # and the real thing cannot disagree about where the tree lands.
+    fetch_target
+    fetch_kit "$FETCH_LAYOUT" "$FETCH_TARGET"
+    if [ "$FETCH_LAYOUT" = kit ]; then
       # fetch_kit resolved it (mkdir + cd + pwd -P); take the resolved form
       # back, because the wrapper below records this path literally.
       KIT_DIR=$FETCH_BASE
-    else
-      fetch_kit checkout "$REPO"
     fi
     KIT_ROOT=$FETCH_TREE
   fi
@@ -1253,21 +1476,11 @@ cmd_install() {
     fi
   fi
 
-  # Moved down here from the top of this function, and asked of $KIT_ROOT
-  # rather than $REPO. Under the curl|sh bootstrap $REPO is a temp
-  # directory's parent and holds nothing at all, so at the top this check
-  # fired before a single byte had been fetched. Its message names a
-  # different fix for each case: inside a kit or a downloaded tree these
-  # files shipped with it (§3.2), so their absence means the download is
-  # incomplete; in a checkout it means what it always did.
-  if [ ! -f "$KIT_ROOT/device/install.sh" ] || \
-     [ ! -f "$KIT_ROOT/device/uninstall.sh" ] || \
-     [ ! -f "$KIT_ROOT/device/redoku-watcher.service" ]; then
-    if in_kit_tree; then
-      die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found in $KIT_ROOT — this kit is incomplete or corrupt, re-download it with:  redoku upgrade"
-    fi
-    die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found next to me — run bin/redoku from a reDoku checkout"
-  fi
+  # In this order: a kit that arrived incomplete is a hard failure and says so
+  # first, and only a kit that IS complete is worth telling you differs from
+  # what you have been editing.
+  require_device_files
+  warn_device_scripts_replaced
 
   build_decoy
 
@@ -1311,8 +1524,20 @@ cmd_install() {
     say "  cross-compile whose first run clones the pinned rM2-stuff into tmp/)"
     confirm "Download the released binaries?"
     [ "$DRY" -eq 0 ] || die "dry-run: would download the released binaries into $REPO/build/download/ — re-run with --download to do it, or run 'make rm2fb' first"
+    # Always the checkout layout, even if --kit was passed: this whole prompt
+    # is the checkout row of §5.4 — its wording, its build/download/<tag>/
+    # destination and its "not your working tree" promise. Somebody who wants
+    # a kit install asks for one with --download.
     fetch_kit checkout "$REPO"
     KIT_ROOT=$FETCH_TREE
+    # $KIT_ROOT has moved, so the two checks that ran against the checkout a
+    # moment ago have to run again against what actually arrived — otherwise
+    # an incomplete download is only noticed by push_file, three screens
+    # later, with a message about a missing local file rather than a corrupt
+    # kit, and a developer's edited device/install.sh is replaced by the
+    # released one without a word.
+    require_device_files
+    warn_device_scripts_replaced
     # find_game ran against the checkout's own build/ tree a moment ago; now
     # that a kit is on disk, ask again — but ONLY if it found nothing there,
     # because a game you cross-built yourself must not be silently replaced

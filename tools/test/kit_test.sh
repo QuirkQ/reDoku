@@ -1137,10 +1137,14 @@ EOF
 # The CLI asset is $REPO/bin/redoku verbatim, so it goes out UNSTAMPED
 # (KIT_VERSION=dev). That is deliberate: with no stamp and no redirect to
 # read, §6.1 falls through to step 4 and takes the tag out of the tarball,
-# which is the path an offline install actually takes. TMPDIR is pointed
-# inside the test's own tree so that $REPO — which for the bootstrapped CLI
-# is the PARENT of install.sh's temp dir — is a directory this test controls
-# and not the machine's shared /tmp.
+# which is the path an offline install actually takes.
+#
+# TMPDIR is pointed inside the test's own tree as a courtesy, not as a load
+# bearing seam: where it is honoured (GNU coreutils) it keeps $REPO — which
+# for the bootstrapped CLI is the PARENT of install.sh's temp dir — inside
+# this test's own tree; on macOS `mktemp -d` with no template IGNORES $TMPDIR
+# and uses the per-user Darwin temp dir, as test_kit_tarball_entry_outside_redoku
+# records at length. No assertion below depends on which of those happened.
 test_kit_bootstrap_end_to_end() {
   _w=$(mktemp -d "$ROOT/kit-e2e.XXXXXX")
   _home=$_w/home
@@ -1759,6 +1763,393 @@ test_kit_dry_run_resolves_every_path() {
   esac
 }
 
+# ---- fix round 1 -----------------------------------------------------------
+
+# repack_kit_without <fixture-dir> <version> <path-inside-redoku>
+#
+# Rebuilds the fixture's redoku-rm2.tar.gz with one path removed, and
+# re-checksums it so the checksum still passes and whatever the test is
+# probing is unambiguously what fires. Used to make the two shapes of
+# "arrived incomplete" the milestone has messages for: a kit with no game
+# binary, and a kit with no device/ scripts.
+#
+# Self-checked, like make_fake_arm_elf: if the path was not actually in the
+# archive, the harness dies rather than reporting a green it did not earn.
+repack_kit_without() {
+  _rkw_dir=$1
+  _rkw_version=$2
+  _rkw_path=$3
+  _rkw_pinned=$_rkw_dir/download/$_rkw_version
+  _rkw_stage=$_rkw_dir/.repack-$_rkw_version
+  rm -rf "$_rkw_stage"
+  mkdir -p "$_rkw_stage" || die "repack_kit_without: mkdir $_rkw_stage failed"
+  tar -xzf "$_rkw_pinned/redoku-rm2.tar.gz" -C "$_rkw_stage" || \
+    die "repack_kit_without: tar -x failed"
+  [ -e "$_rkw_stage/redoku/$_rkw_path" ] || \
+    die "repack_kit_without: redoku/$_rkw_path is not in the fixture tarball, so removing it proves nothing"
+  rm -rf "$_rkw_stage/redoku/$_rkw_path"
+  ( cd "$_rkw_stage" && tar -czf "$_rkw_pinned/redoku-rm2.tar.gz" redoku ) || \
+    die "repack_kit_without: tar -c failed"
+  printf '%s  redoku-rm2.tar.gz\n' "$(kit_digest "$_rkw_pinned/redoku-rm2.tar.gz")" \
+    > "$_rkw_pinned/redoku-rm2.tar.gz.sha256"
+  rm -rf "$_rkw_stage"
+}
+
+# IMPORTANT 3: after a checkout-mode `install --download`, the game came out
+# of a tarball — so a missing or wrong-arch one must be met with "re-download
+# it" and never with "make build". Before the fix, find_game keyed that
+# entirely off $KIT_VERSION, which is still `dev` here (this CLI is an
+# unstamped checkout build), so it handed a developer build advice about a
+# file no build of theirs produced.
+#
+# The needle is "cross-build it with", which appears ONLY in find_game's
+# checkout branch — a bare "make build" would also match the final
+# "play it : make build, then bin/redoku play" line that prints whenever the
+# game is missing, in either branch.
+test_find_game_downloaded_into_checkout_message() {
+  _w=$(mktemp -d "$ROOT/findgame-dl.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  build_fake_checkout "$_w/checkout"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  repack_kit_without "$_w/release" v0.1.0 build/rm2/bin/redoku
+  make_dead_ssh_config "$_w/ssh_config"
+
+  assert_fails "find_game downloaded-into-checkout: run ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$_w/checkout/bin/redoku" install --download \
+      --ssh-config "$_w/ssh_config" --host nowhere --yes < /dev/null || return 1
+
+  assert_contains "$ASSERT_OUTPUT" "could not connect to root@nowhere" \
+    "find_game downloaded-into-checkout: the whole host-side plan ran" || return 1
+  assert_contains "$ASSERT_OUTPUT" "this kit is incomplete or corrupt, re-download it with:  redoku upgrade" \
+    "find_game downloaded-into-checkout: names re-download, not a build" || return 1
+  case $ASSERT_OUTPUT in
+    *"cross-build it with"*)
+      printf 'FAIL: find_game downloaded-into-checkout: gave checkout advice for a downloaded file\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  # The game came from build/download/, so the path it names must too — this
+  # is also what proves KIT_ROOT moved rather than find_game just guessing.
+  assert_contains "$ASSERT_OUTPUT" "build/download/v0.1.0/redoku/build/rm2/bin/redoku" \
+    "find_game downloaded-into-checkout: names the downloaded tree's path" || return 1
+}
+
+# IMPORTANT 2: the prompt path downloads AFTER the device-file check has
+# already run against the checkout, so both of the things that check protects
+# have to be redone against what actually arrived.
+#
+# (a) an incomplete kit must produce the "incomplete or corrupt" message that
+#     controller ruling 3 asked for, not push_file's "no such file" three
+#     screens later;
+# (b) a developer's edited device/install.sh is REPLACED by the released one
+#     (controller ruling 3 made all three device files come from $KIT_ROOT) —
+#     which is correct, but §5.4's promise is that it is never done SILENTLY.
+test_kit_prompt_download_rechecks_device_files() {
+  _w=$(mktemp -d "$ROOT/kit-prompt-device.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_dead_ssh_config "$_w/ssh_config"
+
+  # (a) — a kit with no device/ at all. build_fake_checkout makes a checkout
+  # with NO build/ tree, which is exactly the state the "not built yet"
+  # prompt exists for; --yes answers it.
+  build_fake_checkout "$_w/co-a"
+  make_fixture_release "$_w/rel-a" v0.1.0 "$_w/cli"
+  repack_kit_without "$_w/rel-a" v0.1.0 device
+
+  assert_fails "prompt device re-check: incomplete kit exits non-zero" -- \
+    env REDOKU_BASE_URL="file://$_w/rel-a" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$_w/co-a/bin/redoku" install \
+      --ssh-config "$_w/ssh_config" --host nowhere --yes < /dev/null || return 1
+  # Proves the prompt path was the one taken, not --download.
+  assert_contains "$ASSERT_OUTPUT" "not built yet" \
+    "prompt device re-check: the download prompt is what ran" || return 1
+  assert_contains "$ASSERT_OUTPUT" "this kit is incomplete or corrupt" \
+    "prompt device re-check: the corrupt-kit message, not push_file's" || return 1
+  # The check must have been re-run against the DOWNLOADED tree; naming the
+  # checkout would mean it still ran against $REPO.
+  assert_contains "$ASSERT_OUTPUT" "not found in $_w/co-a/build/download/v0.1.0/redoku" \
+    "prompt device re-check: it was re-run against the downloaded tree" || return 1
+  # And it stopped there rather than carrying on into the device work.
+  case $ASSERT_OUTPUT in
+    *"could not connect to"*)
+      printf 'FAIL: prompt device re-check: an incomplete kit still reached the device step\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # (b) — a complete kit, but this checkout's device/install.sh has been
+  # edited. The released one goes on the device; the run has to say so.
+  build_fake_checkout "$_w/co-b"
+  printf '\n# a developer edited this\n' >> "$_w/co-b/device/install.sh"
+  make_fixture_release "$_w/rel-b" v0.1.0 "$_w/cli"
+
+  assert_fails "prompt device re-check: edited script run ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/rel-b" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$_w/co-b/bin/redoku" install \
+      --ssh-config "$_w/ssh_config" --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "could not connect to root@nowhere" \
+    "prompt device re-check: (b) the install carried on to the device step" || return 1
+  # "device/ scripts differ" occurs only in warn_device_scripts_replaced.
+  assert_contains "$ASSERT_OUTPUT" "device/ scripts differ" \
+    "prompt device re-check: (b) the replacement is announced, not silent" || return 1
+  assert_contains "$ASSERT_OUTPUT" "install.sh" \
+    "prompt device re-check: (b) it names which script" || return 1
+  # And the RELEASED ones really are what would go on: the plan's watcher line
+  # is the only device/ path printed before connect() ends the run, and it
+  # names the downloaded tree rather than the checkout.
+  assert_contains "$ASSERT_OUTPUT" "  watcher: $_w/co-b/build/download/v0.1.0/redoku/device/redoku-watcher.service" \
+    "prompt device re-check: (b) the device files come from the downloaded kit" || return 1
+
+  # The control: an UNEDITED checkout must say nothing at all about it.
+  build_fake_checkout "$_w/co-c"
+  make_fixture_release "$_w/rel-c" v0.1.0 "$_w/cli"
+  assert_fails "prompt device re-check: unedited run ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/rel-c" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$_w/co-c/bin/redoku" install \
+      --ssh-config "$_w/ssh_config" --host nowhere --yes < /dev/null || return 1
+  case $ASSERT_OUTPUT in
+    *"device/ scripts differ"*)
+      printf 'FAIL: prompt device re-check: (c) warned about identical scripts\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
+# IMPORTANT 4: an option handed an EMPTY value must not fall through to
+# meaning "not given at all" — the standard this file already sets for
+# --seconds in its own words ("--seconds '' must not silently fall through to
+# interactive play"). --kit '' would silently switch a kit install into
+# checkout mode; --bin-dir '' would resolve to $PWD/ and drop the wrapper
+# wherever the user happened to be standing.
+#
+# No fixture needed: both die during argument validation, which is the point —
+# nothing downstream should ever see the empty value. $REDOKU_BASE_URL still
+# points at a file:// path that does not exist, so a regression that got past
+# the guard fails offline instead of reaching for github.com; without it, the
+# mutation that removes these guards went straight to the real network.
+test_kit_empty_option_values() {
+  _w=$(mktemp -d "$ROOT/kit-emptyopt.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  _nowhere="file://$_w/no-such-release"
+
+  # The control comes FIRST, so a guard that over-fires is caught by the
+  # assertion that exists for it rather than incidentally by a later one. An
+  # empty $REDOKU_HOME is NOT an empty --kit: ${REDOKU_HOME:-} documents it as
+  # "unset", and tools/install.sh's own ${REDOKU_HOME:-$HOME/.redoku} reads it
+  # the same way. It must keep working, so the guard has to be on the FLAG.
+  # This run is a plain checkout install pointed at --artifacts, so it gets as
+  # far as the device plan; all that matters is that no argument guard stopped
+  # it on the way there.
+  assert_fails "empty REDOKU_HOME: gets past argument validation" -- \
+    env HOME="$_home" REDOKU_BASE_URL="$_nowhere" REDOKU_HOME='' REDOKU_BIN_DIR='' \
+      "$KIT_SH" "$REPO/bin/redoku" install --dry-run --host nowhere --yes \
+      --artifacts "$_w" < /dev/null || return 1
+  case $ASSERT_OUTPUT in
+    *"wants a directory, not an empty value"*)
+      printf 'FAIL: an empty $REDOKU_HOME / $REDOKU_BIN_DIR was treated as an empty flag\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  assert_fails "empty --kit: exits non-zero" -- \
+    env HOME="$_home" REDOKU_BASE_URL="$_nowhere" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit '' \
+      --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "--kit wants a directory, not an empty value" \
+    "empty --kit: says so rather than switching modes" || return 1
+
+  assert_fails "empty --bin-dir: exits non-zero" -- \
+    env HOME="$_home" REDOKU_BASE_URL="$_nowhere" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --bin-dir '' \
+      --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "--bin-dir wants a directory, not an empty value" \
+    "empty --bin-dir: says so rather than defaulting to \$PWD" || return 1
+}
+
+# IMPORTANT 1: downloads are staged BESIDE the destination, never under
+# $TMPDIR, so the final `mv` is a rename and not a recursive copy. On a stock
+# Linux box /tmp is often tmpfs while ~/.redoku is on the root filesystem, so
+# $TMPDIR staging turned the rename into a copy on the DEFAULT path — and a
+# copy interrupted by a full disk leaves a half-populated <kit>/<tag>/, which
+# is what §6.2's temp-dir-then-mv shape exists to make impossible.
+#
+# Proving "it staged beside the destination" portably is the trick here. A
+# planted leftover staging directory is the proof: clean_stale_staging only
+# ever looks in the staging PARENT, so if staging had moved back under
+# $TMPDIR the planted directory would still be sitting there afterwards.
+# (Asserting through $TMPDIR itself would prove nothing on macOS, where
+# `mktemp -d` with no template ignores it — see
+# test_kit_tarball_entry_outside_redoku.)
+test_kit_staging_beside_destination() {
+  _w=$(mktemp -d "$ROOT/kit-staging.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home" "$_kit"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # A leftover only a SIGKILL could have produced — everything short of that
+  # is covered by fetch_kit's own traps.
+  mkdir -p "$_kit/.staging.99999/half-a-download"
+  # …and something that is NOT a staging directory, which must survive.
+  mkdir -p "$_kit/notes"
+  printf 'keep me\n' > "$_kit/notes/README"
+
+  assert_fails "staging: kit-mode run ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+
+  assert_file "$_kit/v0.1.0/VERSION" "staging: the kit still installed" || return 1
+  assert_no_file "$_kit/.staging.99999" \
+    "staging: a leftover staging dir in the KIT ROOT was swept, so that is where staging lives" || return 1
+  assert_file "$_kit/notes/README" \
+    "staging: a directory that is not a staging dir was left alone" || return 1
+  _left=$(find "$_kit" -maxdepth 1 -name '.staging.*' 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq 0 "$_left" "staging: nothing named .staging.* survives a successful run" || return 1
+
+  # Checkout mode stages under build/download/, beside its own destination,
+  # for exactly the same reason.
+  build_fake_checkout "$_w/checkout"
+  mkdir -p "$_w/checkout/build/download/.staging.99999/half-a-download"
+  assert_fails "staging: checkout-mode run ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$_w/checkout/bin/redoku" install --download \
+      --host nowhere --yes < /dev/null || return 1
+  assert_file "$_w/checkout/build/download/v0.1.0/redoku/VERSION" \
+    "staging: the checkout-mode download landed" || return 1
+  assert_no_file "$_w/checkout/build/download/.staging.99999" \
+    "staging: checkout mode stages under build/download/, beside its destination" || return 1
+}
+
+# IMPORTANT 1, the other half: the §6.3 reuse gate decides whether a download
+# is SKIPPED, so a tree that is present but incomplete must not satisfy it.
+# is_arm_elf reads bytes 0-4 and 18-19 only, so the game binary alone cannot
+# answer the question — a tree missing everything past it would have been
+# adopted, `current` repointed at it, and a truncated binary pushed.
+test_kit_reuse_gate_rejects_a_partial_tree() {
+  _w=$(mktemp -d "$ROOT/kit-reusegate.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # First install: complete and reusable.
+  assert_fails "reuse gate: first install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "downloading" "reuse gate: the first run fetched" || return 1
+
+  # Second: untouched, so it is reused.
+  assert_fails "reuse gate: second install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "already unpacked" "reuse gate: an intact tree is reused" || return 1
+
+  # Third: the shape an interrupted copy leaves — VERSION and the head of the
+  # game binary present, everything past it gone. The ARM gate still passes,
+  # so this is exactly the tree that used to be adopted.
+  rm -rf "$_kit/v0.1.0/device" "$_kit/v0.1.0/build/rm2fb"
+  assert_fails "reuse gate: partial-tree install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  case $ASSERT_OUTPUT in
+    *"already unpacked"*)
+      printf 'FAIL: reuse gate: a partial tree was adopted instead of re-fetched\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_contains "$ASSERT_OUTPUT" "replacing an incomplete earlier download" \
+    "reuse gate: the partial tree is replaced, not merged with" || return 1
+  assert_file "$_kit/v0.1.0/device/install.sh" \
+    "reuse gate: the re-fetched tree is complete again" || return 1
+}
+
+# MINOR 9: $KIT_VERSION was the only source of a tag not passed through
+# valid_tag. It is mkkit-stamped, so the risk is low — but a tag becomes a
+# directory name and a URL component, and "every source is checked" is a
+# cheaper property to hold than "every source except this one".
+test_kit_stamped_version_is_validated() {
+  _w=$(mktemp -d "$ROOT/kit-badstamp.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  build_fake_kit_inputs "$_w/build"
+  # mkkit stamps whatever --version says; it is not its job to police the
+  # value, and this is the CLI's guard being tested, not the packager's.
+  "$KIT_SH" "$REPO/tools/mkkit.sh" --version '../evil' --out "$_w/out" \
+    --build-dir "$_w/build" >/dev/null || \
+    die "test_kit_stamped_version_is_validated: mkkit.sh failed"
+  _extract=$_w/extract
+  mkdir -p "$_extract"
+  tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_extract" || \
+    die "test_kit_stamped_version_is_validated: tar -x failed"
+
+  assert_fails "bad stamp: exits non-zero" -- \
+    env REDOKU_BASE_URL="file://$_w/no-such-release" HOME="$_home" \
+      "$KIT_SH" "$_extract/redoku/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "was stamped KIT_VERSION='../evil'" \
+    "bad stamp: the message names the stamp it refused" || return 1
+  assert_no_file "$_kit" "bad stamp: nothing was created under the kit root" || return 1
+}
+
+# MINOR 7: the controller singled out "a dry run downloads nothing and writes
+# nothing" with a ruling of its own, and nothing covered it. It is the one
+# behaviour where a future edit could quietly make --dry-run start fetching
+# megabytes with no test to notice.
+test_kit_download_dry_run_writes_nothing() {
+  _w=$(mktemp -d "$ROOT/kit-dlplan.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 \
+    HOME="$_home" \
+    "$KIT_SH" "$REPO/bin/redoku" install --download --dry-run --kit "$_kit" \
+    --bin-dir "$_bin" --host nowhere --yes < /dev/null 2>&1)
+  _dlplan_rc=$?
+  set -e
+  assert_eq 0 "$_dlplan_rc" "download dry-run: exits 0 (output: $ASSERT_OUTPUT)" || return 1
+
+  # Nothing written, anywhere this run could have written.
+  assert_no_file "$_kit" "download dry-run: the kit directory was not created" || return 1
+  assert_no_file "$_bin/redoku" "download dry-run: no PATH entry" || return 1
+  assert_no_file "$_home/.local/bin/redoku" "download dry-run: nothing at the default bin dir" || return 1
+
+  # The plan is concrete: the resolved tag, the asset URL, the destination,
+  # the current repoint and the wrapper path.
+  assert_contains "$ASSERT_OUTPUT" "  version : v0.1.0" \
+    "download dry-run: names the resolved tag" || return 1
+  assert_contains "$ASSERT_OUTPUT" "file://$_w/release/download/v0.1.0/redoku-rm2.tar.gz" \
+    "download dry-run: names the asset URL it would fetch" || return 1
+  assert_contains "$ASSERT_OUTPUT" "  unpack  : $_kit/v0.1.0/" \
+    "download dry-run: names the destination" || return 1
+  assert_contains "$ASSERT_OUTPUT" "  current : $_kit/current -> v0.1.0" \
+    "download dry-run: names the current repoint" || return 1
+  assert_contains "$ASSERT_OUTPUT" "$_bin/redoku, a two-line wrapper" \
+    "download dry-run: names the wrapper path" || return 1
+  assert_contains "$ASSERT_OUTPUT" "[dry-run] stops here" \
+    "download dry-run: stops with the file's own dry-run ending" || return 1
+
+  # And it never carried on into the device plan, whose artifact paths would
+  # all be inside a kit that has not arrived.
+  case $ASSERT_OUTPUT in
+    *"  server : "*|*"  decoy  : "*)
+      printf 'FAIL: download dry-run: continued into the device plan\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
 # ---- main -----------------------------------------------------------------
 
 TESTS='
@@ -1791,6 +2182,7 @@ test_mkkit_stale_sixth_asset_fails
 FIND_GAME_TESTS='
 test_find_game_checkout_mode_message
 test_find_game_kit_mode_message
+test_find_game_downloaded_into_checkout_message
 '
 
 FETCH_KIT_TESTS='
@@ -1803,6 +2195,12 @@ test_kit_foreign_redoku_left_alone
 test_kit_wrapper_self_heals
 test_kit_no_sha256_tool
 test_kit_dry_run_resolves_every_path
+test_kit_prompt_download_rechecks_device_files
+test_kit_empty_option_values
+test_kit_download_dry_run_writes_nothing
+test_kit_staging_beside_destination
+test_kit_reuse_gate_rejects_a_partial_tree
+test_kit_stamped_version_is_validated
 '
 
 for KIT_SH in $KIT_SHELLS; do
