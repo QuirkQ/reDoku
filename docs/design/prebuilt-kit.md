@@ -189,7 +189,7 @@ curl -fsSL -o "$T/redoku"        "$URL/redoku"
 curl -fsSL -o "$T/redoku.sha256" "$URL/redoku.sha256"
 # …compute the digest (shasum -a 256 | sha256sum | openssl dgst -sha256),
 #   compare to the first field, die naming both digests and the URL…
-[ -t 0 ] || { [ -e /dev/tty ] && exec < /dev/tty || true; }
+if [ ! -t 0 ] && [ -e /dev/tty ] && (: < /dev/tty) 2>/dev/null; then exec < /dev/tty; fi
 sh "$T/redoku" install --download --kit "${REDOKU_HOME:-$HOME/.redoku}" "$@"
 ```
 
@@ -198,9 +198,15 @@ Four things in there are load-bearing:
 **`exec < /dev/tty`.** When the script is piped, stdin *is* the script, so
 `confirm()` — which reads stdin and guards with `[ -t 0 ]` **[src]** — would
 die with *"not running in a terminal — add --yes"*. Reopening the terminal is
-what keeps the existing confirmations real rather than bypassed. With no tty
-anywhere (CI, a Docker build) the guard falls through and `confirm()`'s
-existing message is the right answer, not a new failure mode. **[reasoned]**
+what keeps the existing confirmations real rather than bypassed. `/dev/tty`
+exists as a device node in containers and under systemd but opens with ENXIO
+when there is no controlling terminal — and a failed redirection on a bare
+`exec` is a fatal shell error under dash and under bash invoked as `sh`, not
+something a trailing `|| true` can catch — so openability is probed in a
+subshell first, and the real `exec` only runs once that probe has already
+succeeded; with no tty reachable at all it still falls through, and
+`confirm()`'s existing message is the right answer, not a new failure mode.
+**[test]**
 
 **It does not `exec` the CLI.** `exec` would replace the shell and drop the
 `EXIT` trap, leaking the temp dir. Running it as a child costs nothing —

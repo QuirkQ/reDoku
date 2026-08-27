@@ -85,7 +85,11 @@ assert_eq() {
 
 # assert_contains <haystack> <needle> <label> — substring check, for
 # messages. A `case` pattern, not grep: the quoted needle is matched
-# literally, so no regex metacharacters in it need escaping.
+# literally, so no regex metacharacters in it need escaping. Pick needles
+# that appear ONLY in the branch under test — a needle like bare "sha256"
+# also matches an asset URL such as ".../redoku.sha256", so a test can
+# pass having proven nothing about which branch actually ran (fix round 1,
+# IMPORTANT 3): prefer whole phrases like "no sha256 tool" or "refusing".
 assert_contains() {
   case $1 in
     *"$2"*) return 0 ;;
@@ -115,15 +119,22 @@ assert_no_file() {
 # rather than trusting the ambient -e-suppression context described
 # above, so this is safe to call from anywhere, not just inside a test
 # function invoked just so.
+#
+# It saves and restores the CALLER's own -e state (via `$-`) rather than
+# unconditionally turning -e back on afterwards (fix round 1, MINOR 11):
+# this is a shared interface later tasks call too, and a caller that had
+# deliberately run `set +e` before calling it must get that back, not a
+# surprise re-enable.
 assert_fails() {
   _af_label=$1
   shift
   [ "${1:-}" = -- ] || die "assert_fails: expected -- before the command (label: $_af_label)"
   shift
+  case $- in *e*) _af_had_e=1 ;; *) _af_had_e=0 ;; esac
   set +e
   ASSERT_OUTPUT=$("$@" 2>&1)
   _af_rc=$?
-  set -e
+  [ "$_af_had_e" -eq 0 ] || set -e
   if [ "$_af_rc" -eq 0 ]; then
     printf 'FAIL: %s\n  expected non-zero exit, got 0\n  output: %s\n' "$_af_label" "$ASSERT_OUTPUT" >&2
     return 1
@@ -137,6 +148,48 @@ count_entries() {
   find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '
 }
 
+# ---- which shell interprets tools/install.sh ---------------------------
+#
+# KIT_SH is the seam every install.sh invocation below goes through (fix
+# round 1, IMPORTANT 2). The bug that prompted this — a failed `exec <
+# /dev/tty` is fatal under dash and under bash-as-sh, but macOS's own
+# /bin/sh tolerates it — was invisible to this suite even when the suite
+# itself was RUN under dash, because every test still hardcoded a literal
+# `sh` at the invocation site, and on this machine that's bash 3.2. The
+# fix is structural, not "run the harness under dash once": every place
+# that used to say `sh "$REPO/tools/install.sh"` now says
+# `"$KIT_SH" "$REPO/tools/install.sh"`, and `main` below runs the ENTIRE
+# test list once per interesting shell on this machine, not just once.
+KIT_SHELLS="sh"
+if command -v dash >/dev/null 2>&1; then
+  KIT_SHELLS="$KIT_SHELLS dash"
+else
+  printf 'NOTE: dash not found on this machine — skipping the dash pass.\n' >&2
+  printf '      dash is the shell that caught a fatal-exec regression in review;\n' >&2
+  printf '      install it for full coverage.\n' >&2
+fi
+
+# build_minpath <dir> <bin...> — creates <dir> and populates it with
+# symlinks to the real location of each named binary, resolved via
+# `command -v` — except "sh", which resolves through $KIT_SH so a PATH
+# built this way exercises the same shell the rest of the current pass is
+# testing, not whatever the ambient default happens to be. Used by tests
+# that need to run install.sh with almost nothing on PATH (ones exercising
+# what it does when a tool it depends on is missing).
+build_minpath() {
+  _bmp_dir=$1
+  shift
+  mkdir -p "$_bmp_dir" || die "build_minpath: mkdir $_bmp_dir failed"
+  for _bmp_bin in "$@"; do
+    if [ "$_bmp_bin" = sh ]; then
+      _bmp_src=$(command -v "$KIT_SH") || die "build_minpath: no '$KIT_SH' on this machine"
+    else
+      _bmp_src=$(command -v "$_bmp_bin") || die "build_minpath: no '$_bmp_bin' on this machine"
+    fi
+    ln -s "$_bmp_src" "$_bmp_dir/$_bmp_bin"
+  done
+}
+
 # ---- stub CLI ---------------------------------------------------------
 #
 # write_stub_cli <path> [marker] — writes a tiny redoku stand-in used
@@ -147,15 +200,26 @@ count_entries() {
 # scope here: install --download/--kit are Task 2/3 additions to it, and
 # this task is explicitly off-limits from touching that file.
 #
+# The record is ONE ARGUMENT PER LINE (`printf '%s\n' "$@"`), not a single
+# $*-joined line (fix round 1, MINOR 10): $* joins with a space, which is
+# indistinguishable from a single argument that legitimately CONTAINS a
+# space — so a quoting regression in install.sh (e.g. losing the quotes
+# around its --kit value) would go undetected. One line per argument is
+# unambiguous either way; see test_kit_path_with_space, which is the
+# regression this format exists to catch.
+#
 # Both $REDOKU_TEST_RECORD and $REDOKU_TEST_TMPDIR_RECORD are OPTIONAL —
 # a test that only cares whether the stub ran at all (not what it was
 # called with) can leave either unset rather than pointing it at a
 # throwaway path it never reads.
 #
-# [marker], when given, is prefixed to the recorded line ("marker argv"),
-# so two fixture versions can each get a distinguishable stub — needed by
+# [marker], when given, is written as the record's first line, so two
+# fixture versions can each get a distinguishable stub — needed by
 # test_redoku_version_pins_url to prove WHICH one actually ran, since
-# both stubs are always called with the identical argv otherwise.
+# both stubs are always called with the identical argv otherwise. It has
+# to be baked into the generated script at WRITE time (not read from an
+# env var at run time): the whole point is that the test doesn't know in
+# advance which of two fixture assets will actually be fetched and run.
 #
 # It also writes its own directory (dirname "$0") to
 # $REDOKU_TEST_TMPDIR_RECORD when that's set, letting a test that wants
@@ -165,11 +229,13 @@ count_entries() {
 write_stub_cli() {
   _wsc_path=$1
   _wsc_marker=${2:-}
-  _wsc_prefix=
-  [ -z "$_wsc_marker" ] || _wsc_prefix="$_wsc_marker "
   cat > "$_wsc_path" <<STUBEOF
 #!/bin/sh
-[ -z "\${REDOKU_TEST_RECORD:-}" ] || printf '%s\n' "$_wsc_prefix\$*" > "\$REDOKU_TEST_RECORD"
+if [ -n "\${REDOKU_TEST_RECORD:-}" ]; then
+  : > "\$REDOKU_TEST_RECORD"
+  [ -z '$_wsc_marker' ] || printf '%s\n' '$_wsc_marker' >> "\$REDOKU_TEST_RECORD"
+  printf '%s\n' "\$@" >> "\$REDOKU_TEST_RECORD"
+fi
 [ -z "\${REDOKU_TEST_TMPDIR_RECORD:-}" ] || dirname "\$0" > "\$REDOKU_TEST_TMPDIR_RECORD"
 exit 0
 STUBEOF
@@ -253,9 +319,9 @@ TEST_FAILED=0
 run_test() {
   TEST_COUNT=$((TEST_COUNT + 1))
   if "$1"; then
-    printf 'ok   %s\n' "$1"
+    printf 'ok   %s (KIT_SH=%s)\n' "$1" "$KIT_SH"
   else
-    printf 'FAIL %s\n' "$1"
+    printf 'FAIL %s (KIT_SH=%s)\n' "$1" "$KIT_SH"
     TEST_FAILED=$((TEST_FAILED + 1))
   fi
 }
@@ -267,7 +333,8 @@ run_test() {
 # (see tools/install.sh's comment on it), and /dev/null makes that branch
 # run the same deterministic way in an interactive shell, in `make
 # test-kit`, and in CI, instead of picking up whatever the harness's own
-# stdin happens to be.
+# stdin happens to be. Every invocation goes through "$KIT_SH", not a
+# bare `sh` (see the KIT_SHELLS comment above).
 
 test_happy_path() {
   _w=$(mktemp -d "$ROOT/happy.XXXXXX")
@@ -280,14 +347,14 @@ test_happy_path() {
   set +e
   ASSERT_OUTPUT=$(REDOKU_BASE_URL="file://$_w/release" \
     REDOKU_TEST_RECORD="$_record" HOME="$_home" \
-    sh "$REPO/tools/install.sh" < /dev/null 2>&1)
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null 2>&1)
   _rc=$?
   set -e
 
   assert_eq 0 "$_rc" "happy path: install.sh exit code (output: $ASSERT_OUTPUT)" || return 1
   assert_file "$_record" "happy path: stub CLI ran" || return 1
-  assert_eq "install --download --kit $_home/.redoku" "$(cat "$_record")" \
-    "happy path: recorded argv" || return 1
+  _expected=$(printf 'install\n--download\n--kit\n%s\n' "$_home/.redoku")
+  assert_eq "$_expected" "$(cat "$_record")" "happy path: recorded argv" || return 1
 }
 
 test_arg_passthrough() {
@@ -301,12 +368,13 @@ test_arg_passthrough() {
   set +e
   ASSERT_OUTPUT=$(REDOKU_BASE_URL="file://$_w/release" \
     REDOKU_TEST_RECORD="$_record" HOME="$_home" \
-    sh "$REPO/tools/install.sh" --yes --dry-run < /dev/null 2>&1)
+    "$KIT_SH" "$REPO/tools/install.sh" --yes --dry-run < /dev/null 2>&1)
   _rc=$?
   set -e
 
   assert_eq 0 "$_rc" "arg passthrough: install.sh exit code (output: $ASSERT_OUTPUT)" || return 1
-  assert_eq "install --download --kit $_home/.redoku --yes --dry-run" "$(cat "$_record")" \
+  _expected=$(printf 'install\n--download\n--kit\n%s\n--yes\n--dry-run\n' "$_home/.redoku")
+  assert_eq "$_expected" "$(cat "$_record")" \
     "arg passthrough: extra args land after the fixed ones" || return 1
 }
 
@@ -322,15 +390,63 @@ test_redoku_home_honoured() {
   set +e
   ASSERT_OUTPUT=$(REDOKU_BASE_URL="file://$_w/release" \
     REDOKU_TEST_RECORD="$_record" HOME="$_home" REDOKU_HOME="$_kit" \
-    sh "$REPO/tools/install.sh" < /dev/null 2>&1)
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null 2>&1)
   _rc=$?
   set -e
 
   assert_eq 0 "$_rc" "REDOKU_HOME: install.sh exit code (output: $ASSERT_OUTPUT)" || return 1
   # REDOKU_HOME replaces the whole default, it is not $HOME-relative —
   # ${REDOKU_HOME:-$HOME/.redoku} only appends /.redoku in the unset case.
-  assert_eq "install --download --kit $_kit" "$(cat "$_record")" \
+  _expected=$(printf 'install\n--download\n--kit\n%s\n' "$_kit")
+  assert_eq "$_expected" "$(cat "$_record")" \
     "REDOKU_HOME: --kit follows it exactly, no /.redoku suffix" || return 1
+}
+
+test_kit_path_with_space() {
+  # Fix round 1, MINOR 10's regression case: if install.sh's --kit value
+  # ever lost its quoting, a HOME containing a space would split into two
+  # argv entries. write_stub_cli's one-line-per-argument record is what
+  # makes that visible; a $*-joined line would look identical either way.
+  _w=$(mktemp -d "$ROOT/space.XXXXXX")
+  _home="$_w/ho me"
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  _record=$_w/record
+
+  set +e
+  ASSERT_OUTPUT=$(REDOKU_BASE_URL="file://$_w/release" \
+    REDOKU_TEST_RECORD="$_record" HOME="$_home" \
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null 2>&1)
+  _rc=$?
+  set -e
+
+  assert_eq 0 "$_rc" "HOME with a space: install.sh exit code (output: $ASSERT_OUTPUT)" || return 1
+  _expected=$(printf 'install\n--download\n--kit\n%s\n' "$_home/.redoku")
+  assert_eq "$_expected" "$(cat "$_record")" \
+    "HOME with a space: --kit stayed one argument, not two" || return 1
+}
+
+test_no_home_no_redoku_home() {
+  # Fix round 1, IMPORTANT 7: "${REDOKU_HOME:-$HOME/.redoku}" still
+  # evaluates $HOME under set -u the moment REDOKU_HOME is unset, even
+  # when $HOME is ALSO entirely unset — that used to die with a bare
+  # "HOME: parameter not set", naming no fix. Both env vars are
+  # legitimately unset for this one process (not written elsewhere on the
+  # real $HOME — the download succeeds, but the guard fires before
+  # anything is written anywhere).
+  _w=$(mktemp -d "$ROOT/nohome.XXXXXX")
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  _record=$_w/record
+
+  assert_fails "no HOME, no REDOKU_HOME: install.sh exits non-zero" -- \
+    env -u HOME -u REDOKU_HOME REDOKU_BASE_URL="file://$_w/release" \
+    REDOKU_TEST_RECORD="$_record" \
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null || return 1
+
+  assert_contains "$ASSERT_OUTPUT" "REDOKU_HOME" "no HOME, no REDOKU_HOME: message names a fix" || return 1
+  assert_no_file "$_record" "no HOME, no REDOKU_HOME: the stub CLI never ran" || return 1
 }
 
 test_redoku_version_pins_url() {
@@ -346,7 +462,7 @@ test_redoku_version_pins_url() {
   set +e
   ASSERT_OUTPUT=$(REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 \
     REDOKU_TEST_RECORD="$_record" HOME="$_home" \
-    sh "$REPO/tools/install.sh" < /dev/null 2>&1)
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null 2>&1)
   _rc=$?
   set -e
 
@@ -377,7 +493,7 @@ test_checksum_mismatch() {
   assert_fails "checksum mismatch: install.sh exits non-zero" -- \
     env REDOKU_BASE_URL="file://$_w/release" REDOKU_TEST_RECORD="$_record" \
     HOME="$_home" TMPDIR="$_tmpdir" \
-    sh "$REPO/tools/install.sh" < /dev/null || return 1
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null || return 1
 
   assert_contains "$ASSERT_OUTPUT" "$_expect" "checksum mismatch: message names the expected digest" || return 1
   assert_contains "$ASSERT_OUTPUT" "$_actual" "checksum mismatch: message names the actual digest" || return 1
@@ -394,29 +510,48 @@ test_no_sha256_tool() {
   make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
   _record=$_w/record
 
-  # A PATH dir holding only symlinks to what install.sh genuinely needs
-  # when NO digest tool exists (curl, mktemp, rm, and sh itself — sh has
-  # to be reachable through the SAME restricted PATH used for its own
-  # internal lookups, since a shell invoked via PATH=... prog also
-  # resolves "prog" through that overridden PATH, not the ambient one;
-  # verified empirically). Preferred over shadowing shasum/sha256sum/
-  # openssl with three failing stubs: an absent file IS "not found" to
-  # `command -v` on every shell, where a stub has to correctly fake that
-  # across implementations.
+  # Preferred over shadowing shasum/sha256sum/openssl with three failing
+  # stubs: an absent file IS "not found" to `command -v` on every shell,
+  # where a stub has to correctly fake that across implementations.
   _minpath=$_w/minpath
-  mkdir -p "$_minpath"
-  for _bin in curl mktemp rm sh; do
-    _src=$(command -v "$_bin") || die "test_no_sha256_tool: no '$_bin' on this machine"
-    ln -s "$_src" "$_minpath/$_bin"
-  done
+  build_minpath "$_minpath" curl mktemp rm sh
 
   assert_fails "no sha256 tool: install.sh exits non-zero" -- \
     env PATH="$_minpath" REDOKU_BASE_URL="file://$_w/release" \
     REDOKU_TEST_RECORD="$_record" HOME="$_home" \
     "$_minpath/sh" "$REPO/tools/install.sh" < /dev/null || return 1
 
-  assert_contains "$ASSERT_OUTPUT" "sha256" "no sha256 tool: message says so" || return 1
+  # Fix round 1, IMPORTANT 3: bare "sha256" also matches the asset URL
+  # ".../redoku.sha256" (e.g. if redoku.sha256 were the thing missing,
+  # producing "could not download .../redoku.sha256"), so that needle
+  # passed vacuously without proving refusal happened at all. "no sha256
+  # tool" appears only in the branch this test exists to exercise.
+  assert_contains "$ASSERT_OUTPUT" "no sha256 tool" "no sha256 tool: message says so, specifically" || return 1
   assert_no_file "$_record" "no sha256 tool: the stub CLI never ran" || return 1
+}
+
+test_no_curl() {
+  # Fix round 1, MINOR 9: the no-curl branch (design doc §7's failure
+  # catalogue) had no covering test — one omitted symlink away from
+  # test_no_sha256_tool's own build_minpath call.
+  _w=$(mktemp -d "$ROOT/nocurl.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  _record=$_w/record
+
+  _minpath=$_w/minpath
+  build_minpath "$_minpath" mktemp rm sh
+
+  assert_fails "no curl: install.sh exits non-zero" -- \
+    env PATH="$_minpath" REDOKU_BASE_URL="file://$_w/release" \
+    REDOKU_TEST_RECORD="$_record" HOME="$_home" \
+    "$_minpath/sh" "$REPO/tools/install.sh" < /dev/null || return 1
+
+  assert_contains "$ASSERT_OUTPUT" "no 'curl'" "no curl: message says so" || return 1
+  assert_contains "$ASSERT_OUTPUT" "--artifacts" "no curl: message names an offline route" || return 1
+  assert_no_file "$_record" "no curl: the stub CLI never ran" || return 1
 }
 
 test_404_missing_asset() {
@@ -426,16 +561,37 @@ test_404_missing_asset() {
 
   assert_fails "404 unpinned: install.sh exits non-zero" -- \
     env REDOKU_BASE_URL="file://$_w/empty-release" HOME="$_home" \
-    sh "$REPO/tools/install.sh" < /dev/null || return 1
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null || return 1
   assert_contains "$ASSERT_OUTPUT" "file://$_w/empty-release" "404 unpinned: message names the URL" || return 1
   assert_contains "$ASSERT_OUTPUT" "no published release" "404 unpinned: wording for the no-REDOKU_VERSION case" || return 1
 
   assert_fails "404 pinned: install.sh exits non-zero" -- \
     env REDOKU_BASE_URL="file://$_w/empty-release" REDOKU_VERSION=v9.9.9 HOME="$_home" \
-    sh "$REPO/tools/install.sh" < /dev/null || return 1
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null || return 1
   assert_contains "$ASSERT_OUTPUT" "file://$_w/empty-release" "404 pinned: message names the URL" || return 1
   assert_contains "$ASSERT_OUTPUT" "v9.9.9" "404 pinned: message names the version that may not exist" || return 1
   assert_contains "$ASSERT_OUTPUT" "may not exist" "404 pinned: wording differs from the unpinned case" || return 1
+}
+
+test_empty_checksum_file() {
+  # Fix round 1, IMPORTANT 4: `read` hits EOF on an empty (or
+  # newline-less, truncated) redoku.sha256 and returns non-zero; under
+  # set -eu that used to exit the whole script with NO message at all.
+  _w=$(mktemp -d "$ROOT/emptysum.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  _record=$_w/record
+  : > "$_w/release/download/v0.1.0/redoku.sha256"
+
+  assert_fails "empty checksum file: install.sh exits non-zero" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_TEST_RECORD="$_record" \
+    HOME="$_home" "$KIT_SH" "$REPO/tools/install.sh" < /dev/null || return 1
+
+  assert_contains "$ASSERT_OUTPUT" "empty or unreadable" "empty checksum file: message says so, not silence" || return 1
+  assert_contains "$ASSERT_OUTPUT" "redoku.sha256" "empty checksum file: message names the file" || return 1
+  assert_no_file "$_record" "empty checksum file: the stub CLI never ran" || return 1
 }
 
 test_tmpdir_cleanup_on_success() {
@@ -450,7 +606,7 @@ test_tmpdir_cleanup_on_success() {
   set +e
   ASSERT_OUTPUT=$(REDOKU_BASE_URL="file://$_w/release" HOME="$_home" TMPDIR="$_tmpdir" \
     REDOKU_TEST_RECORD="$_w/record" \
-    sh "$REPO/tools/install.sh" < /dev/null 2>&1)
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null 2>&1)
   _rc=$?
   set -e
 
@@ -467,7 +623,7 @@ test_tmpdir_cleanup_on_failure() {
 
   assert_fails "cleanup on failure: install.sh exits non-zero" -- \
     env REDOKU_BASE_URL="file://$_w/empty-release" HOME="$_home" TMPDIR="$_tmpdir" \
-    sh "$REPO/tools/install.sh" < /dev/null || return 1
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null || return 1
 
   assert_eq 0 "$(count_entries "$_tmpdir")" "cleanup on failure: install.sh's temp dir is gone afterwards" || return 1
 }
@@ -478,16 +634,23 @@ TESTS='
 test_happy_path
 test_arg_passthrough
 test_redoku_home_honoured
+test_kit_path_with_space
+test_no_home_no_redoku_home
 test_redoku_version_pins_url
 test_checksum_mismatch
 test_no_sha256_tool
+test_no_curl
 test_404_missing_asset
+test_empty_checksum_file
 test_tmpdir_cleanup_on_success
 test_tmpdir_cleanup_on_failure
 '
 
-for _t in $TESTS; do
-  run_test "$_t"
+for KIT_SH in $KIT_SHELLS; do
+  printf '=== bootstrap tests under KIT_SH=%s ===\n' "$KIT_SH"
+  for _t in $TESTS; do
+    run_test "$_t"
+  done
 done
 
 printf '%s/%s tests passed\n' "$((TEST_COUNT - TEST_FAILED))" "$TEST_COUNT"
