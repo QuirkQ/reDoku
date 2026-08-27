@@ -298,6 +298,33 @@ make_fake_arm_elf() {
     die "make_fake_arm_elf: $_mfae_path has $_mfae_machine at offset 18-19, expected 2800 — bin/redoku's is_arm_elf would reject this file"
 }
 
+# make_dead_ssh_config <path> — an ssh config under which every connection
+# fails INSTANTLY, so a test can drive a real, complete host-side install
+# (download, verify, unpack, symlink, wrapper) and have the run stop dead at
+# connect()'s die, which is the assertion boundary: everything host-side has
+# happened by then, nothing device-side has been attempted.
+#
+# Why not just "--host 127.0.0.1": a developer's Mac may well have a real
+# sshd listening there, in which case the run does not fail — it sits at a
+# password prompt until the test times out or someone notices. ProxyCommand
+# /usr/bin/false makes the connection fail before any network or credential
+# is involved at all; BatchMode yes guarantees no prompt even if something
+# else answered; ConnectTimeout 2 bounds the pathological case. The other
+# seam, --dry-run, returns early from connect() and never reaches ssh — use
+# that where the point is the PLAN, and this where the point is that the
+# host-side work really ran.
+make_dead_ssh_config() {
+  _mdsc_path=$1
+  mkdir -p "$(dirname -- "$_mdsc_path")" || \
+    die "make_dead_ssh_config: mkdir for $_mdsc_path failed"
+  cat > "$_mdsc_path" <<'EOF'
+Host *
+  ProxyCommand /usr/bin/false
+  BatchMode yes
+  ConnectTimeout 2
+EOF
+}
+
 # ---- the fixture-release builder ---------------------------------------
 #
 # make_fixture_release <dir> <version> <cli-source-file>
@@ -1071,6 +1098,667 @@ test_find_game_kit_mode_message() {
     "find_game kit-mode: names the fix, redoku upgrade" || return 1
 }
 
+# ---- fetch_kit / install --download (design doc §8 tests 2,3,4,7,8,9) ----
+#
+# These drive the REAL bin/redoku, not a stub: `install --download`, `--kit`,
+# `--bin-dir`, `--no-symlink` and fetch_kit all arrived in it in this task.
+# Every one of them is offline (REDOKU_BASE_URL points at a file:// fixture),
+# gets its own $HOME, kit root and bin dir under $ROOT, and never touches a
+# device — either because --dry-run returns early from connect(), or because
+# make_dead_ssh_config makes the ssh attempt fail instantly.
+#
+# Note which §6.1 tag-resolution step these exercise: a file:// URL has no
+# redirects at all, so step 3 finds nothing and the tag comes from step 4 —
+# VERSION inside the downloaded tarball. That is the design doc's own
+# prediction (§6.1: "file:// has no redirects at all, so this is the path the
+# offline tests exercise"), not an accident of the harness.
+
+# The §3.2 files (not the directory entries) an unpacked kit must hold,
+# derived from KIT_TREE_EXPECTED above rather than listed a second time —
+# so a change to §3.2 has exactly one place to be made.
+assert_kit_tree() { # assert_kit_tree <tree-root> <label>
+  _akt_root=$1
+  _akt_label=$2
+  while IFS= read -r _akt_entry; do
+    case $_akt_entry in
+      */) continue ;;
+    esac
+    _akt_rel=${_akt_entry#redoku/}
+    assert_file "$_akt_root/$_akt_rel" "$_akt_label: §3.2 tree has $_akt_rel" || return 1
+  done <<EOF
+$KIT_TREE_EXPECTED
+EOF
+}
+
+# Design doc §8 test 2: the bootstrap end to end, now with a real CLI and a
+# real kit — tools/install.sh fetches this checkout's own bin/redoku, hands
+# over to it, and it downloads, verifies, unpacks and wires up a kit.
+#
+# The CLI asset is $REPO/bin/redoku verbatim, so it goes out UNSTAMPED
+# (KIT_VERSION=dev). That is deliberate: with no stamp and no redirect to
+# read, §6.1 falls through to step 4 and takes the tag out of the tarball,
+# which is the path an offline install actually takes. TMPDIR is pointed
+# inside the test's own tree so that $REPO — which for the bootstrapped CLI
+# is the PARENT of install.sh's temp dir — is a directory this test controls
+# and not the machine's shared /tmp.
+test_kit_bootstrap_end_to_end() {
+  _w=$(mktemp -d "$ROOT/kit-e2e.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  _tmp=$_w/tmp
+  mkdir -p "$_home" "$_tmp"
+  make_fixture_release "$_w/release" v0.1.0 "$REPO/bin/redoku"
+  make_dead_ssh_config "$_w/ssh_config"
+
+  assert_fails "bootstrap e2e: the run ends non-zero at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" TMPDIR="$_tmp" \
+      REDOKU_HOME="$_kit" REDOKU_BIN_DIR="$_bin" \
+      "$KIT_SH" "$REPO/tools/install.sh" \
+      --ssh-config "$_w/ssh_config" --host nowhere --yes < /dev/null || return 1
+
+  # "could not connect to" appears in exactly one place in bin/redoku —
+  # connect()'s die — so this proves the run got all the way through the
+  # host-side work and stopped at the device, rather than dying earlier for
+  # some reason the assertions below would then be checking against a
+  # half-finished tree.
+  assert_contains "$ASSERT_OUTPUT" "could not connect to root@nowhere" \
+    "bootstrap e2e: failed at connect(), not before it" || return 1
+
+  assert_kit_tree "$_kit/v0.1.0" "bootstrap e2e" || return 1
+
+  # current -> v0.1.0, as a symlink and not a copy.
+  [ -L "$_kit/current" ] || {
+    printf 'FAIL: bootstrap e2e: %s is not a symlink\n' "$_kit/current" >&2
+    return 1
+  }
+  assert_eq "v0.1.0" "$(readlink "$_kit/current")" \
+    "bootstrap e2e: current points at the version directory, by name" || return 1
+  assert_eq "v0.1.0" "$(cat "$_kit/current/VERSION")" \
+    "bootstrap e2e: current/VERSION reads the tag" || return 1
+
+  # The wrapper records the RESOLVED kit path (design doc §5.3), so the
+  # expectation has to be resolved too — on macOS $TMPDIR lives under a
+  # /var -> /private/var symlink, and comparing against the unresolved
+  # string would fail for a reason that has nothing to do with the code.
+  _kit_resolved=$(CDPATH= cd -- "$_kit" && pwd -P) || \
+    die "test_kit_bootstrap_end_to_end: could not resolve $_kit"
+  assert_file "$_bin/redoku" "bootstrap e2e: the PATH entry exists" || return 1
+  [ -x "$_bin/redoku" ] || {
+    printf 'FAIL: bootstrap e2e: %s is not executable\n' "$_bin/redoku" >&2
+    return 1
+  }
+  assert_contains "$(cat "$_bin/redoku")" \
+    "exec \"$_kit_resolved/current/bin/redoku\" \"\$@\"" \
+    "bootstrap e2e: the wrapper execs through <kit>/current, absolute and resolved" || return 1
+
+  set +e
+  _e2e_help=$(env HOME="$_home" "$_bin/redoku" --help 2>&1)
+  _e2e_rc=$?
+  set -e
+  assert_eq 0 "$_e2e_rc" "bootstrap e2e: the wrapper runs (output: $_e2e_help)" || return 1
+  assert_contains "$_e2e_help" "put the rm2fb display server" \
+    "bootstrap e2e: the wrapper reached the real CLI's --help" || return 1
+}
+
+# Not in design doc §8's numbered list, and here because a hand-run found a
+# real bug that every test in that list missed: `current` is repointed and
+# older versions pruned by an `install --download` of a different version
+# just as much as by `upgrade` (§5.3), and NONE of the tests above ever ran a
+# second install over an existing kit.
+#
+# What that hid: the repoint was written as the design doc's §6.2 sketch says
+# — `ln -s <tag> .current.new && mv -f .current.new current` — and BSD `mv`
+# resolves a destination that is a symlink to a directory, so the second
+# install moved .current.new INSIDE the OLD version directory, left `current`
+# pointing at the old tag, and then pruned the wrong version. Every command
+# in the run had succeeded and the run reported the new version.
+#
+# This is deliberately NOT design doc §8's test 5: that one drives the
+# `upgrade` COMMAND, which is a later task and does not exist yet.
+test_kit_second_download_repoints_and_prunes() {
+  _w=$(mktemp -d "$ROOT/kit-repoint.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  make_fixture_release "$_w/release" v0.2.0 "$_w/cli"
+  make_fixture_release "$_w/release" v0.3.0 "$_w/cli"
+
+  # Pinned with REDOKU_VERSION so each run installs a known tag: with a
+  # file:// fixture there is no redirect to resolve "latest" through, and all
+  # three versions live in the same fixture directory.
+  for _v in v0.1.0 v0.2.0 v0.3.0; do
+    assert_fails "repoint: install $_v ends at the connect step" -- \
+      env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION="$_v" HOME="$_home" \
+        "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+        --no-symlink --host nowhere --yes < /dev/null || return 1
+    assert_eq "$_v" "$(readlink "$_kit/current")" \
+      "repoint: current follows the version just installed ($_v)" || return 1
+    assert_eq "$_v" "$(cat "$_kit/current/VERSION")" \
+      "repoint: current/VERSION reads the version just installed ($_v)" || return 1
+  done
+
+  # One back is kept so a rollback is one symlink swap; the one before that
+  # is gone.
+  assert_file "$_kit/v0.3.0/VERSION" "repoint: the new version is there" || return 1
+  assert_file "$_kit/v0.2.0/VERSION" "repoint: the one 'current' pointed at before is kept" || return 1
+  assert_no_file "$_kit/v0.1.0" "repoint: the version before that is pruned" || return 1
+
+  # Nothing was left inside a version directory by the repoint itself — the
+  # exact shape the mv bug took.
+  _stray=$(find "$_kit" -name '.current.new' 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq 0 "$_stray" "repoint: no stray link left inside a version directory" || return 1
+
+  # Re-running the version that is ALREADY current must reuse it and must NOT
+  # prune the one-back version: 'install' is documented safe to re-run from
+  # any state, and a second run that quietly destroys the rollback target
+  # would not be.
+  assert_fails "repoint: re-running the current version ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.3.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "already unpacked" \
+    "repoint: a version already on disk is reused, not re-fetched (§6.3)" || return 1
+  assert_file "$_kit/v0.2.0/VERSION" \
+    "repoint: re-running the current version leaves the rollback target alone" || return 1
+  assert_eq "v0.3.0" "$(readlink "$_kit/current")" \
+    "repoint: re-running the current version leaves current where it was" || return 1
+}
+
+# Design doc §8 test 3: a corrupted tarball is refused, both digests are
+# named, and the kit directory is left with nothing in it.
+test_kit_checksum_mismatch() {
+  _w=$(mktemp -d "$ROOT/kit-badsum.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # Corrupted AFTER mkkit checksummed it, so redoku-rm2.tar.gz.sha256 still
+  # names the pre-corruption digest — exactly the mismatch fetch_kit exists
+  # to catch.
+  _expect=$(kit_digest "$MFR_PINNED/redoku-rm2.tar.gz")
+  printf '\n# corrupted for test_kit_checksum_mismatch\n' >> "$MFR_PINNED/redoku-rm2.tar.gz"
+  _actual=$(kit_digest "$MFR_PINNED/redoku-rm2.tar.gz")
+  [ "$_expect" != "$_actual" ] || \
+    die "test_kit_checksum_mismatch: corruption didn't change the digest"
+
+  assert_fails "kit checksum mismatch: install --download exits non-zero" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --bin-dir "$_bin" --host nowhere --yes < /dev/null || return 1
+
+  assert_contains "$ASSERT_OUTPUT" "checksum mismatch" \
+    "kit checksum mismatch: message says which check failed" || return 1
+  assert_contains "$ASSERT_OUTPUT" "$_expect" \
+    "kit checksum mismatch: message names the expected digest" || return 1
+  assert_contains "$ASSERT_OUTPUT" "$_actual" \
+    "kit checksum mismatch: message names the digest it actually got" || return 1
+  assert_contains "$ASSERT_OUTPUT" "file://$_w/release" \
+    "kit checksum mismatch: message names the URL" || return 1
+  assert_no_file "$_kit/v0.1.0" "kit checksum mismatch: no version directory" || return 1
+  assert_no_file "$_kit/current" "kit checksum mismatch: no current symlink" || return 1
+  assert_eq 0 "$(count_entries "$_kit")" \
+    "kit checksum mismatch: the kit directory holds nothing at all" || return 1
+  assert_no_file "$_bin/redoku" "kit checksum mismatch: no PATH entry written" || return 1
+}
+
+# Design doc §8 test 4: a tarball with an entry outside redoku/ is refused
+# BEFORE extraction, and nothing is written anywhere.
+#
+# Both bad tarballs are re-checksummed after they are built, so the checksum
+# passes and the ^redoku/ guard is unambiguously what fires — a test that let
+# the checksum fail instead would prove nothing about the guard.
+#
+# Each is self-checked the way make_fake_arm_elf self-checks its output: some
+# tar implementations normalise a "..", or strip a leading "/", while
+# PACKING. If this machine's tar did that, the archive would be harmless and
+# the test would pass having exercised nothing — so the harness dies loudly
+# rather than reporting a green it did not earn.
+test_kit_tarball_entry_outside_redoku() {
+  _w=$(mktemp -d "$ROOT/kit-evil.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+
+  # The escaping entry is "redoku/../../evil": extracted from a temp dir
+  # <tmp>, that resolves to <tmp>/../../evil, i.e. genuinely outside the
+  # directory bin/redoku extracts into — which is what makes the
+  # "nothing was written outside the temp dir" assertion below meaningful.
+  _stage=$_w/stage
+  mkdir -p "$_stage/a/b/redoku"
+  printf 'v0.1.0\n' > "$_stage/a/b/redoku/VERSION"
+  # Two levels up from the packing directory, which is what makes the entry
+  # name "redoku/../../evil" resolve to a real file while packing and to
+  # <tmp>/../evil — outside the extraction directory — while unpacking.
+  printf 'pwned\n' > "$_stage/a/evil"
+  ( cd "$_stage/a/b" && tar -czPf "$_w/bad-dotdot.tgz" redoku redoku/../../evil ) || \
+    die "test_kit_tarball_entry_outside_redoku: could not build the '..' tarball"
+  tar -tzf "$_w/bad-dotdot.tgz" | grep -q '\.\./\.\./evil' || \
+    die "test_kit_tarball_entry_outside_redoku: this machine's tar normalised the '..' away while packing, so the guard under test cannot be exercised here"
+
+  ( cd "$_stage/a/b" && tar -czPf "$_w/bad-abs.tgz" redoku "$_stage/a/evil" ) || \
+    die "test_kit_tarball_entry_outside_redoku: could not build the absolute-path tarball"
+  tar -tzf "$_w/bad-abs.tgz" | grep -q '^/' || \
+    die "test_kit_tarball_entry_outside_redoku: this machine's tar stripped the leading '/' while packing, so the guard under test cannot be exercised here"
+
+  for _case in dotdot abs; do
+    _rel=$_w/release-$_case
+    _kit=$_w/kit-$_case
+    make_fixture_release "$_rel" v0.1.0 "$_w/cli"
+    cp "$_w/bad-$_case.tgz" "$MFR_PINNED/redoku-rm2.tar.gz" || \
+      die "test_kit_tarball_entry_outside_redoku: cp bad-$_case.tgz failed"
+    printf '%s  redoku-rm2.tar.gz\n' "$(kit_digest "$MFR_PINNED/redoku-rm2.tar.gz")" \
+      > "$MFR_PINNED/redoku-rm2.tar.gz.sha256"
+
+    assert_fails "evil tarball ($_case): install --download exits non-zero" -- \
+      env REDOKU_BASE_URL="file://$_rel" HOME="$_home" \
+        "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+        --no-symlink --host nowhere --yes < /dev/null || return 1
+
+    # "refusing to unpack" appears only in the ^redoku/ guard's die — not in
+    # the checksum branch, not in tar's own errors — so it proves the archive
+    # was rejected by that check and not by something else upstream.
+    assert_contains "$ASSERT_OUTPUT" "refusing to unpack" \
+      "evil tarball ($_case): refused by the entry guard, not by something else" || return 1
+
+    # "refused BEFORE extraction, and extract nothing" is the actual contract,
+    # and this is how it is proved: bin/redoku says "unpacking" on the line
+    # immediately before its `tar -xzf`, so that word's absence means tar was
+    # never asked to extract anything at all.
+    #
+    # Deliberately NOT proved by pointing $TMPDIR at a directory of our own
+    # and asserting nothing escaped into it. Two independent reasons that
+    # assertion would pass without proving a thing, both measured on this
+    # machine: macOS's `mktemp -d` (no template) ignores $TMPDIR entirely and
+    # uses the per-user Darwin temp dir, so the seam does not exist here; and
+    # bsdtar refuses a path containing ".." on its own ("Path contains '..'"),
+    # so on this platform the escape would not happen even with bin/redoku's
+    # guard deleted. The guard is still right — GNU tar instead strips the
+    # ".." with a warning and extracts, and neither behaviour is something a
+    # security check should be delegated to — but the ASSERTION has to be one
+    # this machine can actually fail.
+    case $ASSERT_OUTPUT in
+      *unpacking*)
+        printf 'FAIL: evil tarball (%s): tar was asked to extract before the guard refused\n  output: %s\n' \
+          "$_case" "$ASSERT_OUTPUT" >&2
+        return 1 ;;
+    esac
+    assert_no_file "$_kit/v0.1.0" "evil tarball ($_case): nothing unpacked into the kit" || return 1
+    assert_eq 0 "$(count_entries "$_kit")" \
+      "evil tarball ($_case): the kit directory holds nothing at all" || return 1
+  done
+
+  # Case-specific: the message has to name the offending entry, and the two
+  # entries are different strings.
+  _rel=$_w/release-dotdot
+  _kit=$_w/kit-dotdot-again
+  assert_fails "evil tarball (..): rerun for the entry-naming assertion" -- \
+    env REDOKU_BASE_URL="file://$_rel" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "redoku/../../evil" \
+    "evil tarball (..): message names the offending entry verbatim" || return 1
+
+  _rel=$_w/release-abs
+  _kit=$_w/kit-abs-again
+  assert_fails "evil tarball (absolute): rerun for the entry-naming assertion" -- \
+    env REDOKU_BASE_URL="file://$_rel" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "$_stage/a/evil" \
+    "evil tarball (absolute): message names the offending entry verbatim" || return 1
+}
+
+# Design doc §8 test 7, first three cases: --bin-dir puts the wrapper where
+# it says, --no-symlink writes nothing anywhere and says nothing about PATH,
+# and the not-on-PATH hint appears exactly when the bin dir is not on PATH.
+#
+# One fixture, three runs against three separate kit roots. They cannot share
+# a kit root: fetch_kit's §6.3 idempotence would reuse the first run's tree
+# and the later runs would exercise a different path than the first.
+test_kit_bin_dir_and_path_hint() {
+  _w=$(mktemp -d "$ROOT/kit-bindir.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # (a) --bin-dir honoured, and the bin dir is NOT on PATH, so the hint runs.
+  _bin_a=$_w/bin-a
+  assert_fails "bin-dir: run (a) ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_w/kit-a" \
+      --bin-dir "$_bin_a" --host nowhere --yes < /dev/null || return 1
+  assert_file "$_bin_a/redoku" "bin-dir: --bin-dir put the wrapper where it said" || return 1
+  # "is not on your PATH" occurs in exactly one place in bin/redoku.
+  assert_contains "$ASSERT_OUTPUT" "is not on your PATH" \
+    "bin-dir: (a) the not-on-PATH hint was printed" || return 1
+  assert_contains "$ASSERT_OUTPUT" "export PATH=" \
+    "bin-dir: (a) the hint prints the line to add" || return 1
+  # …and never edits a shell rc file: there is no rc file under this HOME.
+  assert_no_file "$_home/.profile" "bin-dir: (a) no shell rc file was created" || return 1
+  assert_no_file "$_home/.bashrc" "bin-dir: (a) no shell rc file was created" || return 1
+  assert_no_file "$_home/.zshrc" "bin-dir: (a) no shell rc file was created" || return 1
+
+  # (b) --no-symlink: nothing written anywhere, nothing said about PATH.
+  # $REDOKU_BIN_DIR is set on purpose — an environment default going unused
+  # is not a contradiction, so the run must succeed AND ignore it.
+  _bin_b=$_w/bin-b
+  assert_fails "bin-dir: run (b) ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" REDOKU_BIN_DIR="$_bin_b" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_w/kit-b" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "could not connect to root@nowhere" \
+    "bin-dir: (b) --no-symlink still installed, it just wrote no PATH entry" || return 1
+  assert_no_file "$_bin_b/redoku" "bin-dir: (b) --no-symlink wrote no wrapper" || return 1
+  assert_no_file "$_home/.local/bin/redoku" \
+    "bin-dir: (b) --no-symlink wrote nothing at the default bin dir either" || return 1
+  case $ASSERT_OUTPUT in
+    *"is not on your PATH"*|*"PATH entry:"*)
+      printf 'FAIL: bin-dir: (b) --no-symlink still said something about PATH\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # (c) the same bin dir, this time ON $PATH: the hint must NOT be printed.
+  _bin_c=$_w/bin-c
+  assert_fails "bin-dir: run (c) ends at the connect step" -- \
+    env PATH="$_bin_c:$PATH" REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_w/kit-c" \
+      --bin-dir "$_bin_c" --host nowhere --yes < /dev/null || return 1
+  assert_file "$_bin_c/redoku" "bin-dir: (c) the wrapper was still written" || return 1
+  case $ASSERT_OUTPUT in
+    *"is not on your PATH"*)
+      printf 'FAIL: bin-dir: (c) the hint was printed for a bin dir that IS on PATH\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
+# Design doc §8 test 7, the foreign-`redoku` case: a file at the bin dir that
+# this installer did not write is left byte-for-byte alone, the message names
+# its path and both ways out, and the install carries on rather than failing.
+test_kit_foreign_redoku_left_alone() {
+  _w=$(mktemp -d "$ROOT/kit-foreign.XXXXXX")
+  _home=$_w/home
+  _bin=$_w/bindir
+  mkdir -p "$_home" "$_bin"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  printf '#!/bin/sh\n# somebody else put this here\necho not ours\n' > "$_bin/redoku"
+  chmod +x "$_bin/redoku"
+  _before=$(kit_digest "$_bin/redoku")
+
+  assert_fails "foreign redoku: the run still ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_w/kit" \
+      --bin-dir "$_bin" --host nowhere --yes < /dev/null || return 1
+
+  assert_eq "$_before" "$(kit_digest "$_bin/redoku")" \
+    "foreign redoku: left byte-for-byte unchanged" || return 1
+  # "already a 'redoku' at" occurs only in write_path_entry's foreign branch.
+  assert_contains "$ASSERT_OUTPUT" "already a 'redoku' at" \
+    "foreign redoku: the foreign-file branch is what ran" || return 1
+  assert_contains "$ASSERT_OUTPUT" "$_bin/redoku" \
+    "foreign redoku: message names its path" || return 1
+  assert_contains "$ASSERT_OUTPUT" "--bin-dir DIR" \
+    "foreign redoku: message suggests --bin-dir" || return 1
+  assert_contains "$ASSERT_OUTPUT" "--no-symlink" \
+    "foreign redoku: message suggests --no-symlink" || return 1
+  # Not a failed install: it reached the device step, which is as far as any
+  # of these tests can go.
+  assert_contains "$ASSERT_OUTPUT" "could not connect to root@nowhere" \
+    "foreign redoku: the install carried on rather than failing" || return 1
+  # The kit itself still went in — only the PATH entry was skipped.
+  assert_file "$_w/kit/v0.1.0/VERSION" \
+    "foreign redoku: the kit was still unpacked" || return 1
+}
+
+# Design doc §5.3's stated consequences of the wrapper, which §8's numbered
+# list does not cover: "a kit-mode install rewrites the wrapper every run, so
+# a moved ~/.local/bin or a hand-edited file self-heals and re-running stays
+# idempotent" — and its neighbour, "a `redoku` some package manager put there
+# is never touched".
+#
+# Those two collide, and this test records how the collision was settled.
+# There is no way to tell a wrapper somebody hand-edited beyond recognition
+# from a file that was never ours: both are "a redoku here without our exec
+# line in it". The OWNERSHIP rule wins — a file we cannot prove is ours is
+# left alone, and the run says so and carries on — because the alternative is
+# an installer that overwrites strangers' files, and because the next task's
+# `uninstall --self` decides what it may DELETE by that same rule. What
+# "self-heals" then means, and what is asserted below: an edit that leaves the
+# exec line intact is rewritten, a moved bin directory gets a fresh wrapper,
+# and re-running is idempotent.
+#
+# The kit root is reached through a SYMLINK on purpose. The wrapper records
+# the kit path literally and is recognised by comparing that literal back, so
+# the string has to come out identical whether the run resolved the root
+# itself (a --download creates it) or inherited it from marker 2 (a plain
+# `install` from inside the kit). Written against an unresolved path the two
+# disagreed, and each run then saw the OTHER's wrapper as a stranger's file.
+test_kit_wrapper_self_heals() {
+  _w=$(mktemp -d "$ROOT/kit-wrapper.XXXXXX")
+  _home=$_w/home
+  _bin=$_w/bindir
+  mkdir -p "$_home" "$_w/real"
+  ln -s "$_w/real" "$_w/kitlink"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  assert_fails "wrapper: the --download run ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_w/kitlink" \
+      --bin-dir "$_bin" --host nowhere --yes < /dev/null || return 1
+  assert_file "$_bin/redoku" "wrapper: written by the download" || return 1
+  _first=$(kit_digest "$_bin/redoku")
+  _exec_line=$(grep '^exec ' "$_bin/redoku") || \
+    die "test_kit_wrapper_self_heals: the wrapper has no exec line"
+
+  # Edited around the exec line — a stray comment, a lost shebang — which is
+  # still recognisably ours, and is what gets healed.
+  printf '# somebody poked at this\n%s\n# and left this behind\n' "$_exec_line" > "$_bin/redoku"
+
+  # No --download, and driven through the kit's OWN CLI, so the kit root comes
+  # from marker 2 and has to resolve to the identical string.
+  assert_fails "wrapper: the plain kit install ends at the connect step" -- \
+    env REDOKU_BIN_DIR="$_bin" HOME="$_home" \
+      "$KIT_SH" "$_w/real/current/bin/redoku" install --host nowhere --yes < /dev/null || return 1
+  assert_eq "$_first" "$(kit_digest "$_bin/redoku")" \
+    "wrapper: a plain kit install healed it byte-identically (stable resolved path)" || return 1
+
+  # A third run over the healed wrapper changes nothing, and never mistakes
+  # its own file for a stranger's.
+  assert_fails "wrapper: the idempotent third run ends at the connect step" -- \
+    env REDOKU_BIN_DIR="$_bin" HOME="$_home" \
+      "$KIT_SH" "$_w/real/current/bin/redoku" install --host nowhere --yes < /dev/null || return 1
+  case $ASSERT_OUTPUT in
+    *"already a 'redoku' at"*)
+      printf 'FAIL: wrapper: the installer did not recognise its own wrapper\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_eq "$_first" "$(kit_digest "$_bin/redoku")" \
+    "wrapper: the third run left it byte-identical" || return 1
+
+  # A moved bin directory gets a fresh wrapper with the same contents,
+  # because it points at the kit and not at where it happens to live.
+  _bin2=$_w/bindir-moved
+  assert_fails "wrapper: the moved-bin-dir run ends at the connect step" -- \
+    env REDOKU_BIN_DIR="$_bin2" HOME="$_home" \
+      "$KIT_SH" "$_w/real/current/bin/redoku" install --host nowhere --yes < /dev/null || return 1
+  assert_eq "$_first" "$(kit_digest "$_bin2/redoku")" \
+    "wrapper: a moved bin dir gets the same wrapper" || return 1
+
+  # And the ownership rule's other side: edited past recognition, it is a
+  # stranger's file and stays untouched.
+  _bin3=$_w/bindir-unrecognisable
+  mkdir -p "$_bin3"
+  printf '#!/bin/sh\necho nothing of ours survives here\n' > "$_bin3/redoku"
+  _stranger=$(kit_digest "$_bin3/redoku")
+  assert_fails "wrapper: the unrecognisable-file run ends at the connect step" -- \
+    env REDOKU_BIN_DIR="$_bin3" HOME="$_home" \
+      "$KIT_SH" "$_w/real/current/bin/redoku" install --host nowhere --yes < /dev/null || return 1
+  assert_eq "$_stranger" "$(kit_digest "$_bin3/redoku")" \
+    "wrapper: a redoku without our exec line is left alone, not healed over" || return 1
+  assert_contains "$ASSERT_OUTPUT" "already a 'redoku' at" \
+    "wrapper: and the run says so rather than silently skipping it" || return 1
+}
+
+# Design doc §8 test 8: with no shasum, sha256sum or openssl reachable,
+# install --download refuses — and refuses BEFORE downloading anything, which
+# is what "never falls through to an unverified install" has to mean in
+# practice.
+test_kit_no_sha256_tool() {
+  _w=$(mktemp -d "$ROOT/kit-nodigest.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # Same reasoning as test_no_sha256_tool's minpath: an absent file IS "not
+  # found" to `command -v` on every shell, where a stub has to fake that
+  # correctly across implementations.
+  #
+  # The list is deliberately WIDER than what the refusal itself needs
+  # (dirname for $REPO, ssh for bin/redoku's up-front `command -v ssh`, curl
+  # for fetch_kit's first preflight check). It also carries everything the
+  # download path would reach for AFTER that point — tr and sed for the tag
+  # resolution, mkdir for the kit root, mktemp for the temp dir, dd and od
+  # for the ARM-ELF reuse check, rm for the cleanup — so that "the kit
+  # directory was never even created" is an assertion this test can actually
+  # fail. With a minimal PATH, a build that dropped the check would die on a
+  # missing `tr` long before it created anything, and the assertion would
+  # pass having proved nothing.
+  _minpath=$_w/minpath
+  build_minpath "$_minpath" curl dd dirname mkdir mktemp od rm sed sh ssh tr
+
+  assert_fails "no sha256 tool: install --download exits non-zero" -- \
+    env PATH="$_minpath" REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$_minpath/sh" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+
+  # "no sha256 tool" appears only in that refusal; a bare "sha256" would also
+  # match the asset URL ".../redoku-rm2.tar.gz.sha256" and prove nothing.
+  assert_contains "$ASSERT_OUTPUT" "no sha256 tool" \
+    "no sha256 tool: message says so, specifically" || return 1
+  assert_contains "$ASSERT_OUTPUT" "refusing to fetch" \
+    "no sha256 tool: it refused rather than installing unverified" || return 1
+  assert_no_file "$_kit" \
+    "no sha256 tool: the kit directory was never even created" || return 1
+}
+
+# Design doc §8 test 9, and the one that earns its keep long-term: a kit-mode
+# `install --dry-run` resolves EVERY path it prints, and every one of them
+# exists. This is the canary for D8 drift — it is what fails if someone moves
+# a path in bin/redoku without moving it in tools/mkkit.sh, or the other way
+# round.
+#
+# It also pins the two things that make a kit installable with no toolchain:
+# the decoy is taken as it shipped (no tools/mkdecoy.rb, no ruby), and the
+# "not built yet" download/'make rm2fb' prompt never appears, because the kit
+# came with its binaries.
+test_kit_dry_run_resolves_every_path() {
+  _w=$(mktemp -d "$ROOT/kit-canary.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home" "$_kit"
+  build_fake_kit_inputs "$_w/build"
+  "$KIT_SH" "$REPO/tools/mkkit.sh" --version v0.9.9 --out "$_w/out" \
+    --build-dir "$_w/build" >/dev/null || \
+    die "test_kit_dry_run_resolves_every_path: mkkit.sh failed"
+
+  # Unpacked by hand into the §5.3 shape rather than through a download: the
+  # point here is the PLAN a kit resolves, not the fetch that put it there.
+  mkdir -p "$_kit/v0.9.9"
+  tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_w" || \
+    die "test_kit_dry_run_resolves_every_path: tar -x failed"
+  mv "$_w/redoku"/* "$_w/redoku"/.[!.]* "$_kit/v0.9.9/" 2>/dev/null || true
+  [ -f "$_kit/v0.9.9/VERSION" ] || \
+    die "test_kit_dry_run_resolves_every_path: the fixture kit did not land at $_kit/v0.9.9"
+  ln -s v0.9.9 "$_kit/current"
+
+  set +e
+  ASSERT_OUTPUT=$(env HOME="$_home" \
+    "$KIT_SH" "$_kit/current/bin/redoku" install --dry-run --yes --host nowhere \
+    < /dev/null 2>&1)
+  _canary_rc=$?
+  set -e
+  assert_eq 0 "$_canary_rc" \
+    "kit dry-run: exits 0 (output: $ASSERT_OUTPUT)" || return 1
+
+  # Each plan line is matched by its EXACT literal prefix, padding included,
+  # so this pins the plan's shape as well as its contents; a sed alternation
+  # would need GNU-only BRE syntax to do the same in one pass.
+  for _spec in \
+    'server :|==>   server : ' \
+    'client :|==>   client : ' \
+    'ctl    :|==>   ctl    : ' \
+    'game   :|==>   game   : ' \
+    'watcher:|==>   watcher: ' \
+    'decoy  :|==>   decoy  : '
+  do
+    _label=${_spec%%|*}
+    _prefix=${_spec#*|}
+    _path=$(printf '%s\n' "$ASSERT_OUTPUT" | sed -n "s#^$_prefix##p")
+    # The decoy line carries a trailing " (…)" note; the path is what
+    # precedes it.
+    _path=${_path%% (*}
+    [ -n "$_path" ] || {
+      printf 'FAIL: kit dry-run: plan line "%s" is missing or its path is empty\n  output: %s\n' \
+        "$_label" "$ASSERT_OUTPUT" >&2
+      return 1
+    }
+    case $_path in
+      /*) ;;
+      *) printf 'FAIL: kit dry-run: plan line "%s" names a non-absolute path: %s\n' "$_label" "$_path" >&2
+         return 1 ;;
+    esac
+    [ -e "$_path" ] || {
+      printf 'FAIL: kit dry-run: plan line "%s" names a path that does not exist: %s\n' "$_label" "$_path" >&2
+      return 1
+    }
+  done
+
+  assert_contains "$ASSERT_OUTPUT" "  device : root@nowhere" \
+    "kit dry-run: the plan names the device" || return 1
+
+  # No path anywhere in the plan came out empty or with an unexpanded
+  # variable in it. "$" would catch a literal $VAR that never expanded; this
+  # run prints no shell snippet of its own, so there is no legitimate '$'
+  # in the output to confuse it with.
+  case $ASSERT_OUTPUT in
+    *'$'*) printf 'FAIL: kit dry-run: an unexpanded variable reached the plan\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+           return 1 ;;
+  esac
+
+  # The decoy came from the kit, not from a generator: "mkdecoy.rb" is named
+  # by BOTH lines the regenerating branch prints (its say and its plan note),
+  # so its absence is a branch-level proof, and "prebuilt" is unique to the
+  # other branch.
+  assert_contains "$ASSERT_OUTPUT" "shipped prebuilt in this kit" \
+    "kit dry-run: the decoy was taken as it shipped" || return 1
+  case $ASSERT_OUTPUT in
+    *mkdecoy.rb*) printf 'FAIL: kit dry-run: the decoy generator was invoked inside a kit\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+                  return 1 ;;
+  esac
+  case $ASSERT_OUTPUT in
+    *ruby*) printf 'FAIL: kit dry-run: ruby was asked for inside a kit\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+            return 1 ;;
+  esac
+  # …and no "not built yet" prompt: the kit came with its binaries, so
+  # neither the download offer nor 'make rm2fb' has anything to offer here.
+  case $ASSERT_OUTPUT in
+    *"not built yet"*|*"make rm2fb"*)
+      printf 'FAIL: kit dry-run: the not-built-yet prompt appeared inside a kit\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
 # ---- main -----------------------------------------------------------------
 
 TESTS='
@@ -1105,6 +1793,18 @@ test_find_game_checkout_mode_message
 test_find_game_kit_mode_message
 '
 
+FETCH_KIT_TESTS='
+test_kit_bootstrap_end_to_end
+test_kit_second_download_repoints_and_prunes
+test_kit_checksum_mismatch
+test_kit_tarball_entry_outside_redoku
+test_kit_bin_dir_and_path_hint
+test_kit_foreign_redoku_left_alone
+test_kit_wrapper_self_heals
+test_kit_no_sha256_tool
+test_kit_dry_run_resolves_every_path
+'
+
 for KIT_SH in $KIT_SHELLS; do
   printf '=== bootstrap tests under KIT_SH=%s ===\n' "$KIT_SH"
   for _t in $TESTS; do
@@ -1122,6 +1822,13 @@ done
 for KIT_SH in $KIT_SHELLS; do
   printf '=== find_game tests under KIT_SH=%s ===\n' "$KIT_SH"
   for _t in $FIND_GAME_TESTS; do
+    run_test "$_t"
+  done
+done
+
+for KIT_SH in $KIT_SHELLS; do
+  printf '=== fetch_kit / install --download tests under KIT_SH=%s ===\n' "$KIT_SH"
+  for _t in $FETCH_KIT_TESTS; do
     run_test "$_t"
   done
 done
