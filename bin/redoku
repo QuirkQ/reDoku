@@ -1,10 +1,11 @@
 #!/bin/sh
-# bin/redoku — get the rm2fb display server and the reDoku game on and off
-# a reMarkable 2 over SSH, without needing to understand the ssh/scp
-# choreography.
+# bin/redoku — get the rm2fb display server, the M4 decoy document + its
+# watcher, and the reDoku game on and off a reMarkable 2 over SSH, without
+# needing to understand the ssh/scp choreography.
 #
 # Works on Linux and macOS with the stock OpenSSH client. Run it from a
-# reDoku checkout (it needs device/install.sh and device/uninstall.sh).
+# reDoku checkout (it needs device/install.sh, device/uninstall.sh,
+# device/redoku-watcher.service and tools/mkdecoy.rb).
 #
 # Safe by design:
 #   * Your ~/.ssh/config is IGNORED by default (ssh -F /dev/null), so a
@@ -15,8 +16,9 @@
 #     connection is trusted, a later mismatch fails loudly — and your
 #     real known_hosts is never touched.
 #   * Binaries are verified to be 32-bit ARM ELF before anything is
-#     copied, every copy is size-checked, and the on-device installer
-#     rolls the device back to stock if anything fails.
+#     copied, every copy (the decoy's files and the watcher unit
+#     included) is size-checked, and the on-device installer rolls the
+#     device back to stock if anything fails.
 #   * install and uninstall ask before touching the device (or pass --yes);
 #     play does not, since its only write is one binary that play alone
 #     refreshes on every run by design. --dry-run always shows the plan
@@ -70,13 +72,17 @@ how it connects (the default just works):
   kept open for 2 minutes, so back-to-back commands ask only once.
 
 playing the game:
-  'install' stages the whole tree, the game binary included when it has been
-  cross-built (it warns and installs the display server alone when it
+  'install' stages the whole tree — the display server, a decoy "Sudoku"
+  document it drops into the stock library, and the watcher that launches
+  the game when you tap it — plus the game binary itself when it has been
+  cross-built (it warns and installs everything else alone when it
   hasn't), and can be re-run at any time. 'play' then only refreshes that one
   binary (/home/root/redoku/bin/redoku, from the cross build in
   build/rm2/bin/ — run 'make build' first) and starts it, so working on the
-  game never means restarting the display server. 'uninstall --purge'
-  removes everything.
+  game never means restarting the display server or re-tapping the decoy.
+  'uninstall' always takes the decoy and its watcher back out (the decoy
+  can't outlive them — a document that launches nothing is worse than none);
+  'uninstall --purge' also removes everything else.
 
 options:
   -H, --host HOST         device address or ssh alias   (default: 10.11.99.1)
@@ -324,11 +330,47 @@ find_game() {
   [ -z "$GAME_WHY" ] || { GAME=; return 1; }
 }
 
+# ---- the decoy document (M4) --------------------------------------------
+
+# Builds fresh decoy files into $DECOY_DIR via tools/mkdecoy.rb (host-side
+# CRuby, stdlib only — no gems, no bundler) and sets DECOY_FILES to the
+# four sidecar files it wrote. Its uuid never becomes a shell variable
+# here: DECOY_FILES is discovered from what the tool actually produced,
+# the same "get it from the tool instead of hardcoding a second copy of
+# the constant" reasoning device/install.sh's header gives for reading it
+# back out of watch.conf on the device side.
+#
+# Always runs, --dry-run included: unlike 'make rm2fb' below (a slow
+# Docker cross-compile this function deliberately does NOT touch), this
+# is a fast, local, read-only-to-the-device operation, and the dry-run
+# plan needs its real output — real filenames — to say anything concrete.
+build_decoy() {
+  DECOY_DIR=$REPO/build/decoy
+  command -v ruby >/dev/null 2>&1 || \
+    die "no 'ruby' on this machine — tools/mkdecoy.rb needs a stdlib-only
+  CRuby (no gems, no bundler) to build the decoy document. Install one
+  (your OS package manager or a version manager both work) and try again."
+  say "building the decoy document (tools/mkdecoy.rb)"
+  ruby "$REPO/tools/mkdecoy.rb" --out "$DECOY_DIR" >/dev/null || \
+    die "tools/mkdecoy.rb failed — re-run it directly for the full error:
+    ruby $REPO/tools/mkdecoy.rb --out $DECOY_DIR"
+  DECOY_FILES=$(find "$DECOY_DIR" -maxdepth 1 -type f \
+    \( -name '*.pdf' -o -name '*.metadata' -o -name '*.content' -o -name '*.pagedata' \) \
+    2>/dev/null | sort)
+  [ -n "$DECOY_FILES" ] || \
+    die "tools/mkdecoy.rb ran but $DECOY_DIR has none of the expected decoy files"
+  [ -f "$DECOY_DIR/watch.conf" ] || \
+    die "tools/mkdecoy.rb ran but didn't write $DECOY_DIR/watch.conf"
+}
+
 # ---- commands ----------------------------------------------------------
 
 cmd_install() {
-  [ -f "$REPO/device/install.sh" ] && [ -f "$REPO/device/uninstall.sh" ] || \
-    die "device/install.sh not found next to me — run bin/redoku from a reDoku checkout"
+  [ -f "$REPO/device/install.sh" ] && [ -f "$REPO/device/uninstall.sh" ] && \
+    [ -f "$REPO/device/redoku-watcher.service" ] || \
+    die "device/install.sh (or uninstall.sh, or redoku-watcher.service) not found next to me — run bin/redoku from a reDoku checkout"
+
+  build_decoy
 
   # Before the server hunt below, which may offer a long 'make rm2fb', so
   # that the plan can report the game's state without a wait in between.
@@ -366,10 +408,12 @@ cmd_install() {
   if [ -n "$GAME" ]; then
     say "  game   : $GAME"
   else
-    say "  game   : WARNING — skipped, the display server goes on alone:"
+    say "  game   : WARNING — skipped, everything else goes on alone:"
     say "           $GAME_WHY"
     say "           then re-run 'bin/redoku install' to stage the game"
   fi
+  say "  decoy  : $DECOY_DIR (regenerated by tools/mkdecoy.rb, same uuid every run)"
+  say "  watcher: $REPO/device/redoku-watcher.service"
   say "  action : copy to $REMOTE_DIR/ and run the on-device installer"
   say "           (adds files only; any failure rolls back to stock)"
   say "  re-run : safe any time — the same files, the same end state"
@@ -377,13 +421,26 @@ cmd_install() {
 
   connect
   say "copying files to $REMOTE_DIR"
-  remote "mkdir -p $REMOTE_DIR/bin $REMOTE_DIR/lib"
+  remote "mkdir -p $REMOTE_DIR/bin $REMOTE_DIR/lib $REMOTE_DIR/decoy"
   push_file "$SERVER" "$REMOTE_DIR/bin/rm2fb_server_swtcon"
   push_file "$CLIENT" "$REMOTE_DIR/lib/librm2fb_client_swtcon.so"
   [ -z "$CTLBIN" ] || push_file "$CTLBIN" "$REMOTE_DIR/bin/rm2fbctl"
   [ -z "$GAME" ] || push_file "$GAME" "$REMOTE_GAME"
   push_file "$REPO/device/install.sh" "$REMOTE_DIR/install.sh"
   push_file "$REPO/device/uninstall.sh" "$REMOTE_DIR/uninstall.sh"
+  push_file "$REPO/device/redoku-watcher.service" "$REMOTE_DIR/redoku-watcher.service"
+  # watch.conf goes straight to its final home (device/install.sh reads it
+  # there, and the running watcher does too — both by fixed, undisputed
+  # path, not a staged copy an install step has to relocate).
+  push_file "$DECOY_DIR/watch.conf" "$REMOTE_DIR/watch.conf"
+  # The four sidecar files stay staged under $REMOTE_DIR/decoy/: their
+  # real home is xochitl's own document store, which is outside
+  # $REMOTE_DIR and therefore outside push_file's guard (on purpose — see
+  # push_file's header) — device/install.sh, running as root, is what
+  # copies them the rest of the way in and creates the <uuid>/ ink dir.
+  for f in $DECOY_FILES; do
+    push_file "$f" "$REMOTE_DIR/decoy/$(basename "$f")"
+  done
   remote "chmod +x $REMOTE_DIR/bin/"'*'
 
   _force_arg=
@@ -395,11 +452,11 @@ cmd_install() {
     if [ "$DRY" -eq 1 ]; then
       say "[dry-run] stops here — nothing above actually ran"
     else
-      say "all done — xochitl is now running through the display server"
+      say "all done — xochitl is running through the display server, decoy in the library"
       if [ -n "$GAME" ]; then
-        say "  play it    : bin/redoku play"
+        say "  play it    : tap 'Sudoku' in the library, or bin/redoku play"
       else
-        say "  play it    : make build, then bin/redoku play"
+        say "  play it    : make build, then bin/redoku play (tapping the decoy needs the game staged too)"
       fi
       say "  check it   : bin/redoku status"
       say "  banished it: bin/redoku uninstall"
@@ -531,6 +588,8 @@ cmd_uninstall() {
     die "device/uninstall.sh not found next to me — run bin/redoku from a reDoku checkout"
 
   say "this returns the device to stock (idempotent, safe on partial installs)"
+  say "  the decoy 'Sudoku' document and its watcher always come out —"
+  say "  a document that launches nothing is worse than no document at all"
   if [ "$PURGE" -eq 1 ]; then
     say "  --purge: ALSO deletes $REMOTE_DIR entirely (binaries, scripts, everything)"
   fi

@@ -1,9 +1,11 @@
 #!/bin/sh
-# reDoku rm2fb installer — run ON the reMarkable 2, as root.
+# reDoku installer — run ON the reMarkable 2, as root.
 #
 # Installs the rm2fb display server (swtcon mode, from rM2-stuff) so
 # reDoku and other clients can draw to the e-ink panel while xochitl
-# keeps working normally.
+# keeps working normally; and the M4 hijack — a decoy "Sudoku" document
+# in xochitl's own library plus redoku-watcher.service, which spawns the
+# game when that document is tapped (PLAN.md §10, M4-HIJACK.md).
 #
 # Safety design:
 #   * Userland + systemd files only. No kernel, boot, or partition
@@ -15,19 +17,38 @@
 #     by ExecStopPost, which systemd runs even on crashes). A broken
 #     server therefore means xochitl starts stock — it can never be
 #     crash-looped into remarkable-fail.sh's reboot.
-#   * Any failure during install rolls the device back to stock.
+#   * Any failure during install rolls the device back to stock,
+#     decoy document and watcher included — see rollback() below.
 #   * A firmware update reinstalls the rootfs, silently removing the
-#     systemd files — built-in cleanup. /home/root/redoku survives
-#     updates but is inert without them.
+#     systemd files under /etc/systemd/system/ (rm2fb.service, the
+#     xochitl drop-in, redoku-watcher.service) — built-in cleanup.
+#     /home/root/redoku survives updates but is inert without them:
+#     the decoy document stays in xochitl's library (it's a real,
+#     printable PDF either way — see tools/mkdecoy.rb), it just goes
+#     back to opening as a plain PDF until a reinstall.
+#   * A re-run is a plain overwrite, not a merge: the decoy's four
+#     sidecar files and the watcher unit are regenerated/copied fresh
+#     every time (mkdecoy.rb is deterministic, R9 in its header), which
+#     also resets anything xochitl itself wrote into them since the
+#     last install (lastOpened, pinned, …) back to fresh-install values.
+#     What a re-run does NOT touch: the decoy's <uuid>/ ink directory
+#     (the player's own annotations on the decoy, if any) and its
+#     <uuid>.thumbnails/ cache — both are xochitl's to write, never
+#     this script's, so they survive every re-run untouched.
 #
 # Expects the built artifacts already staged (see README):
 #   /home/root/redoku/bin/rm2fb_server_swtcon
 #   /home/root/redoku/bin/rm2fbctl                (optional)
 #   /home/root/redoku/lib/librm2fb_client_swtcon.so
+#   /home/root/redoku/watch.conf                  (tools/mkdecoy.rb output)
+#   /home/root/redoku/decoy/<uuid>.{pdf,metadata,content,pagedata}
+#   /home/root/redoku/redoku-watcher.service      (this repo's device/ copy)
 #
 # bin/redoku also stages /home/root/redoku/bin/redoku (the game) alongside
-# these, but this script neither needs it nor reads it — the display
-# server installs the same way with or without a game build, on purpose.
+# these, but this script neither needs it nor reads it for the display
+# server or decoy/watcher steps — they install the same way with or
+# without a game build, on purpose. (The watcher will simply have nothing
+# to spawn until the game binary is staged, e.g. via `bin/redoku play`.)
 #
 # Usage: install.sh [--force]
 #   --force   proceed even if the firmware version differs from the
@@ -44,6 +65,20 @@ DROPIN_DIR=/etc/systemd/system/xochitl.service.d
 DROPIN=$DROPIN_DIR/10-redoku.conf
 SOCKET=/var/run/rm2fb.sock
 TESTED_VERSION=3.27.3.0
+
+# --- M4 hijack: decoy document + watcher --------------------------------
+# XOCHITL_DIR is where the decoy's four sidecar files ultimately live —
+# xochitl's own document store, not $REDOKU_DIR — so a document appears
+# in the stock library. WATCH_CONF is the single source of truth for
+# *which* uuid that is: bin/redoku writes it there (from tools/mkdecoy.rb's
+# own output, staged first) before this script ever runs, so the uuid is
+# read out of it below rather than hardcoded a second time in this file —
+# same reasoning mkdecoy.rb gives for not calling SecureRandom.uuid.
+XOCHITL_DIR=/home/root/.local/share/remarkable/xochitl
+WATCH_CONF=$REDOKU_DIR/watch.conf
+DECOY_DIR=$REDOKU_DIR/decoy
+WATCHER_UNIT_SRC=$REDOKU_DIR/redoku-watcher.service
+WATCHER_UNIT=/etc/systemd/system/redoku-watcher.service
 
 FORCE=0
 [ "${1:-}" = --force ] && FORCE=1
@@ -112,6 +147,35 @@ fi
 if [ -e "$UNIT" ] && ! grep -q 'reDoku' "$UNIT"; then
   die "$UNIT exists and isn't ours — another rm2fb installation? refusing"
 fi
+if [ -e "$WATCHER_UNIT" ] && ! grep -q 'reDoku' "$WATCHER_UNIT"; then
+  die "$WATCHER_UNIT exists and isn't ours — refusing"
+fi
+
+# --- M4 preflight: decoy document + watcher -----------------------------
+[ -f "$WATCH_CONF" ] || \
+  die "missing $WATCH_CONF — deploy the decoy files first (bin/redoku install stages them)"
+DECOY_PDF=$(sed -n 's/^pdf=//p' "$WATCH_CONF")
+[ -n "$DECOY_PDF" ] || die "$WATCH_CONF has no 'pdf=' line — corrupt, or hand-edited?"
+case $DECOY_PDF in
+  "$XOCHITL_DIR"/*.pdf) ;;
+  *) die "$WATCH_CONF's pdf= path ($DECOY_PDF) is not under $XOCHITL_DIR — refusing" ;;
+esac
+# Every other decoy path is this one with a different suffix — deriving
+# them here, once, is what keeps the uuid out of every other line below
+# (and out of rollback(), which reuses these same variables).
+DECOY_BASE=${DECOY_PDF%.pdf}
+DECOY_UUID=${DECOY_BASE##*/}
+DECOY_STAGED_PDF=$DECOY_DIR/$DECOY_UUID.pdf
+DECOY_STAGED_METADATA=$DECOY_DIR/$DECOY_UUID.metadata
+DECOY_STAGED_CONTENT=$DECOY_DIR/$DECOY_UUID.content
+DECOY_STAGED_PAGEDATA=$DECOY_DIR/$DECOY_UUID.pagedata
+for f in "$DECOY_STAGED_PDF" "$DECOY_STAGED_METADATA" "$DECOY_STAGED_CONTENT" "$DECOY_STAGED_PAGEDATA"; do
+  [ -f "$f" ] || die "missing staged decoy file $f — deploy the decoy files first (bin/redoku install stages them)"
+done
+[ -f "$WATCHER_UNIT_SRC" ] || \
+  die "missing $WATCHER_UNIT_SRC — deploy device/redoku-watcher.service first (bin/redoku install stages it)"
+[ -d "$XOCHITL_DIR" ] || \
+  die "$XOCHITL_DIR missing — this doesn't look like a reMarkable with xochitl's document store"
 
 avail_kb=$(df -k / | awk 'NR==2 {print $4}')
 [ "$avail_kb" -ge 512 ] || die "only ${avail_kb}KB free on / — not enough"
@@ -123,9 +187,19 @@ say "preflight OK (firmware $version)"
 rollback() {
   say "FAILED — rolling back to stock"
   rm -f "$PRELOAD_ENV"
+  systemctl disable --now redoku-watcher.service >/dev/null 2>&1 || true
   systemctl disable --now rm2fb.service >/dev/null 2>&1 || true
-  rm -f "$UNIT" "$DROPIN"
+  rm -f "$UNIT" "$DROPIN" "$WATCHER_UNIT"
   rmdir "$DROPIN_DIR" 2>/dev/null || true
+  # DECOY_UUID is always set by here — it's derived from $WATCH_CONF
+  # during preflight, which runs to completion before this trap is even
+  # armed (below). "Back to stock" means no trace of the decoy either,
+  # so this is unconditional, exactly like the rm2fb/dropin removal
+  # above — including on a re-run of an install that had already
+  # succeeded once.
+  rm -f "$XOCHITL_DIR/$DECOY_UUID.pdf" "$XOCHITL_DIR/$DECOY_UUID.metadata" \
+        "$XOCHITL_DIR/$DECOY_UUID.content" "$XOCHITL_DIR/$DECOY_UUID.pagedata"
+  rm -rf "$XOCHITL_DIR/$DECOY_UUID"
   systemctl daemon-reload
   systemctl reset-failed xochitl.service 2>/dev/null || true
   systemctl restart xochitl.service || true
@@ -177,12 +251,24 @@ EnvironmentFile=-$PRELOAD_ENV
 WatchdogSec=0
 EOF
 
+say "installing $WATCHER_UNIT"
+# A plain copy, not a heredoc like the two units above: this one has no
+# device-specific paths to substitute (its ExecStart is a fixed
+# /home/root/redoku/bin/redoku, install-independent), so the repo's
+# device/redoku-watcher.service — already staged at $WATCHER_UNIT_SRC by
+# bin/redoku — is the single source of truth for its content.
+cp "$WATCHER_UNIT_SRC" "$WATCHER_UNIT"
+
 say "reloading systemd"
 systemctl daemon-reload
 
 say "enabling + starting rm2fb.service"
 systemctl enable rm2fb.service
 systemctl restart rm2fb.service
+
+say "enabling + starting redoku-watcher.service"
+systemctl enable redoku-watcher.service
+systemctl restart redoku-watcher.service
 
 say "waiting for $SOCKET"
 i=0
@@ -196,17 +282,35 @@ done
 # xochitl's first preload connect, xochitl can crash-loop once into a
 # reboot — after which the arming file guarantees a stock, working boot.
 systemctl is-active --quiet rm2fb.service || die "rm2fb.service is not active"
+systemctl is-active --quiet redoku-watcher.service || die "redoku-watcher.service is not active"
 
-say "restarting xochitl with the rm2fb client preloaded"
+say "installing the decoy document into $XOCHITL_DIR"
+# Plain overwrite (see the header comment on what that does and doesn't
+# reset). Copied, not moved, so a re-run's staged files under $DECOY_DIR
+# stay put for the next run rather than only existing once.
+cp "$DECOY_STAGED_PDF" "$XOCHITL_DIR/$DECOY_UUID.pdf"
+cp "$DECOY_STAGED_METADATA" "$XOCHITL_DIR/$DECOY_UUID.metadata"
+cp "$DECOY_STAGED_CONTENT" "$XOCHITL_DIR/$DECOY_UUID.content"
+cp "$DECOY_STAGED_PAGEDATA" "$XOCHITL_DIR/$DECOY_UUID.pagedata"
+# The per-page ink dir a real document has (xochitl-3.27-format.md): empty
+# on a fresh install, but mkdir -p is a no-op if the player already wrote
+# on the decoy in a previous install, so their ink is never touched here.
+# xochitl's own <uuid>.thumbnails/ cache is left alone entirely — this
+# script never creates or touches it, on either an install or a re-run.
+mkdir -p "$XOCHITL_DIR/$DECOY_UUID"
+
+say "restarting xochitl with the rm2fb client preloaded — this also indexes the decoy"
 systemctl restart xochitl.service
 
 say "verifying (15 s settle)"
 sleep 15
 systemctl is-active --quiet rm2fb.service || die "rm2fb.service died after the xochitl restart"
+systemctl is-active --quiet redoku-watcher.service || die "redoku-watcher.service died after the xochitl restart"
 systemctl is-active --quiet xochitl.service || die "xochitl isn't running"
 
 STATUS=ok
-say "SUCCESS — rm2fb is installed and xochitl is running through it"
+say "SUCCESS — rm2fb is installed, the decoy is in the library, and xochitl is running through it"
 say "  server status : systemctl status rm2fb"
+say "  watcher status: systemctl status redoku-watcher"
 say "  client socket : $SOCKET"
 say "  back to stock : sh $REDOKU_DIR/uninstall.sh"

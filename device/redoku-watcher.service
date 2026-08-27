@@ -1,0 +1,46 @@
+# reDoku hijack watcher — installed by device/install.sh, removed by
+# uninstall.sh. Not hand-edited on the device: a re-run of install.sh
+# overwrites this file from the repo's copy every time (device/install.sh
+# stages it under /home/root/redoku/ and copies it into place here).
+#
+# Runs `redoku --watch` (Task 3, mrbgems/mruby-redoku/mrblib/redoku/
+# watcher.rb): an inotify watch on the decoy document plus the rm2fb
+# control socket, PLAN.md §10/M4. It spawns the real game when the decoy
+# is tapped and otherwise never touches the display — it is not a client
+# of /var/run/rm2fb.sock and can't take the screen by accident.
+[Unit]
+Description=reDoku decoy-document watcher
+# Ordering, not a hard dependency (see below): the watcher's "is the game
+# already running" check goes through rm2fb's control socket
+# (RM2::Control.clients, PLAN.md §10), so it wants the display server up
+# first when both start together at boot.
+After=rm2fb.service
+# Deliberately NOT Requires=rm2fb.service. A watcher that refuses to start
+# whenever the display server happens to be down would silently disable
+# the tap-to-launch path for the rest of the session with no visible
+# error — worse than a watcher that starts anyway, finds the control
+# socket missing on its next check, and just keeps watching until rm2fb
+# comes back (its own Restart=on-failure, matched below, already handles
+# that side of the pairing).
+#
+# Same burst/window as rm2fb.service (device/install.sh), so a wedged
+# watcher and a wedged display server fail the same way rather than one
+# looping forever after the other has given up.
+StartLimitIntervalSec=600
+StartLimitBurst=4
+
+[Service]
+ExecStart=/home/root/redoku/bin/redoku --watch
+# The watcher re-reads /home/root/redoku/watch.conf on SIGHUP instead of
+# restarting (Task 3's fixed contract) — a restart would drop it off the
+# control socket and out of its inotify watch for the gap, exactly the
+# window a hijack watcher can't afford to miss a tap in. This is what
+# lets a future `install.sh` re-run (or a manual `systemctl reload
+# redoku-watcher`) push a new watch.conf without one.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+Environment=HOME=/home/root
+
+[Install]
+WantedBy=multi-user.target

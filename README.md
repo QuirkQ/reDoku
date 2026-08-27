@@ -41,14 +41,19 @@ code in here.
 - **Write down your SSH password** first — *Settings → Help → Copyrights and
   licenses*.
 - **Tested on firmware 3.27.3.0 only.** The installer refuses anything else
-  without `--force`. A firmware update wipes the install and reverts you to
-  stock, so keep auto-updates off.
+  without `--force`. A firmware update wipes every unit under
+  `/etc/systemd/system/` — the display server, the xochitl drop-in, and the
+  hijack watcher alike — reverting you to stock: `/home/root/redoku/` (saves
+  included) survives, but nothing in it runs, the decoy document in the
+  library goes back to being just a PDF, and launch is SSH-only again until
+  you reinstall. Stock behaviour, by design — keep auto-updates off.
 
-The install only *adds* files: `/home/root/redoku/` plus two systemd units. No
-kernel, boot or partition changes, failures roll themselves back, and xochitl
-comes up stock if the display server is broken. If the device ever looks
-stuck, hold power for ~10 s. SSH-over-USB never depends on xochitl, so the
-uninstaller is always reachable.
+The install only *adds* files: `/home/root/redoku/`, the decoy document in
+xochitl's own library, and three systemd units. No kernel, boot or partition
+changes, failures roll themselves back, and xochitl comes up stock if the
+display server is broken. If the device ever looks stuck, hold power for
+~10 s. SSH-over-USB never depends on xochitl, so the uninstaller is always
+reachable.
 
 ## Play it
 
