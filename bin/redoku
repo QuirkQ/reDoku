@@ -89,6 +89,12 @@ IDENTITY=
 ARTIFACTS=
 FORCE=0
 PURGE=0
+# --purge and --self are independent and may be combined, and they are about
+# two different machines: --purge deletes /home/root/redoku on the DEVICE,
+# --self deletes the kit and the PATH entry on THIS one. The two are easy to
+# confuse and the consequences differ, so every message that mentions either
+# says which machine it means (design doc §5.2, §5.3).
+SELF=0
 PLAY_SECS=          # empty = play interactively, until you stop it
 PLAY_SECS_SET=0     # was --seconds given at all, distinct from its value
 # Seconds a timed run's SIGTERM gets before the SIGKILL. Longer than the
@@ -127,6 +133,19 @@ FETCH_LAYOUT=
 FETCH_TARGET=
 SHA256_TOOL=
 
+# Does this run want the LATEST release, or the one this CLI belongs to?
+# Set to 1 by cmd_upgrade alone, and read by resolve_tag's step 2.
+#
+# §6.1's step 2 — "a released CLI fetches its OWN tag" — is exactly right for
+# 'install': re-running a kit's own installer must not silently change which
+# version is installed. It is exactly wrong for 'upgrade', whose entire job is
+# to find a tag NEWER than the one this copy was stamped with; taking step 2
+# there would make every upgrade from a released kit a no-op that reported
+# success. So upgrade turns step 2 off and steps 1, 3 and 4 — REDOKU_VERSION,
+# the redirect and the tarball's own VERSION — carry it, which is also why
+# REDOKU_VERSION still pins for upgrade: step 1 is untouched.
+WANT_LATEST=0
+
 say()  { printf '==> %s\n' "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -137,6 +156,9 @@ bin/redoku — put the rm2fb display server and the reDoku game on a reMarkable 
 usage:
   bin/redoku install      copy the built binaries to the device and install
                           (safe to re-run: idempotent from any state)
+  bin/redoku upgrade      fetch the latest release into the kit, point
+                          'current' at it and keep one version back so a
+                          rollback is one symlink swap (kit installs only)
   bin/redoku play         run the game on the device
   bin/redoku uninstall    return the device to stock (safe, idempotent)
   bin/redoku status       show what's running on the device
@@ -175,15 +197,23 @@ options:
                           looking for a local build. Without --kit they land
                           in build/download/<tag>/ and nothing outside this
                           directory is touched.
-      --kit DIR           install: unpack the released kit into DIR, point
-                          DIR/current at it and put a 'redoku' on your PATH.
+      --kit DIR           install, upgrade, uninstall --self: the kit root.
+                          install unpacks into DIR, points DIR/current at it
+                          and puts a 'redoku' on your PATH; upgrade and
+                          uninstall --self operate on the kit already there.
                           The curl|sh installer passes ~/.redoku; set it
-                          yourself with --kit or $REDOKU_HOME.
-      --bin-dir DIR       install: where that PATH entry goes
-                          (default: ~/.local/bin, or $REDOKU_BIN_DIR)
-      --no-symlink        install: write no PATH entry at all
+                          yourself with --kit or $REDOKU_HOME. Running from
+                          inside a kit, it needs no flag at all.
+      --bin-dir DIR       install, upgrade, uninstall --self: where that PATH
+                          entry goes (default: ~/.local/bin, $REDOKU_BIN_DIR)
+      --no-symlink        install, upgrade: write no PATH entry at all
       --force             install: proceed on an untested firmware version
-      --purge             uninstall: also delete /home/root/redoku
+      --purge             uninstall: also delete /home/root/redoku on the
+                          DEVICE (nothing on this machine)
+      --self              uninstall: once the device is back to stock, also
+                          remove the kit and our PATH entry from THIS machine
+                          (nothing extra on the device). Refused in a
+                          checkout — there is no kit there to remove.
       --seconds N         play: stop the game after N seconds instead of
                           running it interactively (unattended smoke test)
   -y, --yes               don't ask for confirmation
@@ -210,7 +240,7 @@ EOF
 
 while [ $# -gt 0 ]; do
   case $1 in
-    install|uninstall|play|status|shell)
+    install|upgrade|uninstall|play|status|shell)
       [ -z "$CMD" ] || die "two commands given: '$CMD' and '$1'"
       CMD=$1 ;;
     -H|--host)       [ $# -ge 2 ] || die "$1 needs a value"; HOST=$2; shift ;;
@@ -224,6 +254,7 @@ while [ $# -gt 0 ]; do
     --no-symlink)    NO_SYMLINK=1 ;;
     --force)         FORCE=1 ;;
     --purge)         PURGE=1 ;;
+    --self)          SELF=1 ;;
     --seconds)       [ $# -ge 2 ] || die "$1 needs a value"; PLAY_SECS=$2; PLAY_SECS_SET=1; shift ;;
     -y|--yes)        YES=1 ;;
     -n|--dry-run)    DRY=1 ;;
@@ -240,16 +271,27 @@ command -v ssh >/dev/null 2>&1 || die "no 'ssh' on this machine"
 [ -z "$ARTIFACTS" ] || [ -d "$ARTIFACTS" ] || die "artifacts directory not found: $ARTIFACTS"
 [ "$FORCE" -eq 0 ] || [ "$CMD" = install ]   || die "--force only applies to install"
 [ "$PURGE" -eq 0 ] || [ "$CMD" = uninstall ] || die "--purge only applies to uninstall"
+[ "$SELF" -eq 0 ]  || [ "$CMD" = uninstall ] || die "--self only applies to uninstall"
 [ -z "$ARTIFACTS" ] || [ "$CMD" = install ]  || die "--artifacts only applies to install"
 [ "$PLAY_SECS_SET" -eq 0 ] || [ "$CMD" = play ] || die "--seconds only applies to play"
-# The four kit options are install-only for now. A later task in this
-# milestone widens --kit and --bin-dir to 'upgrade' and 'uninstall'; these
-# lines are where that happens, and until then a --kit on any other command
-# is a mistake worth saying out loud rather than silently ignoring.
+# Which commands each kit option reaches, and no more: a --kit on a command
+# that would ignore it is a mistake worth saying out loud rather than
+# silently accepting.
+#
+# --download stays install-only, because 'upgrade' fetches unconditionally —
+# that is what it IS — and there is nothing for the flag to switch on. The
+# other three widen exactly as far as they have a job to do: --kit and
+# --bin-dir name the kit root and the PATH entry, which 'upgrade' rewrites and
+# 'uninstall --self' removes, and --no-symlink says "write no PATH entry",
+# which 'upgrade' must honour too or an upgrade would hand a wrapper to
+# somebody who installed with --no-symlink precisely to avoid one.
 [ "$DOWNLOAD" -eq 0 ]    || [ "$CMD" = install ] || die "--download only applies to install"
-[ "$KIT_DIR_SET" -eq 0 ] || [ "$CMD" = install ] || die "--kit only applies to install"
-[ "$BIN_DIR_SET" -eq 0 ] || [ "$CMD" = install ] || die "--bin-dir only applies to install"
-[ "$NO_SYMLINK" -eq 0 ]  || [ "$CMD" = install ] || die "--no-symlink only applies to install"
+[ "$KIT_DIR_SET" -eq 0 ] || [ "$CMD" = install ] || [ "$CMD" = upgrade ] || [ "$CMD" = uninstall ] || \
+  die "--kit only applies to install, upgrade and uninstall --self"
+[ "$BIN_DIR_SET" -eq 0 ] || [ "$CMD" = install ] || [ "$CMD" = upgrade ] || [ "$CMD" = uninstall ] || \
+  die "--bin-dir only applies to install, upgrade and uninstall --self"
+[ "$NO_SYMLINK" -eq 0 ]  || [ "$CMD" = install ] || [ "$CMD" = upgrade ] || \
+  die "--no-symlink only applies to install and upgrade"
 # --bin-dir says where the PATH entry goes; --no-symlink says there isn't
 # one. Honouring either by quietly dropping the other is exactly the "it did
 # something, just not what you asked for" this script is written to avoid.
@@ -747,7 +789,11 @@ resolve_tag() {
   #    stamped it: the point of a guard that runs on every path is that no
   #    path has to be trusted, and a stamp is one `--version` typo away from
   #    putting a slash in a directory name.
-  if [ "$KIT_VERSION" != dev ]; then
+  #    Skipped entirely when this run asked for the latest (WANT_LATEST, set
+  #    by 'upgrade' — see its declaration at the top of this file for why a
+  #    released CLI resolving its own tag is the right answer for 'install'
+  #    and the wrong one for 'upgrade').
+  if [ "$KIT_VERSION" != dev ] && [ "$WANT_LATEST" -eq 0 ]; then
     valid_tag "$KIT_VERSION" || \
       die "this copy of redoku was stamped KIT_VERSION='$KIT_VERSION', which can't be
   used as a release tag — it becomes a directory name and a URL component, so it
@@ -1431,6 +1477,41 @@ resolve_kit_mode() {
   fi
 }
 
+# The kit root 'upgrade' and 'uninstall --self' operate on — always a value,
+# where resolve_kit_mode above deliberately leaves KIT_DIR empty to MEAN
+# "checkout mode". These two commands have already refused a checkout by the
+# time they call this, so for them there is no such mode left to express and
+# the ~/.redoku default the docs name (§5.2) applies.
+#
+# Its derivation is looser than resolve_kit_mode's on purpose, and the looseness
+# is the point rather than an oversight: resolve_kit_mode additionally requires
+# <parent>/current to resolve back to $REPO before it will believe <parent> is a
+# kit root, because writing a PATH wrapper through a 'current' that does not
+# exist would be worse than writing none. But a 'current' that is missing or
+# dangling is precisely the state §7 says `upgrade` REPAIRS — so applying that
+# extra condition here would make the repair give up on the kit it is standing
+# in and go install a fresh one into ~/.redoku instead, leaving the broken kit
+# exactly as broken. $REPO/VERSION (marker 2) is enough: it says the artifacts
+# are beside me, and a kit's versions live one directory below its root.
+resolve_kit_root() {
+  if [ -n "$KIT_DIR" ]; then
+    KIT_DIR=$(abs_path "$KIT_DIR")
+  elif [ "$IN_KIT" -eq 1 ]; then
+    KIT_DIR=$(dirname -- "$REPO")
+  else
+    KIT_DIR=$HOME/.redoku
+  fi
+  # Resolved once it exists, for the same reason resolve_kit_mode resolves:
+  # the PATH wrapper records this path literally and is_our_wrapper recognises
+  # it by comparing that literal back, so an unresolved root would make our own
+  # wrapper unrecognisable — and for 'uninstall --self' unrecognisable means
+  # "somebody else's file", i.e. left behind forever.
+  if [ -d "$KIT_DIR" ]; then
+    KIT_DIR=$(CDPATH= cd -- "$KIT_DIR" && pwd -P) || \
+      die "could not resolve the kit directory $KIT_DIR — check the path and its permissions, or point somewhere else with --kit DIR"
+  fi
+}
+
 # The --dry-run plan for `install --download`. This file's header promises
 # that --dry-run always shows the plan without doing it, FOR EVERY COMMAND,
 # and here "doing it" means fetching several megabytes and writing them under
@@ -1496,6 +1577,59 @@ plan_download() {
   say "[dry-run] stops here — nothing above actually ran"
 }
 
+# The --dry-run plan for `upgrade`, held to the same promise as
+# plan_download's: a dry run downloads nothing and writes nothing, so the tag
+# is only as resolved as §6.1's steps 1-3 could make it and the plan says so
+# rather than implying it knows more. $TAG is read, not resolved again — its
+# caller resolved it a moment ago, and resolving twice would mean two answers
+# free to disagree about what the plan describes.
+#
+# A separate function from plan_download rather than a flag inside it: half of
+# that plan is the DEVICE install that follows a download, and upgrade has no
+# device stage at all. Sharing it would mean a plan whose every second line
+# was conditional, describing a run that does not happen.
+plan_upgrade() { # plan_upgrade <what-current-points-at-now, or empty>
+  # Costs nothing, writes nothing, and a plan that skipped them would promise
+  # an upgrade this machine cannot actually perform.
+  require_curl
+  sha256_tool
+
+  _pu_now=$1
+  _pu_url=$(asset_url_dir)
+  if [ -n "$TAG" ]; then
+    _pu_tag=$TAG
+  else
+    _pu_tag='<tag>'
+  fi
+
+  say "this will:"
+  if [ -n "$_pu_now" ]; then
+    say "  from    : $_pu_now — what $KIT_DIR/current points at now"
+  else
+    say "  from    : nothing — $KIT_DIR/current is missing, so this repairs it"
+  fi
+  if [ -n "$TAG" ]; then
+    say "  to      : $_pu_tag"
+  else
+    say "  to      : the latest release — its tag is inside the tarball, and"
+    say "            reading it means downloading it, which a dry run doesn't"
+  fi
+  say "  download: $_pu_url/redoku-rm2.tar.gz"
+  say "            plus its .sha256, which has to match before anything unpacks"
+  say "  unpack  : $(kit_dest kit "$KIT_DIR" "$_pu_tag")/"
+  say "  current : $KIT_DIR/current -> $_pu_tag"
+  say "  prune   : older versions under $KIT_DIR, keeping the new one and"
+  say "            the one 'current' points at now (a rollback stays one swap)"
+  if [ "$NO_SYMLINK" -eq 1 ]; then
+    say "  PATH    : nothing — --no-symlink"
+  else
+    say "  PATH    : $BIN_DIR/redoku, a two-line wrapper for $KIT_DIR/current/bin/redoku"
+  fi
+  say "  device  : nothing at all — upgrade is host-side only. Run"
+  say "            'redoku install' afterwards to put the new version on $TARGET."
+  say "[dry-run] stops here — nothing above actually ran"
+}
+
 # The three files cmd_install pushes verbatim have to exist before any of the
 # plan below can be believed. Asked of $KIT_ROOT, not $REPO: under the curl|sh
 # bootstrap $REPO is a temp directory's parent and holds nothing at all, so as
@@ -1552,6 +1686,170 @@ warn_device_scripts_replaced() {
   say "     device instead, build the binaries here and install from this"
   say "     checkout with neither --download nor --kit:"
   say "       make rm2fb && bin/redoku install"
+}
+
+# ---- removing the host kit (design doc §5.2's `uninstall --self`) --------
+#
+# This is the only code in this file that recursively deletes something the
+# user did not hand it a path to, and it is aimed at a directory under their
+# home. Design doc §10's D6 weighed printing the `rm` commands instead and
+# rejected it — the kit writes a PATH entry OUTSIDE its own directory with no
+# build step first, so it owes the user a precise, guarded removal — but the
+# price of that decision is that every guard below has to be provably right,
+# not merely present. Each one therefore says what makes the path it approves
+# impossible to point somewhere else, and each has its own message.
+
+# check_removable_kit_root <root> — dies unless <root> is a path this script
+# may recursively delete. Called TWICE on purpose: once by cmd_uninstall
+# before it has touched the device, so a root that could never be removed is
+# refused before anything happens rather than after the device has been
+# returned to stock; and once by remove_kit, immediately before the first
+# `rm -rf`, so the check cannot be skipped by a future caller that forgets it.
+# Same belt-and-braces shape as push_file's refusal to write outside
+# $REMOTE_DIR and fetch_kit's refusal to unpack outside its base.
+check_removable_kit_root() {
+  _crk_root=$1
+
+  # 1. Non-empty. `set -u` catches an UNSET variable and says nothing at all
+  #    about an EMPTY one, so `rm -rf "$root"/*` with an empty root walks the
+  #    filesystem root. This repo has already shipped a fix titled "close the
+  #    empty-uuid rm -rf" for exactly that shape; an explicit check is what
+  #    closes it, not errexit and not careful quoting.
+  [ -n "$_crk_root" ] || \
+    die "internal error: refusing to remove an empty kit path — say which kit with --kit DIR"
+
+  # 2. Absolute. A relative path would be resolved against whatever directory
+  #    the user happened to be standing in, so the SAME kit root would name
+  #    different directories on two runs. resolve_kit_root makes it absolute;
+  #    this is what proves it did.
+  case $_crk_root in
+    /*) ;;
+    *)  die "internal error: refusing to remove the relative path '$_crk_root' — a kit root must be absolute" ;;
+  esac
+
+  # 3. Not the filesystem root, and not the home directory itself. Both are
+  #    reachable by a plausible typo (`--kit /`, `--kit ~`) and neither can
+  #    ever be a kit root: a kit root holds version directories, it is not the
+  #    place they happen to live under. $HOME is compared both as written and
+  #    as resolved, because ~ is a symlinked path on some systems and a guard
+  #    that only catches one spelling of your home directory is not a guard.
+  [ "$_crk_root" != / ] || \
+    die "refusing to remove / as a kit root. Point --kit at the kit directory itself, e.g. --kit ~/.redoku"
+  _crk_home=$(CDPATH= cd -P -- "$HOME" 2>/dev/null && pwd -P) || _crk_home=$HOME
+  { [ "$_crk_root" != "$HOME" ] && [ "$_crk_root" != "$_crk_home" ]; } || \
+    die "refusing to remove your home directory ($_crk_root) as a kit root. A kit
+  root is a directory holding version directories and a 'current' symlink —
+  point --kit at that, e.g. --kit ~/.redoku"
+
+  # 4. Not an ancestor of this running script except in the one way a kit root
+  #    legitimately is one. `uninstall --self` is normally run FROM inside the
+  #    kit it is removing, so "the root contains me" cannot itself be the
+  #    refusal — but it is only allowed to contain me the way a kit contains
+  #    its versions, i.e. at <root>/<version>/bin/redoku, two components down
+  #    or more. A root that is the directory I am running from, or that holds
+  #    me directly, is something else that merely has this script inside it.
+  _crk_self=$(CDPATH= cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || _crk_self=
+  if [ -n "$_crk_self" ]; then
+    case $_crk_self in
+      "$_crk_root"/?*/?*) ;;   # <root>/<version>/bin — the expected shape
+      "$_crk_root" | "$_crk_root"/?*)
+        die "refusing to remove $_crk_root: this script is running from $_crk_self,
+  which sits directly in it rather than inside one of its version directories.
+  That is not the shape of a kit root, so removing it would delete more than a
+  kit. Name the real kit root with --kit DIR." ;;
+    esac
+  fi
+
+  # 5. And it has to LOOK like a kit root, which is the guard that turns all
+  #    of the above from "not obviously wrong" into "this is a kit": either a
+  #    'current' symlink, or at least one direct child directory holding a
+  #    VERSION file. An ordinary directory of the user's own satisfies
+  #    neither, and is refused with its contents intact.
+  _crk_looks=0
+  if [ -L "$_crk_root/current" ]; then
+    _crk_looks=1
+  else
+    while IFS= read -r _crk_dir; do
+      [ -n "$_crk_dir" ] || continue
+      [ -f "$_crk_dir/VERSION" ] || continue
+      _crk_looks=1
+      break
+    done <<EOF
+$(find "$_crk_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+EOF
+  fi
+  [ "$_crk_looks" -eq 1 ] || \
+    die "$_crk_root does not look like a reDoku kit: it has no 'current' symlink and
+  no version directory with a VERSION file in it. Nothing was removed. If your
+  kit is somewhere else, name it with --kit DIR; if you meant to delete this
+  directory, delete it yourself — this installer only removes kits it recognises."
+}
+
+# remove_kit <root> — delete the version directories, then 'current', then the
+# root itself if nothing of the user's is left in it.
+#
+# What makes each `rm -rf` below provably right is not that the path was
+# checked but that it was CONSTRUCTED: every path it is handed is a direct
+# child of <root> as reported by `find`, re-tested against the "$root"/?*
+# pattern, and required to hold a VERSION file before it is touched. `find` is
+# never told to follow symlinks, so 'current' is reported as a symlink and can
+# never be the directory it points at; and a child with no VERSION in it — a
+# note, a tarball, a directory the user made — fails the test and is left,
+# which is also what stops the root itself from being removed.
+remove_kit() {
+  _rk_root=$1
+  check_removable_kit_root "$_rk_root"
+
+  # Ours, and swept the same way a download sweeps them — a leftover from a
+  # SIGKILLed fetch is not "something of the user's", and leaving it would
+  # keep the root from being removed for no reason. clean_stale_staging skips
+  # any whose pid is still alive, which is the right answer here too.
+  clean_stale_staging "$_rk_root"
+
+  while IFS= read -r _rk_dir; do
+    [ -n "$_rk_dir" ] || continue
+    [ -f "$_rk_dir/VERSION" ] || continue
+    case $_rk_dir in
+      "$_rk_root"/?*) ;;
+      *) die "internal error: refusing to remove '$_rk_dir', which is not under $_rk_root" ;;
+    esac
+    say "  removing $_rk_dir"
+    # Unlinking the very file this shell is executing is safe and is the
+    # normal case: `uninstall --self` runs from inside the kit it removes, and
+    # POSIX keeps an open file's inode alive until the last descriptor closes,
+    # so the script goes on being read from the fd the shell already holds.
+    rm -rf "$_rk_dir" || \
+      die "could not remove $_rk_dir — check its permissions and re-run 'redoku uninstall --self'. The device is already back to stock."
+  done <<EOF
+$(find "$_rk_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+EOF
+
+  # -L, not -e: a DANGLING current is still ours and still has to go, and -e
+  # says no about exactly that case.
+  if [ -L "$_rk_root/current" ]; then
+    say "  removing $_rk_root/current"
+    rm -f "$_rk_root/current" || \
+      die "could not remove $_rk_root/current — check permissions on $_rk_root"
+  fi
+
+  _rk_left=$(find "$_rk_root" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d '[:space:]')
+  if [ "$_rk_left" = 0 ]; then
+    # rmdir, never `rm -rf`: it can only succeed on a directory that is
+    # already empty, so this last step cannot delete anything the loop above
+    # decided to keep, whatever raced with it in between.
+    rmdir "$_rk_root" || \
+      die "removed everything inside $_rk_root but could not remove the directory itself — check its permissions and remove it by hand"
+    say "  removed the kit root $_rk_root"
+  else
+    say "  $_rk_root has things in it this installer did not put there, so the"
+    say "  directory itself was left alone. Still there:"
+    while IFS= read -r _rk_keep; do
+      [ -n "$_rk_keep" ] || continue
+      say "    $_rk_keep"
+    done <<EOF
+$(find "$_rk_root" -mindepth 1 -maxdepth 1 2>/dev/null)
+EOF
+  fi
 }
 
 # ---- commands ----------------------------------------------------------
@@ -1745,6 +2043,109 @@ cmd_install() {
   fi
 }
 
+# design doc §5.2: "fetch latest, repoint current, prune to one previous".
+#
+# Entirely host-side: it touches the kit under your home directory and the
+# PATH entry, and never opens an ssh connection. Putting the new version on
+# the device is 'install', which the closing message names.
+cmd_upgrade() {
+  # §5.4's last row. The marker is §5.1's marker 2 — a checkout has no
+  # $REPO/VERSION beside it — and the advice is the one §5.4 gives verbatim.
+  # An explicit kit root (--kit, or $REDOKU_HOME) is a different request and
+  # is honoured: it names a kit outright rather than asking this CLI to
+  # upgrade whatever it happens to be running from.
+  if [ "$IN_KIT" -eq 0 ] && [ -z "$KIT_DIR" ]; then
+    die "you're in a checkout: git pull && make build
+  'redoku upgrade' fetches a released kit and repoints <kit>/current at it, and
+  a checkout has neither of those. To put a released kit on this machine anyway,
+  name its root:  bin/redoku install --download --kit ~/.redoku"
+  fi
+
+  resolve_kit_root
+  BIN_DIR=$(abs_path "$BIN_DIR")
+
+  # What 'current' points at right now: the answer to "is there anything to
+  # do?", and — through fetch_kit's own prune — the version kept as the
+  # rollback target. Read with `readlink` rather than by resolving the path,
+  # because a DANGLING current still names a target while a missing one names
+  # nothing, and §7 says upgrade repairs both rather than refusing either.
+  _up_now=
+  if [ -L "$KIT_DIR/current" ]; then
+    _up_now=$(readlink "$KIT_DIR/current") || _up_now=
+  fi
+  # Is that target actually a usable version tree? A dangling or half-deleted
+  # one is not "the version you are on", it is the damage this command
+  # repairs — and the closing message has to be able to tell those apart, or
+  # a repair would report itself as "already up to date".
+  _up_ok=0
+  if [ -n "$_up_now" ] && kit_tree_is_complete "$KIT_DIR/$_up_now"; then
+    _up_ok=1
+  fi
+
+  # §6.1's step 3 alone, first, and this ordering is about COST (§6.2's last
+  # paragraph). The un-followed-redirect Location header is one HEAD request
+  # and no bytes, so an "already on the latest" upgrade — much the commonest
+  # outcome — costs no download at all. When it yields nothing (a file://
+  # mirror has no redirects whatsoever; so does an offline machine) the answer
+  # is only inside the tarball, and the fallback is to download and compare
+  # VERSION: one wasted download, still correct.
+  #
+  # resolve_tag runs a second time inside fetch_kit below, which on the paths
+  # that get that far means one extra HEAD request. That is the price of
+  # fetch_kit resolving its own tag rather than trusting a caller to have done
+  # it — the property that keeps every caller on §6.1's one ladder — and a
+  # HEAD against a URL we are about to download several megabytes from is not
+  # a cost worth restructuring for.
+  WANT_LATEST=1
+  resolve_tag
+  if [ "$_up_ok" -eq 1 ] && [ -n "$TAG" ] && [ "$TAG" = "$_up_now" ]; then
+    say "already on $TAG — nothing to download"
+    say "  ($KIT_DIR/current -> $TAG, and that is the latest this run could find)"
+    return 0
+  fi
+
+  if [ "$DRY" -eq 1 ]; then
+    plan_upgrade "$_up_now"
+    return 0
+  fi
+
+  # One function, three callers (§6.2 / D7). Everything the repoint and the
+  # prune need is inside it already, and a second implementation of the
+  # download-verify-unpack step free to drift from that one is exactly what
+  # D7 exists to prevent.
+  fetch_kit kit "$KIT_DIR"
+  # fetch_kit resolved the root (mkdir + cd + pwd -P); take the resolved form
+  # back, because write_path_entry records this path literally.
+  KIT_DIR=$FETCH_BASE
+  KIT_ROOT=$FETCH_TREE
+
+  # The same self-healing rewrite a kit-mode install does (§5.3), and under
+  # the same condition: only where <kit>/current actually exists, since a
+  # wrapper pointing through a 'current' that does not is worse than none.
+  if [ "$NO_SYMLINK" -eq 0 ] && [ -L "$KIT_DIR/current" ]; then
+    write_path_entry "$BIN_DIR" "$KIT_DIR"
+  fi
+
+  if [ "$_up_ok" -eq 0 ]; then
+    if [ -z "$_up_now" ]; then
+      say "$KIT_DIR/current was missing — repaired: it now points at $FETCH_TAG"
+    else
+      say "$KIT_DIR/current was dangling (it pointed at $_up_now, which isn't there) — repaired: it now points at $FETCH_TAG"
+    fi
+  elif [ "$FETCH_TAG" = "$_up_now" ]; then
+    say "already on $FETCH_TAG — nothing changed"
+  else
+    say "upgraded: $_up_now -> $FETCH_TAG"
+  fi
+  # REDOKU_VERSION pins upgrade exactly as it pins install (§5.2), which means
+  # an 'upgrade' can legitimately install something OLDER than what was there.
+  # Saying so is the difference between a surprising result and an explained
+  # one.
+  [ -z "${REDOKU_VERSION:-}" ] || \
+    say "  (REDOKU_VERSION=$REDOKU_VERSION asked for that version specifically — unset it to take the latest)"
+  say "  on the device: nothing changed — run 'redoku install' to put $FETCH_TAG on $TARGET"
+}
+
 cmd_play() {
   find_game || die "$GAME_WHY"
   connect
@@ -1865,13 +2266,80 @@ cmd_uninstall() {
   [ -f "$REPO/device/uninstall.sh" ] || \
     die "device/uninstall.sh not found next to me — run bin/redoku from a reDoku checkout"
 
+  # Everything --self needs to know is worked out HERE, before the plan block
+  # and therefore before the confirmation, because §5.3's rule is that nothing
+  # is deleted that was not named in the plan — which means the plan has to
+  # name it by the same absolute paths the deletion will use, not by a
+  # description of how they will later be derived.
+  _un_wrapper=
+  _un_foreign=
+  if [ "$SELF" -eq 1 ]; then
+    # There is no kit in a checkout, so there is nothing for --self to do and
+    # nothing it could remove without guessing. Same marker (§5.1's marker 2)
+    # and the same "an explicit kit root is a different request" carve-out as
+    # 'upgrade'.
+    if [ "$IN_KIT" -eq 0 ] && [ -z "$KIT_DIR" ]; then
+      die "--self removes a released kit, and you're in a checkout — there is no kit here.
+  Return the device to stock with:  bin/redoku uninstall
+  Then delete the checkout yourself; nothing outside it was installed.
+  (Removing a kit somewhere else? Name it:  bin/redoku uninstall --self --kit DIR)"
+    fi
+    resolve_kit_root
+    BIN_DIR=$(abs_path "$BIN_DIR")
+    # Refused before the device is touched, not after it has been returned to
+    # stock — the deletion re-checks for itself immediately before its first
+    # rm -rf, but a root that could never pass has no business getting as far
+    # as an ssh connection.
+    check_removable_kit_root "$KIT_DIR"
+    # §5.3's ownership test, through the one helper that knows it: the file is
+    # ours only if it holds the exec line for THIS kit. Anything else is
+    # somebody's own `redoku` — a package manager's, a script of their own —
+    # and is named in the plan as a thing that will be LEFT, so that the plan
+    # and the outcome agree either way.
+    if is_our_wrapper "$BIN_DIR/redoku" "$KIT_DIR"; then
+      _un_wrapper=$BIN_DIR/redoku
+    elif [ -e "$BIN_DIR/redoku" ] || [ -L "$BIN_DIR/redoku" ]; then
+      _un_foreign=$BIN_DIR/redoku
+    fi
+  fi
+
   say "this returns the device to stock (idempotent, safe on partial installs)"
   say "  the decoy 'Sudoku' document and its watcher always come out —"
   say "  a document that launches nothing is worse than no document at all"
   if [ "$PURGE" -eq 1 ]; then
     say "  --purge: ALSO deletes $REMOTE_DIR entirely (binaries, scripts, everything)"
+    say "           — that is on the DEVICE, and nothing on this machine"
+  fi
+  if [ "$SELF" -eq 1 ]; then
+    say "  --self: and then, on THIS machine (not the device), deletes:"
+    say "            $KIT_DIR"
+    say "            — every version directory in it, and its 'current' symlink"
+    if [ -n "$_un_wrapper" ]; then
+      say "            $_un_wrapper"
+      say "            — the PATH entry this installer wrote for that kit"
+    elif [ -n "$_un_foreign" ]; then
+      say "          the 'redoku' at $_un_foreign is NOT ours (it doesn't exec"
+      say "          this kit), so it is left exactly as it is."
+    else
+      say "          no PATH entry to remove — there is no 'redoku' at $BIN_DIR"
+    fi
+    say "          Nothing else on this machine is touched. The device comes"
+    say "          first: if it can't be returned to stock, none of the above"
+    say "          happens and you can retry."
   fi
   confirm "Return the device to stock?"
+
+  # The device stage is all of what follows, and it must finish before a
+  # single host-side file is deleted — deleting the kit first would delete
+  # $REPO/device/uninstall.sh, the very script this stage pushes. Both
+  # connect() and remote()'s failures go through die(), which exits the
+  # process, so there is no "after the failure" left in which to explain that
+  # the kit is still here: an EXIT trap is the only place the sentence can be
+  # printed from. Armed after the confirmation (an abort has its own message
+  # and needs no second one) and disarmed the moment the stage succeeds.
+  if [ "$SELF" -eq 1 ]; then
+    trap 'printf "==> the host kit at %s was NOT removed — the device did not get back to stock, so nothing on this machine was touched. Fix that and re-run: redoku uninstall --self\n" "$KIT_DIR" >&2' EXIT
+  fi
 
   connect
   say "copying the uninstaller"
@@ -1883,6 +2351,79 @@ cmd_uninstall() {
   say "running the on-device uninstaller"
   remote "sh $REMOTE_DIR/uninstall.sh$_purge_arg"
   say "done — the device is back to stock"
+  [ "$SELF" -eq 0 ] || trap - EXIT
+
+  [ "$SELF" -eq 1 ] || return 0
+
+  # A dry run has shown the plan; doing it is what it must not do. This is the
+  # one command in this file where "changes nothing" means "deletes nothing",
+  # so the guard is here rather than inside remove_kit, where a future caller
+  # could reach the deletion around it.
+  if [ "$DRY" -eq 1 ]; then
+    say "[dry-run] stops here — $KIT_DIR is still there and nothing was removed"
+    return 0
+  fi
+
+  # The wrapper goes FIRST. If the kit went first and this then failed, the
+  # PATH would keep a 'redoku' that execs a directory which no longer exists —
+  # a command that fails with a message about a missing file rather than one
+  # saying it was uninstalled. This order can only leave the opposite, milder
+  # state: a kit with no PATH entry, which the kit's own CLI can still finish
+  # removing.
+  if [ -n "$_un_wrapper" ]; then
+    say "removing the PATH entry $_un_wrapper"
+    rm -f "$_un_wrapper" || \
+      die "could not remove $_un_wrapper — check permissions on $BIN_DIR and remove it by hand. The device is back to stock and the kit is still at $KIT_DIR."
+  elif [ -n "$_un_foreign" ]; then
+    say "leaving the 'redoku' at $_un_foreign alone — this installer did not write it"
+  fi
+
+  say "removing the kit at $KIT_DIR"
+  remove_kit "$KIT_DIR"
+  say "done — the device is back to stock and this machine has no reDoku kit left"
+  say "  reinstall any time with:"
+  say "    curl -fsSL https://github.com/QuirkQ/reDoku/releases/latest/download/install.sh | sh"
+}
+
+# The one line of `status` that is about THIS machine rather than the device
+# (design doc §5.2). Printed locally and never smuggled into the remote
+# script: the device has no idea which kit on your laptop drove the install,
+# and a line that pretended otherwise would be reporting a value it made up.
+#
+# Padded to the same width as the device's own lines ("firmware ", "installed",
+# "rm2fb    " …) so the whole block stays one aligned table, and printed with
+# printf rather than say() for the same reason — say()'s "==> " prefix belongs
+# to progress messages, not to the table.
+#
+# The path is abbreviated to ~ when it is under $HOME. That is display only:
+# nothing parses this line, and every path this file feeds to a command is the
+# absolute, resolved one.
+kit_status_line() {
+  if [ "$IN_KIT" -eq 0 ] && [ -z "$KIT_DIR" ]; then
+    # An empty value here would be the least useful thing to print. Say what
+    # is actually true instead: this is a checkout, so there is no kit, and
+    # $KIT_VERSION — §5.1's marker 1 — says whether these bytes were released
+    # or are a working copy.
+    printf 'kit      : none — running from %s (KIT_VERSION=%s)\n' "$REPO" "$KIT_VERSION"
+    return 0
+  fi
+  resolve_kit_root
+  _ksl_shown=$KIT_DIR/current
+  case $_ksl_shown in
+    "$HOME"/*) _ksl_shown="~${_ksl_shown#"$HOME"}" ;;
+  esac
+  _ksl_ver=
+  if [ -f "$KIT_DIR/current/VERSION" ]; then
+    # `|| true` for the same reason fetch_kit's read of VERSION has it: `read`
+    # returns non-zero at EOF even when it DID fill the variable, which a
+    # VERSION file with no trailing newline produces.
+    read -r _ksl_ver < "$KIT_DIR/current/VERSION" || true
+  fi
+  if [ -n "$_ksl_ver" ]; then
+    printf 'kit      : %s (%s)\n' "$_ksl_ver" "$_ksl_shown"
+  else
+    printf 'kit      : %s — broken, repair it with: redoku upgrade\n' "$_ksl_shown"
+  fi
 }
 
 cmd_status() {
@@ -1893,6 +2434,10 @@ printf "rm2fb    : %s\n" "$(systemctl is-active rm2fb.service 2>/dev/null || tru
 printf "xochitl  : %s\n" "$(systemctl is-active xochitl.service 2>/dev/null || true)"
 if [ -S /var/run/rm2fb.sock ]; then printf "socket   : present\n"; else printf "socket   : absent\n"; fi
 if [ -f /home/root/redoku/preload.env ]; then printf "preload  : armed (xochitl draws through rm2fb)\n"; else printf "preload  : disarmed (xochitl is stock)\n"; fi'
+  # After the remote block, so the host-side line joins the end of the same
+  # aligned table rather than being separated from it by connect()'s progress
+  # messages.
+  kit_status_line
 }
 
 cmd_shell() {
@@ -1903,6 +2448,7 @@ cmd_shell() {
 
 case $CMD in
   install)   cmd_install ;;
+  upgrade)   cmd_upgrade ;;
   play)      cmd_play ;;
   uninstall) cmd_uninstall ;;
   status)    cmd_status ;;
