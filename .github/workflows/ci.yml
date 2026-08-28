@@ -42,19 +42,44 @@ jobs:
           shellcheck bin/redoku device/install.sh device/uninstall.sh \
             tools/install.sh tools/mkkit.sh tools/test/kit_test.sh
           # A written-out list goes stale silently, which is the one failure
-          # mode a lint gate cannot afford. Re-derive the set the way D9
-          # defines it — tracked files whose first line is a sh shebang — and
-          # refuse to pass if it disagrees with what was just linted. Adding a
-          # script then becomes a review decision, never an unnoticed hole.
-          found=$(git ls-files | while IFS= read -r f; do
-            case $(head -n 1 -- "$f" 2>/dev/null) in
-              '#!'*sh | '#!'*sh[!A-Za-z0-9]*) printf '%s\n' "$f" ;;
-            esac
-          done)
-          # These continuation lines sit at the block scalar's own indent, so
-          # YAML strips it and the shell sees them flush left — do not "tidy"
-          # them. If that ever breaks, this guard fails loudly rather than
-          # quietly passing, which is the right way round.
+          # mode a lint gate cannot afford. Re-derive the set and refuse to
+          # pass if it disagrees with what was just linted. Adding a script
+          # then becomes a review decision, never an unnoticed hole.
+          #
+          # The set is the UNION of two scans, because neither alone is D9's
+          # "every shell file":
+          #   * a shebang scan is the only thing that finds bin/redoku, which
+          #     has no suffix — but it misses a sourced fragment, which is
+          #     shell and has no shebang at all;
+          #   * a *.sh/*.bash pathspec finds that fragment — but not a
+          #     suffixless script.
+          # A file caught by only one scan is still in the union, which is the
+          # whole point.
+          #
+          # core.quotePath=false and -z: git otherwise renders a non-ASCII path
+          # as an escaped, double-quoted string, and `head` on that literal name
+          # then fails silently and the file drops out of the scan unnoticed —
+          # a hole in exactly the shape this guard exists to prevent. A path
+          # containing a literal newline survives both scans intact and then
+          # cannot match $expected, so it fails the guard loudly rather than
+          # slipping through: the safe direction.
+          found=$(
+            {
+              git -c core.quotePath=false ls-files -z |
+                while IFS= read -r -d '' f; do
+                  case $(head -n 1 -- "$f" 2>/dev/null) in
+                    '#!'*sh | '#!'*sh[!A-Za-z0-9]*) printf '%s\n' "$f" ;;
+                  esac
+                done
+              git -c core.quotePath=false ls-files -z -- '*.sh' '*.bash' |
+                tr '\0' '\n'
+            } | LC_ALL=C sort -u
+          )
+          # Keep this list LC_ALL=C-sorted — that is the order $found comes
+          # back in. These continuation lines sit at the block scalar's own
+          # indent, so YAML strips it and the shell sees them flush left — do
+          # not "tidy" them. If either ever breaks, this guard fails loudly
+          # rather than quietly passing, which is the right way round.
           expected='bin/redoku
           device/install.sh
           device/uninstall.sh
