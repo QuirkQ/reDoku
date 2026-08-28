@@ -573,44 +573,61 @@ of a directory it merely found. A future command that pushes a file cannot
 forget the check, because the check is inside the push. The commands also
 refuse early, but that is for the message, not the guarantee.
 
-**Two consequences worth stating.** The checkout layout unpacks into
+**One consequence worth stating.** The checkout layout unpacks into
 `$REPO/build/download/` and reads back from it on a later run, so it is
 refused when `$REPO` is not our own tree — a standalone CLI must pass
-`--kit DIR`. And §6.3's reuse skips the download and therefore the checksum,
-so it is refused in a base other people can write; idempotence survives
-everywhere legitimate.
+`--kit DIR`.
 
 **Reuse mints nothing.** §6.3 skips the download and therefore the checksum,
 so a tree merely sitting at the destination cannot be told from one somebody
 else put there — no property of a directory can establish that this installer
-wrote it. `verified` is therefore set at exactly one line, immediately after
-the `mv` that puts checksum-matched bytes in place, and reuse is permitted
-only where trust was already earned for that base. Everywhere else the
-fall-through is a **download**, not a refusal. §6.3's idempotence was always a
-bandwidth optimisation; it was never a claim about what may be trusted, and it
-is narrower now than it was. **[reasoned]**
+wrote it, and a mode bit least of all: an attacker's directory is 0755 like
+everybody else's. `verified` is therefore set at exactly one line, immediately
+after the `mv` that puts checksum-matched bytes in place, and reuse is
+permitted only where trust was **already earned for that base by other means**.
+Everywhere else the fall-through is a **download**, not a refusal. §6.3's
+idempotence was always a bandwidth optimisation; it was never a claim about
+what may be trusted, and it is narrower now than it was. **[reasoned]**
 
-**The writability question is asked of the subtree, not the root.** Artifacts
-come from `<root>/device/` and `<root>/build/rm2/bin/`, so a world-writable
-*subdirectory* under a sound root defeated `own` entirely — whoever can write
-`<root>/device` cannot write `<root>/bin/redoku`, which is the whole of `own`'s
-argument. The check walks from each artifact up to the root. It stops there:
-above the root, trustworthiness is what `own` or `verified` established, and
-walking to `/` would condemn every legitimate use of a world-writable `/tmp`,
-the bootstrap's own 0700 directory included.
+**The writability question is asked of the subtree, up to the TRUST ANCHOR.**
+Artifacts come from `<anchor>/device/` and `<anchor>/build/rm2/bin/`, so a
+world-writable *subdirectory* under a sound anchor defeated `own` entirely —
+whoever can write `<anchor>/device` cannot write `<anchor>/bin/redoku`, which
+is the whole of `own`'s argument. The check walks from each artifact — its own
+mode included — up to the anchor.
 
-**The residuals, stated rather than implied.** Two, and neither is closed:
+The anchor is `$REPO` for `own` and `$FETCH_BASE` for `verified`, and it is
+**not** `$KIT_ROOT`. That distinction is load-bearing rather than pedantic:
+`$KIT_ROOT` is reassigned to the unpacked version directory after a fetch, so
+handing the walk `$KIT_ROOT` made it start and finish inside that version tree
+and never examine `build/download/` or any other ancestor — which made the
+whole check ornamental on every download path. Measured: a legitimate checkout
+with only `build/download` world-writable had its planted `device/install.sh`
+executed as root, and with `REDOKU_VERSION` pinned it did so with no network
+traffic at all.
 
-- **Group-writability.** The walk detects *world*-writable directories. A
-  directory writable by a **group the attacker is in** is not detected, and
-  cannot be without an ownership model this script has no business
-  implementing. So: **do not run a downloaded CLI, or point `--kit`, at a
-  directory other people can write.**
-- **TOCTOU.** Between the checksum and the push, someone with write access to
-  a non-sticky `--kit` base can swap the tree. Closing it means holding an open
-  descriptor to every artifact across the device stage, which POSIX `sh` cannot
-  express. It needs write access to a base the user named, and the walk above
-  refuses that base when it is world-writable.
+The walk stops at the anchor rather than continuing to `/`, because above the
+anchor trustworthiness is what `own` or `verified` established, and walking on
+would condemn every legitimate use of a world-writable `/tmp` — the
+bootstrap's own 0700 directory included. An artifact that resolves outside
+every anchor (a symlinked branch pointing away from the kit) is **refused**
+rather than given the benefit of the doubt; `--artifacts DIR` is passed as a
+second anchor, because that is a tree the user named on purpose.
+
+**The residuals, stated rather than implied.** Two, and neither is closed —
+this section has twice claimed a wider boundary than the code held, which is
+the direction that invites the trust the preamble warns against:
+
+- **Group-writability.** The walk detects *world*-writable paths. A directory
+  writable by a **group the attacker is in** is not detected, and cannot be
+  without an ownership model this script has no business implementing. So: **do
+  not run a downloaded CLI, or point `--kit`, at a directory other people can
+  write.**
+- **TOCTOU.** Between the checksum and the push, anyone with write access to
+  the tree can swap it. Closing that needs an open descriptor held to every
+  artifact across the device stage, which POSIX `sh` cannot express. Accepted;
+  it needs write access to a tree this run vouched for. It is **not** mitigated
+  by the walk — the walk runs before the push, not during it.
 
 The `bin/`-name check that preceded all of this was weaker still and is gone;
 it was forgeable by the same actor, since anyone who can write `$REPO` can
@@ -632,7 +649,7 @@ install behind.
 | interrupted or disk-full unpack | staging directory (beside the destination, not `$TMPDIR`) + `mv`; `current` never points at a partial tree |
 | `~/.local/bin` not on `PATH` | prints the `export` line; never edits a shell rc |
 | a foreign `redoku` at the bin-dir | left alone; prints its path, suggests `--bin-dir` / `--no-symlink` |
-| that version already downloaded | reused, not re-fetched (§6.3) |
+| that version already downloaded | reused only where this run already earned trust for the base (§6.3, §6.5); otherwise re-fetched and replaced |
 | `current` missing or dangling | `upgrade` repairs it by installing latest |
 | device-side failure | unchanged — `device/install.sh` still rolls back to stock **[src]** |
 
