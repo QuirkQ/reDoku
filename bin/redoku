@@ -221,9 +221,15 @@ options:
   -h, --help              this help
 
 environment:
-  REDOKU_HOME             kit root, same as --kit DIR   (no default — see --kit)
+  REDOKU_HOME             kit root, same as --kit DIR. install has no default
+                          for it (a kit install is asked for, never guessed);
+                          upgrade and uninstall --self fall back to the kit
+                          they are running from, then to ~/.redoku.
   REDOKU_BIN_DIR          PATH entry dir, same as --bin-dir DIR
-  REDOKU_VERSION          pin a release tag instead of taking the latest
+  REDOKU_VERSION          pin a release tag instead of taking the latest —
+                          for upgrade too, which will then install exactly
+                          that version even if it is older than the one you
+                          have, and say that it did
   REDOKU_BASE_URL         where releases are fetched from — for a fork, a
                           mirror, or a file:// directory offline
 
@@ -2448,8 +2454,15 @@ kit_status_line() {
   fi
   resolve_kit_root
   _ksl_shown=$KIT_DIR/current
+  # Both spellings of the home directory, because resolve_kit_root resolves
+  # the kit root (cd + pwd -P) while $HOME stays exactly as the environment
+  # wrote it — and on a machine where /var is a symlink to /private/var, or
+  # where anyone's home is reached through one, those two strings differ and a
+  # test against $HOME alone silently never abbreviates.
+  _ksl_home=$(CDPATH= cd -P -- "$HOME" 2>/dev/null && pwd -P) || _ksl_home=$HOME
   case $_ksl_shown in
-    "$HOME"/*) _ksl_shown="~${_ksl_shown#"$HOME"}" ;;
+    "$HOME"/*)      _ksl_rest=${_ksl_shown#"$HOME"};      _ksl_shown="~$_ksl_rest" ;;
+    "$_ksl_home"/*) _ksl_rest=${_ksl_shown#"$_ksl_home"}; _ksl_shown="~$_ksl_rest" ;;
   esac
   _ksl_ver=
   if [ -f "$KIT_DIR/current/VERSION" ]; then
