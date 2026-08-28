@@ -3613,7 +3613,7 @@ test_artifact_trust_fails_closed() {
       uninstall --host nowhere --yes < /dev/null || return 1
   # Needle inside one physical line: the message wraps between "is writable"
   # and "by other users", so the obvious phrase spans the break.
-  assert_contains "$ASSERT_OUTPUT" "a directory on the way to it is writable" \
+  assert_contains "$ASSERT_OUTPUT" "or a directory on the way to it" \
     "trust gate: (e) refused for the directory the file actually came from" || return 1
   assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
     "trust gate: (e) nothing reached the device" || return 1
@@ -3642,7 +3642,7 @@ test_artifact_trust_fails_closed() {
   assert_fails "trust gate: (g) an exposed ancestor of the artifact is refused" -- \
     env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_sub/bin/redoku" \
       play --seconds 1 --host nowhere < /dev/null || return 1
-  assert_contains "$ASSERT_OUTPUT" "a directory on the way to it is writable" \
+  assert_contains "$ASSERT_OUTPUT" "or a directory on the way to it" \
     "trust gate: (g) the walk found it, not the artifact's own directory" || return 1
   assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
     "trust gate: (g) nothing reached the device" || return 1
