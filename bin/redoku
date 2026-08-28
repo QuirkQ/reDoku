@@ -664,6 +664,32 @@ valid_tag() {
     # the sweep to look inside candidates: the sweep runs before a download,
     # when the directory it is looking at may legitimately be half-written.
     .staging.*)        return 1 ;;
+    # The kit root's OTHER reserved name, and the same rule as the line above
+    # for the same reason: design doc §5.3 gives 'current' to the symlink, so a
+    # tag spelling it is a version directory competing for a name this
+    # installer already owns. Measured, not theorised — with this arm removed,
+    # a release whose VERSION reads "current" walks an existing kit through all
+    # four of these at once:
+    #
+    #   * the reuse gate stats <kit>/current, FOLLOWS it into the live version
+    #     directory, finds a complete tree there and announces "current is
+    #     already unpacked — reusing it", which is a lie about a symlink;
+    #   * the repoint's `rm -f current; ln -s "$TAG" current` produces
+    #     current -> current, and the read-back guard passes because the loop's
+    #     own name IS the tag;
+    #   * prune_kit is then told to keep "current" and the one-back version,
+    #     so it rm -rf's the rollback target — a recursive delete of a good
+    #     version directory, steered by remote input;
+    #   * and the PATH wrapper is rewritten through the loop, so the command
+    #     the resulting error message tells you to run is itself dead (ELOOP).
+    #
+    # On a kit root with no 'current' yet it is worse in a quieter way: the
+    # tree is moved in as a REAL directory called 'current', and every later
+    # install into that root dies at "current is not a symlink" until somebody
+    # removes it by hand. "current" is also the word a user reaches for when
+    # they mean "the current release", so REDOKU_VERSION=current is a plain
+    # typo, not only an attack.
+    current)           return 1 ;;
   esac
 }
 
@@ -777,9 +803,10 @@ resolve_tag() {
   if [ -n "${REDOKU_VERSION:-}" ]; then
     valid_tag "$REDOKU_VERSION" || \
       die "REDOKU_VERSION='$REDOKU_VERSION' can't be used as a release tag — it becomes a
-  directory name and a URL component, so it may only hold letters, digits,
-  '.', '_' and '-'. Set it to a published tag (e.g. REDOKU_VERSION=v0.3.0),
-  or unset it to take the latest release."
+  directory name in your kit root, so it may only hold letters, digits, '.', '_'
+  and '-', and it may not be 'current' or begin '.staging.': this installer owns
+  those two names inside a kit root. Set it to a published tag (e.g.
+  REDOKU_VERSION=v0.3.0), or unset it to take the latest release."
     TAG=$REDOKU_VERSION
     return 0
   fi
@@ -796,9 +823,10 @@ resolve_tag() {
   if [ "$KIT_VERSION" != dev ] && [ "$WANT_LATEST" -eq 0 ]; then
     valid_tag "$KIT_VERSION" || \
       die "this copy of redoku was stamped KIT_VERSION='$KIT_VERSION', which can't be
-  used as a release tag — it becomes a directory name and a URL component, so it
-  may only hold letters, digits, '.', '_' and '-'. The release is mis-stamped;
-  pin a known-good one with REDOKU_VERSION=<tag> instead."
+  used as a release tag — it becomes a directory name in a kit root, so it may
+  only hold letters, digits, '.', '_' and '-', and may not be 'current' or begin
+  '.staging.', which are names this installer owns there. The release is
+  mis-stamped; pin a known-good one with REDOKU_VERSION=<tag> instead."
     TAG=$KIT_VERSION
     return 0
   fi
@@ -844,6 +872,15 @@ resolve_tag() {
 # is discarded, so it looks at files spread across the tree rather than at a
 # prefix of it.
 kit_tree_is_complete() {
+  # A real directory, and not a symlink to one. `-f` and `is_arm_elf` below all
+  # follow symlinks, so without this the gate happily reports a SYMLINK
+  # complete and the caller then treats the link as the tree — which is how a
+  # tag colliding with the kit root's own 'current' got this function to
+  # announce "already unpacked" about the live version directory it pointed at.
+  # valid_tag now refuses that tag outright, and this is the defence in depth
+  # behind it: nothing this function approves can be a link into somewhere
+  # else, whatever named it.
+  [ -d "$1" ] && [ ! -L "$1" ] && \
   [ -f "$1/VERSION" ] && \
   [ -f "$1/bin/redoku" ] && \
   [ -f "$1/device/install.sh" ] && \
@@ -1201,7 +1238,9 @@ EOF
       valid_tag "$TAG" || \
         die "the kit at $_fk_url/redoku-rm2.tar.gz carries a VERSION this installer
   cannot use as a directory name ('$TAG') — it may only hold letters, digits,
-  '.', '_' and '-'. Pin a known-good release with REDOKU_VERSION=<tag> instead."
+  '.', '_' and '-', and it may not be 'current' or begin '.staging.', which are
+  names this installer owns inside a kit root. Nothing was unpacked and your kit
+  is untouched. Pin a known-good release with REDOKU_VERSION=<tag> instead."
     fi
     _fk_dest=$(kit_dest "$_fk_layout" "$_fk_base" "$TAG")
 
