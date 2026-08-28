@@ -34,11 +34,38 @@ MRuby::CrossBuild.new('rm2') do |conf|
 
   conf.gembox 'default'
 
-  # Cross builds select NO platform port by default (lib/mruby/build.rb
-  # effective_ports returns [] for MRuby::CrossBuild), which leaves
-  # mruby-io/mruby-dir HAL symbols (mrb_hal_io_*, mrb_hal_dir_*) undefined
-  # at link time. The device is ARM Linux, so the posix port is correct.
-  conf.ports :posix
+  # Cross builds select no platform implementation by default, which leaves
+  # mruby-io/mruby-dir/mruby-socket HAL symbols (mrb_hal_io_*, mrb_hal_dir_*)
+  # undefined at link time. The device is ARM Linux, so posix is correct.
+  #
+  # Which SPELLING is correct depends on which mruby you build against, and
+  # this repo can be built against two different ones — see the Makefile's
+  # `MRUBY_DIR ?= $(firstword $(wildcard ../mruby) tmp/mruby)`. A developer
+  # with a sibling ../mruby checkout builds against that; CI has no sibling,
+  # so it clones tmp/mruby at $(MRUBY_REF), currently the 4.0.0 tag. Those
+  # are different API generations:
+  #
+  #   * post-4.0.0 mruby (master) has the ports API — `conf.ports :posix`.
+  #   * the 4.0.0 RELEASE has no ports API at all (`grep -r ports
+  #     lib/mruby/*.rb` is empty) and instead ships the HAL as core gems,
+  #     `hal-posix-io` and friends, one of which each of mruby-io, mruby-dir
+  #     and mruby-socket requires.
+  #
+  # Hard-coding either one breaks the other, and it breaks it at config-parse
+  # time with a NoMethodError or a missing-gem abort — before any compilation,
+  # so there is no partial build to diagnose from. Feature-detect instead.
+  #
+  # Naming the HAL explicitly also matters on the 4.0.0 path: left to itself
+  # each gem auto-selects from RUBY_PLATFORM, which is the HOST's platform,
+  # not the target's — a cross build would be right only by coincidence, and
+  # mruby warns you to say it explicitly.
+  if conf.respond_to?(:ports)
+    conf.ports :posix
+  else
+    conf.gem core: 'hal-posix-io'
+    conf.gem core: 'hal-posix-dir'
+    conf.gem core: 'hal-posix-socket'
+  end
 
   conf.gem File.expand_path('mrbgems/mruby-rm2', File.dirname(__FILE__))
   conf.gem File.expand_path('mrbgems/mruby-sqlite3', File.dirname(__FILE__))
