@@ -4169,6 +4169,13 @@ test_kit_uninstall_self_leaves_what_is_not_ours() {
   _foreign=$(kit_digest "$_bin/redoku")
   mkdir -p "$_kit/notes"
   printf 'keep me\n' > "$_kit/notes/README"
+  # …and one shaped like a version directory: named after its own VERSION,
+  # which is the test remove_kit's sweep used to run on by itself. notes/
+  # above fails that test already, so without this the structural gate is
+  # unpinned — measured, the mutation survived.
+  mkdir -p "$_kit/v1.2.3"
+  printf 'v1.2.3\n' > "$_kit/v1.2.3/VERSION"
+  printf 'my work\n' > "$_kit/v1.2.3/notes.txt"
   write_fake_ssh "$_w/fakebin/ssh" "$_w/device"
 
   set +e
@@ -4191,6 +4198,8 @@ test_kit_uninstall_self_leaves_what_is_not_ours() {
   assert_no_file "$_kit/v0.1.0" "self foreign: the version directory was still removed" || return 1
   assert_no_file "$_kit/current" "self foreign: and so was current" || return 1
   assert_file "$_kit/notes/README" "self foreign: the user's own file survived" || return 1
+  assert_file "$_kit/v1.2.3/notes.txt" \
+    "self foreign: and a directory of theirs that merely LOOKS like a version" || return 1
   assert_contains "$ASSERT_OUTPUT" "did not put there" \
     "self foreign: the run says the root was left and why" || return 1
 }
