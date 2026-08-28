@@ -2322,6 +2322,16 @@ check_kit_root() {
     if [ -n "$_crk_cres" ]; then
       looks_like_our_tree "$_crk_cres" && _crk_looks=1
     elif [ ! -e "$_crk_root/current" ]; then
+      # No test pins THIS arm on its own, and that is recorded rather than
+      # hidden: with kit_root_holds_only_ours below in place, every shape that
+      # reaches it is already refused for the other reason — a link to a file
+      # in the root makes that file a child which is not ours, and a link to
+      # anything outside the root carries a slash and fails valid_tag. It is
+      # kept because the two rules are independent and this one states the
+      # intent: a link whose target EXISTS was never dangling, whatever cd -P
+      # said. (cmd_upgrade needs the same distinction and is not redundant
+      # there — see its `foreign` state, which is pinned.)
+      #
       # State 4 only: -e follows the symlink, so it is false exactly when the
       # target is not there. This is §6.2's repoint window and §7's dangling
       # `current`, and the only evidence left is the name it was pointed at.
