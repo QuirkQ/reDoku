@@ -435,6 +435,33 @@ Description=reDoku rm2fb display server (swtcon mode)
 Before=xochitl.service
 StartLimitIntervalSec=600
 StartLimitBurst=4
+# $REDOKU_DIR lives on its own partition (/dev/mmcblk2p4, confirmed on the
+# owner's device) that is not guaranteed mounted yet when systemd runs this
+# unit's ExecStart for the first time at boot. Measured, not theoretical:
+# every boot in .superpowers/sdd/M4-HIJACK/device-watcher-journal.txt
+# failed the watcher's first start 203/EXEC for exactly this reason, and
+# ExecStart below sits on the same partition.
+#
+# Untreated, this one fails SILENTLY rather than loudly, which is why it
+# outranks the watcher's copy: Before=xochitl.service is an ordering, and a
+# FAILED start satisfies an ordering just as well as a successful one. So
+# rm2fb dies 203/EXEC, xochitl starts immediately with no preload.env to
+# read (EnvironmentFile below is optional by design) and therefore no
+# shim, and RestartSec=5 then brings the server up to take the panel out
+# from under an already-running unshimmed xochitl. That is the frozen
+# splash the owner hit twice with every unit reporting healthy — and in
+# the same journal, boot 5d13c195 logs the watcher's 203/EXEC and "Started
+# reMarkable main application" in the same second.
+#
+# RequiresMountsFor orders this unit after (and requires) whatever mount
+# unit covers the path, so the first start is a real one. If that mount
+# never arrives, rm2fb does not start at all and xochitl comes up
+# completely stock — the same tolerated fallback as a broken server, not a
+# new way to lose the tablet.
+#
+# NOT closed by this: rm2fb failing its first boot start for some reason
+# OTHER than the mount reopens the identical window (see PLAN.md §11).
+RequiresMountsFor=$REDOKU_DIR
 
 [Service]
 # The server sd_notifies READY only after its sockets are bound and the

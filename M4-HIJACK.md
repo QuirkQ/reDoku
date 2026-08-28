@@ -258,11 +258,17 @@ the owner's own device rather than in review.
   (`looks_like_uuid`, both scripts). Recorded here because a milestone that
   shipped a bug this severe, and then fixed it before it shipped to `main`,
   is not a milestone to describe as trouble-free.
-- **A pre-existing, unrelated bug found on the way and deliberately left
-  alone.** `rm2fb.service`'s own `ExecStart` has the identical late-mount
-  race the watcher had (`203/EXEC` on boot, `RequiresMountsFor` is the
-  fix) — not introduced by M4, not fixed by M4, reported to the owner
-  instead. Full account: PLAN.md §11.
+- **A pre-existing, unrelated bug found on the way, reported rather than
+  quietly patched, then fixed once the owner had seen it.**
+  `rm2fb.service`'s own `ExecStart` had the identical late-mount race the
+  watcher had (`203/EXEC` on boot, `RequiresMountsFor` is the fix), and it
+  was the cause of the frozen-splash boots — not introduced by M4, which
+  only made it visible. Held out of the milestone deliberately so the
+  owner could rule on a change to a unit they depend on daily; fixed on
+  their word on 2026-08-28, one line in the unit `device/install.sh`
+  writes. Still owed: the next boot's journal, to witness the `203/EXEC`
+  actually gone. Full account, including the window the one-liner does
+  *not* close: PLAN.md §11.
 - Both the installer's rollback and the watcher's crash-loop protection were
   exercised for real, not just reasoned about: the owner's install rolled
   back **twice** on the actual device (episode 1, then episode 2) before

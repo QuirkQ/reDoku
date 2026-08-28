@@ -652,7 +652,11 @@ discovery of 3.27.3.0 (2026-08-21):
 2. `rm2fb.service`: `Type=notify` (the server sd_notifies READY after its
    sockets bind), `Before=xochitl.service`, `KillSignal=SIGINT` (its clean
    shutdown handler ignores SIGTERM), `ExecStart` of
-   `rm2fb_server_swtcon`. **No `.socket` unit** — upstream's is stale
+   `rm2fb_server_swtcon`, and `RequiresMountsFor=/home/root/redoku` —
+   without which the first start after every boot races the `/home`
+   mount and fails `203/EXEC`, silently, because `Before=` is satisfied
+   by a failed start just as well as a successful one (§11). **No
+   `.socket` unit** — upstream's is stale
    (DGRAM at the STREAM's path); the server binds its own sockets:
    STREAM `/var/run/rm2fb.sock` (clients), DGRAM
    `/var/run/rm2fb.control.sock` (`rm2fbctl`).
@@ -914,8 +918,8 @@ left the lot for M3a — see
   cooldown. `GetClients` still backs the "already running" check the plan
   describes, but the grace and the cooldown are what actually stop the
   loops — both measured working on hardware, not just reasoned about (§10).
-- **`rm2fb.service`'s boot-time mount race — found during M4, not M4's own
-  defect, and deliberately left unfixed pending the owner's review.**
+- **`rm2fb.service`'s boot-time mount race — found during M4, pre-dating
+  it, fixed after the owner's review (2026-08-28).**
   `/home/root` is a separate partition (`/dev/mmcblk2p4`) that is not
   guaranteed mounted when systemd first runs a unit's `ExecStart` at boot.
   `redoku-watcher.service` hit exactly this as `203/EXEC` on every boot,
@@ -924,13 +928,32 @@ left the lot for M3a — see
   `RequiresMountsFor=/home/root/redoku` (`device/redoku-watcher.service`).
   `rm2fb.service`'s own `ExecStart`
   (`/home/root/redoku/bin/rm2fb_server_swtcon`, written by `device/install.sh`)
-  sits on the same partition and carries the identical race, and it predates
-  M4 — this milestone only made it visible. Its symptom is worse than the
-  watcher's, and can be silent: one observed boot came up with xochitl
-  running **without** `LD_PRELOAD` while rm2fb held the panel, leaving the
-  tablet on a frozen splash with every systemd unit reporting healthy. The
-  fix, when reviewed, is the identical one-liner:
-  `RequiresMountsFor=/home/root/redoku` on `rm2fb.service`.
+  sits on the same partition and carried the identical race; M4 only made
+  it visible. Its symptom was worse than the watcher's because it was
+  silent: `Before=xochitl.service` is an ordering, and a **failed** start
+  satisfies an ordering just as well as a successful one, so rm2fb died
+  `203/EXEC`, xochitl started with no `preload.env` to read (that
+  `EnvironmentFile` is optional by design) and therefore no shim, and
+  `RestartSec=5` then brought the server up to take the panel out from
+  under an already-running unshimmed xochitl — a frozen splash with every
+  systemd unit reporting healthy, hit twice by the owner. Same journal,
+  boot `5d13c195`: the watcher's `203/EXEC` and "Started reMarkable main
+  application" land in the same second.
+  Now closed by the same one-liner, `RequiresMountsFor=$REDOKU_DIR` in the
+  unit `device/install.sh` writes. If that mount never arrives, rm2fb does
+  not start at all and xochitl comes up stock — the same tolerated
+  fallback as a broken server, so the directive cannot cost more than it
+  buys. **Two caveats.** (a) Not verified on hardware: the device was
+  disconnected when this shipped, so the reasoning is sound and the
+  `203/EXEC` disappearing from the next boot's journal is still owed as
+  evidence. (b) It closes the *mount* cause, not the window: rm2fb failing
+  its first boot start for any **other** reason reopens exactly the same
+  unshimmed-xochitl-then-late-panel-grab sequence. Closing that would mean
+  either making xochitl hard-require rm2fb (rejected — a broken display
+  server would then keep the tablet from ever booting to a usable state)
+  or having a late-starting rm2fb restart xochitl behind itself (rejected
+  for now — a flapping server would thrash xochitl up to
+  `StartLimitBurst` times).
 - **Firmware update pressure**: auto-update is off; `install.sh` warns if
   `/etc/version` ≠ 3.27.3.0 (drift detection after any manual update).
 - **xochitl rewrites its own `.content`/`.pagedata` sidecars from its
