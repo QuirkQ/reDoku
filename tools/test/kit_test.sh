@@ -737,8 +737,13 @@ test_no_sha256_tool() {
   # Preferred over shadowing shasum/sha256sum/openssl with three failing
   # stubs: an absent file IS "not found" to `command -v` on every shell,
   # where a stub has to correctly fake that across implementations.
+  # chmod and mkdir joined the list when install.sh started placing the CLI at
+  # $T/bin/redoku (so bin/redoku's $REPO lands on the 0700 temp dir instead of
+  # on /tmp — see install.sh's comment there). They run BEFORE the digest
+  # check, so without them this test would die at "could not create $T/bin" and
+  # pass its assert_fails having proven nothing about the refusal.
   _minpath=$_w/minpath
-  build_minpath "$_minpath" curl mktemp rm sh
+  build_minpath "$_minpath" chmod curl mkdir mktemp rm sh
 
   assert_fails "no sha256 tool: install.sh exits non-zero" -- \
     env PATH="$_minpath" REDOKU_BASE_URL="file://$_w/release" \
@@ -870,9 +875,144 @@ test_tmpdir_cleanup_on_success() {
   assert_file "$_clidir" "cleanup on success: the stub CLI ran" || return 1
   _shim_dir=
   read -r _shim_dir < "$_record" || true
-  assert_eq "$_shim_dir" "$(cat "$_clidir")" \
-    "cleanup on success: the shim's directory is the one install.sh ran the CLI from" || return 1
+  # The CLI lives at $T/bin/redoku, not $T/redoku, so its own `dirname "$0"` is
+  # $T/bin. That extra level is the CRITICAL-1 fix and is the whole point:
+  # bin/redoku's $REPO is the parent of its directory, so this is what puts
+  # $REPO on the 0700 temp dir rather than on /tmp. Asserting the exact
+  # relationship — not just "some directory" — is what makes this test notice
+  # if the layout is ever flattened back.
+  assert_eq "$_shim_dir/bin" "$(cat "$_clidir")" \
+    "cleanup on success: the CLI ran from <tempdir>/bin, so \$REPO is the temp dir itself" || return 1
   _assert_bootstrap_tmpdir_gone "$_record" "cleanup on success" || return 1
+}
+
+# Final-review CRITICAL-1: the bootstrap put the CLI at $T/redoku, one level
+# shallower than bin/redoku's $REPO derivation assumes, so $REPO became the
+# PARENT of the temp directory — /tmp on Linux, which is world-writable and
+# sticky. build_decoy EXECUTES $REPO/tools/mkdecoy.rb when it exists, so a
+# pre-planted /tmp/tools/mkdecoy.rb ran as the victim on the headline curl|sh
+# path, before any confirmation.
+#
+# Two independent layers, and this drives BOTH, because either alone closes the
+# reproduction and a test that only proved "not exploited" would not notice one
+# of them being undone:
+#
+#   1. the layout — the CLI runs from <tempdir>/bin, so $REPO is the 0700
+#      temp dir. Asserted through the shim/stub cross-check in
+#      test_tmpdir_cleanup_on_success, and here by planting a generator at the
+#      parent of the temp dir and proving it is not reached.
+#   2. the stamp gate — a STAMPED CLI never runs a generator found beside it,
+#      wherever it was started from. That is what covers the README's
+#      "curl -O it and read it first" flow from a directory under /tmp, which
+#      the bootstrap fix cannot reach.
+#
+# $TMPDIR is pointed at a directory of the test's own so the "attacker" can
+# plant at its parent. On macOS `mktemp -d` ignores $TMPDIR (see
+# write_mktemp_shim), so the shim is used to make the temp dir land where this
+# test can reason about it — the same seam, for the same reason.
+test_bootstrap_does_not_execute_from_the_temp_parent() {
+  _w=$(mktemp -d "$ROOT/bootstrap-repo.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  _record=$_w/mktemp-record
+  _clidir=$_w/cli-dir
+  # $_w/tmp is the "temp dir parent" — the stand-in for /tmp. The attacker
+  # plants a generator directly in it.
+  write_mktemp_shim "$_w/shim" "$_w/tmp" "$_record"
+  mkdir -p "$_w/tmp/tools"
+  printf '#!/bin/sh\nprintf pwned > %s/PWNED\n' "$_w" > "$_w/tmp/tools/mkdecoy.rb"
+  chmod +x "$_w/tmp/tools/mkdecoy.rb"
+
+  set +e
+  ASSERT_OUTPUT=$(PATH="$_w/shim:$PATH" REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    REDOKU_TEST_TMPDIR_RECORD="$_clidir" \
+    "$KIT_SH" "$REPO/tools/install.sh" < /dev/null 2>&1)
+  _bs_rc=$?
+  set -e
+  assert_eq 0 "$_bs_rc" "bootstrap REPO: install.sh succeeds (output: $ASSERT_OUTPUT)" || return 1
+
+  # The planted script must not have run — this is the exploit itself.
+  assert_no_file "$_w/PWNED" \
+    "bootstrap REPO: a generator planted beside the temp dir was NOT executed" || return 1
+
+  # Layer 1, asserted structurally rather than only by the exploit's absence:
+  # the CLI ran from <tempdir>/bin, so its $REPO is the temp dir itself.
+  assert_file "$_clidir" "bootstrap REPO: the stub CLI ran" || return 1
+  _shim_dir=
+  read -r _shim_dir < "$_record" || true
+  assert_eq "$_shim_dir/bin" "$(cat "$_clidir")" \
+    "bootstrap REPO: the CLI runs from <tempdir>/bin, putting \$REPO on the 0700 temp dir" || return 1
+  # …and that temp dir is a child of the plantable parent, so the test really
+  # did place the generator where the old layout would have looked.
+  case $_shim_dir in
+    "$_w/tmp"/*) ;;
+    *) printf 'FAIL: bootstrap REPO: the temp dir (%s) is not under the planted parent (%s), so nothing was proven\n' \
+         "$_shim_dir" "$_w/tmp" >&2
+       return 1 ;;
+  esac
+
+  # Layer 2, driven directly: a STAMPED CLI must ignore a generator sitting
+  # exactly where $REPO points, which is the flow the bootstrap fix cannot
+  # reach (curl -O the CLI into a directory and run it from there).
+  build_fake_kit_inputs "$_w/build"
+  "$KIT_SH" "$REPO/tools/mkkit.sh" --version v0.9.9 --out "$_w/out" \
+    --build-dir "$_w/build" >/dev/null || \
+    die "test_bootstrap_does_not_execute_from_the_temp_parent: mkkit.sh failed"
+  _stand=$_w/standalone
+  mkdir -p "$_stand/bin" "$_stand/tools"
+  cp "$_w/out/redoku" "$_stand/bin/redoku"
+  chmod +x "$_stand/bin/redoku"
+  grep -qxF 'KIT_VERSION=v0.9.9' "$_stand/bin/redoku" || \
+    die "test_bootstrap_does_not_execute_from_the_temp_parent: the CLI asset is not stamped"
+  printf '#!/bin/sh\nprintf pwned > %s/PWNED2\n' "$_w" > "$_stand/tools/mkdecoy.rb"
+  chmod +x "$_stand/tools/mkdecoy.rb"
+
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+    "$KIT_SH" "$_stand/bin/redoku" install --download --kit "$_w/kit2" \
+    --no-symlink --host nowhere --yes < /dev/null 2>&1)
+  set -e
+  assert_no_file "$_w/PWNED2" \
+    "bootstrap REPO: a stamped CLI does not run a generator found beside it" || return 1
+  # It took the prebuilt branch instead, which is the true answer for a
+  # released CLI and is what makes the gate correct rather than merely safe.
+  assert_contains "$ASSERT_OUTPUT" "shipped prebuilt in this kit" \
+    "bootstrap REPO: the stamped CLI used the decoy that shipped with the kit" || return 1
+}
+
+# Final-review MEDIUM-4: tools/install.sh carries a guard whose whole point is
+# that $REDOKU_HOME alone is enough to say where the kit goes — it defaults the
+# kit directory from whichever of $REDOKU_HOME and $HOME exists, and dies with
+# a message naming its fix when neither does. It then handed over to
+# bin/redoku, which read $HOME unconditionally and died under `set -u` with a
+# bare "HOME: parameter not set", naming nothing. The promise was true of the
+# bootstrap and false of the install it performs.
+#
+# `env -u HOME` rather than `HOME=`: an EMPTY $HOME and an UNSET one are
+# different states to `set -u`, and it is the unset one that produced the bare
+# diagnostic.
+test_bin_redoku_without_home() {
+  _w=$(mktemp -d "$ROOT/nohome.XXXXXX")
+
+  assert_fails "no HOME: bin/redoku exits non-zero" -- \
+    env -u HOME REDOKU_HOME="$_w/kit" "$KIT_SH" "$REPO/bin/redoku" \
+      status --dry-run --host nowhere < /dev/null || return 1
+  # The shell's own diagnostic, which is what this used to be. dash says
+  # "HOME: parameter not set" and bash says "HOME: unbound variable", so both
+  # are checked — the point is that NEITHER reaches the user.
+  case $ASSERT_OUTPUT in
+    *"parameter not set"*|*"unbound variable"*)
+      printf 'FAIL: no HOME: the shell diagnostic reached the user, naming no fix\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_contains "$ASSERT_OUTPUT" "\$HOME is not set" \
+    "no HOME: the message says what is wrong" || return 1
+  assert_contains "$ASSERT_OUTPUT" "redoku_known_hosts" \
+    "no HOME: and what it needed \$HOME for" || return 1
+  assert_contains "$ASSERT_OUTPUT" "Set HOME" \
+    "no HOME: and names the fix" || return 1
 }
 
 test_tmpdir_cleanup_on_failure() {
@@ -2943,6 +3083,31 @@ test_kit_upgrade_repairs_current() {
     "repair: (d) the plan does not claim a broken current is a version you are on" || return 1
   assert_no_file "$_kit/v9.9.9" "repair: (d) the dry run created nothing" || return 1
 
+  # (d2) a `current` repointed at a regular FILE inside a real kit. `cd -P`
+  # fails on it exactly as it does on a dangling link, so collapsing the two —
+  # which both guard 5 and this state machine did — reported a file sitting in
+  # plain view as "which isn't there". Driven through --dry-run because that is
+  # where it is reachable: on a real run, fetch_kit's foreign-`current` refusal
+  # stops things first, but the PLAN is printed before that.
+  rm -f "$_kit/current"
+  printf 'data\n' > "$_kit/somefile"
+  ln -s somefile "$_kit/current"
+  [ -e "$_kit/current" ] || die "test_kit_upgrade_repairs_current: (d2) the fixture link does not resolve"
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    "$KIT_SH" "$_kit/v0.1.0/bin/redoku" upgrade --no-symlink --dry-run < /dev/null 2>&1)
+  _rp_rc=$?
+  set -e
+  assert_eq 0 "$_rp_rc" "repair: (d2) the plan exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "is there but is not a version of this kit" \
+    "repair: (d2) the plan describes a symlink-to-a-file for what it is" || return 1
+  case $ASSERT_OUTPUT in
+    *"isn't there"*)
+      printf 'FAIL: repair: (d2) a file plainly there was described as absent\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  rm -f "$_kit/current" "$_kit/somefile"
+
   # (e) re-review N7: a `current` made by hand with an ABSOLUTE target — a
   # plausible manual rollback. The state was derived by string-joining
   # readlink's output onto the kit root, giving "<kit>//abs/path/...", so a
@@ -3115,6 +3280,109 @@ test_kit_uninstall_names_the_right_fix_for_a_kit() {
   esac
 }
 
+# Final-review CRITICAL-2: `install --download --kit DIR` reached the same
+# repoint and prune through fetch_kit that `upgrade` does — design doc §5.3
+# says so outright — with none of the guards in front of it, and BEFORE its own
+# confirmation. A $HOME holding v1.2.3/ and v3.1/ had both recursively deleted
+# and the run then aborted at the confirm having installed nothing: the user
+# was asked to approve an action whose destructive half had already happened.
+#
+# This is the test whose absence let the F1 fix land on two callers out of
+# three, so it drives all three shapes the defect had rather than the one that
+# is easiest to assert.
+test_kit_install_guards_its_kit_root() {
+  _w=$(mktemp -d "$ROOT/kit-instguard.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # _mkuser <dir> — a directory of somebody's own that happens to be named
+  # after its own VERSION. Not contrived: people really do name directories
+  # v1.2.3, and a VERSION file at a project root is commonplace — which is
+  # exactly why "named after its own VERSION" is too weak a test for deciding
+  # that a whole ROOT is ours.
+  _mkuser() {
+    mkdir -p "$1"
+    printf '%s\n' "${1##*/}" > "$1/VERSION"
+    printf 'my work\n' > "$1/notes.txt"
+  }
+
+  # (a) $HOME itself — guard 3, the one `uninstall --self` had all along.
+  _mkuser "$_home/v1.2.3"
+  _mkuser "$_home/v3.1"
+  assert_fails "install guard: --kit \$HOME is refused" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_home" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "your home directory" \
+    "install guard: (a) refused by the shared guards" || return 1
+  assert_file "$_home/v1.2.3/notes.txt" "install guard: (a) the user's directory survived" || return 1
+  assert_file "$_home/v3.1/notes.txt" "install guard: (a) and the other one" || return 1
+  assert_no_file "$_home/current" "install guard: (a) no 'current' was created in \$HOME" || return 1
+
+  # (b) an ordinary directory of the user's, which guard 3 does NOT cover and
+  # which `install` cannot refuse outright — it is the command that creates a
+  # kit root, so it has to be allowed to write into a directory that is not one
+  # yet. What must not happen is the PRUNE: those directories are theirs.
+  _docs=$_w/Documents
+  mkdir -p "$_docs"
+  _mkuser "$_docs/v1.2.3"
+  _mkuser "$_docs/v3.1"
+  assert_fails "install guard: (b) the run reaches the device step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_docs" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_file "$_docs/v1.2.3/notes.txt" \
+    "install guard: (b) a user directory named after its own VERSION is not pruned" || return 1
+  assert_file "$_docs/v3.1/notes.txt" \
+    "install guard: (b) nor the other one" || return 1
+  case $ASSERT_OUTPUT in
+    *"removing the superseded version"*)
+      printf 'FAIL: install guard: (b) install pruned inside a root that was never ours\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # (c) a Capistrano-shaped deploy root. `install` reaches the repoint with no
+  # guard 5 in front of it by design, so the refusal has to live at the
+  # repoint — where it protects every caller rather than the two that were
+  # remembered.
+  _proj=$_w/deploy
+  mkdir -p "$_proj/releases/20240101120000"
+  printf 'app\n' > "$_proj/releases/20240101120000/app.rb"
+  ln -s releases/20240101120000 "$_proj/current"
+  assert_fails "install guard: (c) a foreign 'current' is refused" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_proj" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "not one this installer wrote" \
+    "install guard: (c) it says whose symlink it is refusing to take over" || return 1
+  assert_eq "releases/20240101120000" "$(readlink "$_proj/current")" \
+    "install guard: (c) the user's symlink still points where it did" || return 1
+  assert_file "$_proj/releases/20240101120000/app.rb" \
+    "install guard: (c) and their release is intact" || return 1
+
+  # (d) the control, and the reason (b) cannot simply refuse: a real kit root
+  # still prunes exactly as §5.3 says. Two installs into a root of our own.
+  _kit=$_w/kit
+  make_fixture_release "$_w/release" v0.2.0 "$_w/cli"
+  for _v in v0.1.0 v0.2.0; do
+    assert_fails "install guard: (d) install $_v ends at the connect step" -- \
+      env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION="$_v" HOME="$_home" \
+        "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+        --no-symlink --host nowhere --yes < /dev/null || return 1
+  done
+  assert_file "$_kit/v0.1.0/VERSION" "install guard: (d) one previous is kept in a real kit" || return 1
+  make_fixture_release "$_w/release" v0.3.0 "$_w/cli"
+  assert_fails "install guard: (d) install v0.3.0 ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.3.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_no_file "$_kit/v0.1.0" \
+    "install guard: (d) and the older one is still pruned — the guard did not disable pruning" || return 1
+  assert_file "$_kit/v0.2.0/VERSION" "install guard: (d) with one previous kept" || return 1
+}
+
 # Re-review N2 (major): `cmd_upgrade`'s call to the shared guards was the
 # second half of F1's prescribed remedy — "the two commands that write in a kit
 # root are held to one standard" — and deleting that one line left the whole
@@ -3248,6 +3516,66 @@ test_kit_guard_rejects_a_deploy_root() {
   assert_file "$_proj/releases/20240101120000/app.rb" "deploy root: the release is intact" || return 1
   assert_file "$_proj/shared/config.yml" "deploy root: and everything beside it" || return 1
   assert_no_file "$_proj/v0.1.0" "deploy root: no version directory was written into it" || return 1
+
+  # The two shapes the re-review actually demonstrated, and which the
+  # resolving-Capistrano case above does NOT reach: it fails on the slash in
+  # `releases/...` before the interesting code runs, so with only that case the
+  # four-state distinction and the holds-only-ours requirement were both
+  # unpinned (measured — two mutations survived).
+  #
+  # (a) `current -> active`, DANGLING, in a directory of the user's. The name
+  # is a bare tag by every rule valid_tag applies, so the name alone admits it;
+  # what refuses it is that the root holds notes.txt, which is not ours.
+  _dang=$_w/projects-dangling
+  mkdir -p "$_dang/coolproject-1.2"
+  printf '1.2.0\n' > "$_dang/coolproject-1.2/VERSION"
+  printf 'mine\n' > "$_dang/notes.txt"
+  ln -s active "$_dang/current"
+  [ ! -e "$_dang/current" ] || die "test_kit_guard_rejects_a_deploy_root: (a) the fixture link is not dangling"
+  for _verb in remove write; do
+    if [ "$_verb" = remove ]; then
+      assert_fails "deploy root: (a) uninstall --self is refused" -- \
+        env HOME="$_home" "$KIT_SH" "$REPO/bin/redoku" uninstall --self \
+          --kit "$_dang" --host nowhere --yes < /dev/null || return 1
+    else
+      assert_fails "deploy root: (a) upgrade is refused" -- \
+        env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+          "$KIT_SH" "$REPO/bin/redoku" upgrade --kit "$_dang" --no-symlink \
+          < /dev/null || return 1
+    fi
+    assert_contains "$ASSERT_OUTPUT" "does not look like a reDoku kit" \
+      "deploy root: (a/$_verb) a dangling tag-shaped link in a user directory is refused" || return 1
+  done
+  [ -L "$_dang/current" ] || {
+    printf 'FAIL: deploy root: (a) the user symlink was removed\n' >&2
+    return 1
+  }
+  assert_file "$_dang/notes.txt" "deploy root: (a) their files are intact" || return 1
+  assert_no_file "$_dang/v0.1.0" "deploy root: (a) nothing was written into it" || return 1
+
+  # (b) `current -> v1` where v1 is a regular FILE. This is not dangling at
+  # all — `cd -P` fails on it, which is why treating every cd -P failure as
+  # "dangling" admitted it, and why the run then described a file plainly
+  # there as "which isn't there".
+  _file=$_w/userdir-file
+  mkdir -p "$_file"
+  printf 'data\n' > "$_file/v1"
+  printf 'mine\n' > "$_file/notes.txt"
+  ln -s v1 "$_file/current"
+  [ -e "$_file/current" ] || die "test_kit_guard_rejects_a_deploy_root: (b) the fixture link does not resolve"
+  assert_fails "deploy root: (b) a 'current' pointing at a file is refused" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" upgrade --kit "$_file" --no-symlink \
+      < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "does not look like a reDoku kit" \
+    "deploy root: (b) refused rather than treated as a dangling kit" || return 1
+  case $ASSERT_OUTPUT in
+    *"which isn't there"*)
+      printf 'FAIL: deploy root: (b) a file that is plainly there was called absent\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_eq "v1" "$(readlink "$_file/current")" "deploy root: (b) their symlink is untouched" || return 1
+  assert_file "$_file/v1" "deploy root: (b) and the file it points at" || return 1
 
   # The complement, so this is not just "guard 5 refuses everything": OUR
   # dangling `current` — the §6.2 repoint window and §7's repair case — still
@@ -3388,8 +3716,31 @@ test_kit_upgrade_repair_from_outside_keeps_one_previous() {
     _left=$(find "$_kit" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
     assert_eq 2 "$_left" \
       "outside repair: ($_damage) exactly one previous version survives beside the new one" || return 1
-    assert_file "$_kit/v0.1.0/VERSION" \
-      "outside repair: ($_damage) and it is the first surviving version, kept deliberately" || return 1
+    # WHICH previous survives is deliberately not asserted. `find` reports
+    # directories in readdir order, which POSIX does not specify: measured,
+    # macOS/APFS returns name order and Linux/overlayfs returns creation order,
+    # so the same kit keeps v0.1.0 on one platform and v0.2.0 on the other.
+    # Pinning the name made this test — the one that closes N1 — red on the CI
+    # platform while the product was correct on both.
+    #
+    # §5.2 promises *a* rollback target, not a particular one, and prune_kit's
+    # rule is "the running tree if it is in this root, else the first survivor"
+    # precisely so that no version sorting is needed. So the property to assert
+    # is the one that was promised: the new version is there, exactly one older
+    # one is there with it, and it is one of the two that existed.
+    assert_file "$_kit/v0.3.0/VERSION" \
+      "outside repair: ($_damage) the new version is installed" || return 1
+    if [ -f "$_kit/v0.1.0/VERSION" ]; then
+      _kept=v0.1.0
+    elif [ -f "$_kit/v0.2.0/VERSION" ]; then
+      _kept=v0.2.0
+    else
+      _kept=
+    fi
+    [ -n "$_kept" ] || {
+      printf 'FAIL: outside repair: (%s) neither original version survived — the kit has no rollback target\n' "$_damage" >&2
+      return 1
+    }
     assert_contains "$ASSERT_OUTPUT" "as the rollback target" \
       "outside repair: ($_damage) the run says it chose one" || return 1
     # And it did NOT keep it by the running-tree rule, which cannot apply here.
@@ -3831,6 +4182,8 @@ test_404_missing_asset
 test_empty_checksum_file
 test_tmpdir_cleanup_on_success
 test_tmpdir_cleanup_on_failure
+test_bootstrap_does_not_execute_from_the_temp_parent
+test_bin_redoku_without_home
 '
 
 MKKIT_TESTS='
@@ -3884,6 +4237,7 @@ test_kit_upgrade_repairs_current
 test_kit_upgrade_refuses_in_a_checkout
 test_kit_upgrade_refuses_a_hand_unpacked_kit
 test_kit_upgrade_repair_keeps_one_previous
+test_kit_install_guards_its_kit_root
 test_kit_upgrade_guards_its_kit_root
 test_kit_upgrade_repair_from_outside_keeps_one_previous
 test_kit_guard_rejects_a_deploy_root
