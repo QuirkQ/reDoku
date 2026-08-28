@@ -59,6 +59,12 @@ Useful knobs — `redoku --help` is the full list:
 | `$REDOKU_BASE_URL` | fetch from a fork, a mirror, or a `file://` directory |
 | `-n`, `--dry-run` | show what would happen without touching anything |
 
+**`--kit DIR` names a directory `redoku` owns.** Installing and upgrading both
+prune it to two versions, so other version directories inside it are *deleted*.
+Only ones this installer made — a release-tag name holding its own `bin/redoku`
+— are ever touched, and nothing is deleted at all in a directory it didn't
+create. Don't point it at a directory you keep other things in.
+
 Keeping it current: `redoku upgrade` fetches the newest release into the kit,
 repoints `current`, and keeps the version it pointed at before — so a rollback
 is one symlink swap. It's host-side only and never opens an SSH connection; run
