@@ -3629,6 +3629,24 @@ test_artifact_trust_fails_closed() {
   set -e
   assert_file "$_w/device-root/uninstall.sh" \
     "trust gate: (f) the same tree with sane permissions still reaches the device" || return 1
+
+  # (g) an ANCESTOR of the artifact is exposed, not the artifact's own
+  # directory. (e) puts the mode on device/, which is dirname(uninstall.sh), so
+  # checking one directory catches it and the WALK is never exercised — the
+  # mutation that reduces exposed_between to a single check survives (e) and
+  # fails here. The game binary is three levels down, so build/ being writable
+  # is reachable only by walking up.
+  chmod 1777 "$_sub/build"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  assert_fails "trust gate: (g) an exposed ancestor of the artifact is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_sub/bin/redoku" \
+      play --seconds 1 --host nowhere < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "a directory on the way to it is writable" \
+    "trust gate: (g) the walk found it, not the artifact's own directory" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "trust gate: (g) nothing reached the device" || return 1
+  chmod 755 "$_sub/build"
 }
 
 # Final verification V-1 (critical): §6.3's reuse gate adopted an
