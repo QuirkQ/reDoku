@@ -57,9 +57,55 @@ reachable.
 
 ## Play it
 
-You need Docker (every build runs in a container — it's `linux/amd64`, so
-expect emulation on an Apple Silicon Mac) and an rM2 on 3.27.3.0 plugged in
-over USB. There are no prebuilt downloads yet.
+An rM2 on 3.27.3.0 plugged in over USB, `curl`, and any one of `shasum`,
+`sha256sum` or `openssl` — with no way to check a download, the installer
+refuses to fetch one at all. Then one line:
+
+```bash
+curl -fsSL https://github.com/QuirkQ/reDoku/releases/latest/download/install.sh | sh
+```
+
+It fetches the host CLI, checks it against the checksum published beside it,
+and hands over to `redoku install --download --kit ~/.redoku`: the release kit
+lands in `~/.redoku`, `~/.redoku/current` points at it, and a two-line
+`redoku` wrapper goes in `~/.local/bin`. If that directory isn't on your
+`PATH`, it prints the `export` line for you to add — it never edits a shell rc
+file behind your back. Then it asks before touching the device.
+
+```bash
+redoku play              # play
+redoku status            # the device, and which kit this machine has
+redoku upgrade           # newer release into the kit ('install' puts it on the device)
+redoku uninstall         # device back to stock (--purge also deletes the saves)
+redoku uninstall --self  # ...and remove the kit and the PATH entry from here
+```
+
+**What the checksum proves.** It ships in the same release as the tarball, so
+it proves the bytes arrived intact — not that the release is authentic:
+whoever could publish a bad tarball could publish its checksum too. A detached
+[minisign](https://jedisct1.github.io/minisign/) signature would be real
+protection against that, and it costs a private key that must never be lost, a
+signing step in every release, and `minisign` on your machine — for a casually
+maintained holiday sudoku machine, this paragraph is the better trade. What
+the checks do buy: nothing unverified is ever unpacked or run, every binary is
+checked to really be 32-bit ARM before it leaves your machine, and any archive
+entry whose name is absolute, holds `..`, or doesn't start `redoku/` is
+refused outright — though that reads entry *names*, not symlink and hardlink
+*targets*, so it is the checksum, not the guard, standing behind the archive.
+
+**Rather read the script first?** The CLI is published as its own asset, so
+nothing has to run straight out of a pipe:
+
+```bash
+curl -fsSLO https://github.com/QuirkQ/reDoku/releases/latest/download/redoku
+curl -fsSLO https://github.com/QuirkQ/reDoku/releases/latest/download/redoku.sha256
+shasum -a 256 -c redoku.sha256   # or: sha256sum -c redoku.sha256
+less redoku
+sh redoku install --download --kit ~/.redoku
+```
+
+**Or build it yourself.** You need Docker (every build runs in a container —
+it's `linux/amd64`, so expect emulation on an Apple Silicon Mac).
 
 ```bash
 make build          # the game            → build/rm2/bin/
