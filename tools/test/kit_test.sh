@@ -2168,9 +2168,13 @@ test_kit_staging_beside_destination() {
   make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
 
   # A leftover only a SIGKILL could have produced — everything short of that
-  # is covered by fetch_kit's own traps. 99999 is above the default pid_max on
-  # both macOS (99998) and Linux (32768), so it is reliably a DEAD pid rather
-  # than one that happens to be free right now.
+  # is covered by fetch_kit's own traps. 99999 is above macOS's default
+  # pid_max (99998), but not reliably above Linux's: the kernel default is
+  # 32768, but systemd raises kernel.pid_max to 4194304 on most modern
+  # distributions, so a live process there could in principle hold this pid.
+  # Accepted anyway — that needs a real process sitting on exactly pid 99999
+  # at the moment this test runs, and a spurious failure from it is loud and
+  # obviously a flake rather than a silent false pass.
   mkdir -p "$_kit/.staging.99999/half-a-download"
   # …and something that is NOT a staging directory, which must survive.
   mkdir -p "$_kit/notes"

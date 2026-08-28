@@ -386,13 +386,13 @@ Three callers: kit-mode `install --download`, checkout-mode
 ### 6.2 Verify, then unpack
 
 ```
-download tarball + .sha256 into a temp dir
+download tarball + .sha256 into <kit>/.staging.<pid>   a sibling of <kit>/<tag>, NOT $TMPDIR
 digest  = shasum -a 256 | sha256sum | openssl dgst -sha256   (whichever exists)
 expect  = first field of the .sha256 asset
 digest = expect  or  die naming both digests and the URL
 tar -tzf | reject any entry not matching ^redoku/     (no absolute paths, no ..)
-tar -xzf into the temp dir
-mv temp/redoku  ->  <kit>/<tag>                       never a partial version dir
+tar -xzf into <kit>/.staging.<pid>
+mv <kit>/.staging.<pid>/redoku  ->  <kit>/<tag>       same filesystem, never a partial version dir
 rm -f <kit>/current && ln -s <tag> <kit>/current      read back and compared to <tag>
 ```
 
@@ -402,11 +402,52 @@ filename to match the one in the checksum file. Computing and string-comparing
 is portable and produces a better message. **[owner]**
 
 **`mv` into place, always — for the version directory.** Extraction is to a
-temp dir so an interrupt, a full disk or a truncated stream can never leave
-`<kit>/<tag>/` half-populated: nothing lands at the destination until the
-verified tree is renamed over from beside it, and that destination is never
-already occupied by anything but a stray earlier attempt, so the rename has
-nothing surprising to resolve. **[reasoned]**
+staging directory so an interrupt, a full disk or a truncated stream can never
+leave `<kit>/<tag>/` half-populated: nothing lands at the destination until
+the verified tree is renamed over from beside it, and that destination is
+never already occupied by anything but a stray earlier attempt, so the rename
+has nothing surprising to resolve. **[reasoned]**
+
+**Staging lives beside the destination, inside the kit root — not under
+`$TMPDIR`.** The obvious shape, and the first one built, was `mktemp -d` under
+`$TMPDIR`. It was wrong, and measured wrong: `mv` is atomic only within one
+filesystem, and on a stock Linux box `/tmp` is very often tmpfs while
+`~/.redoku` sits on the root filesystem, so staging under `$TMPDIR` turned the
+rename above into a recursive copy on the *default* path, not an exotic one.
+`mv`'s exit status does not say which of the two it did, so a failure surfaces
+only later and downstream — a full disk mid-copy, or a signal landing between
+the copy and the cleanup it should have triggered — instead of the immediate,
+all-or-nothing failure a same-filesystem rename would have given "for free",
+which is exactly what this section's "never a partial version dir" promise
+depends on. **[test]**
+
+The fix is staging beside the destination instead: `fetch_kit` downloads and
+unpacks into `<kit>/.staging.<pid>`, a plain directory inside the kit root,
+which makes the final `mv` a same-filesystem rename again. A `mktemp
+-d`-style random name would have been the obvious way to make that directory
+collision-proof, but a template is ruled out on portability grounds, so the
+name is instead the literal `.staging.` prefix plus the running process's own
+pid, and that choice drags in a second mechanism the pid makes possible:
+`clean_stale_staging` runs before every fetch and removes any `.staging.*`
+directory whose pid is not a live process — `kill -0 <pid>` tells a crashed or
+`kill -9`'d run's leftover from one that might still be writing — so a
+directory left behind by an interrupted run does not accumulate forever, and
+a live one is never swept out from under it. Two concurrent installs into the
+same kit root are still not supported — both would repoint `current`, and one
+would win — but this keeps "unsupported" from also meaning "run A's
+half-finished download gets deleted by run B". **[test]**
+
+`.staging.*` is consequently a reserved name in the kit root, alongside
+`current`: `valid_tag` refuses any tag that begins with it. A tag is not just
+a label — it becomes a directory name under `<kit>` — and it can arrive from
+remote-controlled input (the `Location` header of §6.1, or the tarball's own
+`VERSION`), so a release tagged `.staging.1234` would be a real version
+directory sitting under the exact name `clean_stale_staging` deletes; the next
+download of anything at all would then `rm -rf` a complete, currently-`current`
+version. Refusing the tag outright is the fix, not teaching the sweep to
+recognise a real version by looking inside it — the sweep has to run before a
+download, at a moment when a directory it is looking at may legitimately still
+be half-written. **[test]**
 
 **The `current` repoint is not that rename, and cannot be.** The intended form
 was `ln -s <tag> <kit>/.current.new && mv -f <kit>/.current.new <kit>/current`,
@@ -459,13 +500,13 @@ install behind.
 
 | failure | behaviour |
 |---|---|
-| checksum mismatch | dies naming both digests and the URL; temp dir removed, kit untouched |
+| checksum mismatch | dies naming both digests and the URL; staging directory removed, kit untouched |
 | no sha256 tool at all | **refuses** — never falls through to an unverified install |
 | no `curl` | dies naming both offline routes: `--artifacts DIR`, or `make rm2fb` in a checkout |
 | 404 | distinguishes *no releases published yet* from *no such version `REDOKU_VERSION`* |
 | offline / DNS failure | names the URL it tried, and the two offline routes |
 | tar entry outside `redoku/` | refused before extraction |
-| interrupted or disk-full unpack | temp dir + `mv`; `current` never points at a partial tree |
+| interrupted or disk-full unpack | staging directory (beside the destination, not `$TMPDIR`) + `mv`; `current` never points at a partial tree |
 | `~/.local/bin` not on `PATH` | prints the `export` line; never edits a shell rc |
 | a foreign `redoku` at the bin-dir | left alone; prints its path, suggests `--bin-dir` / `--no-symlink` |
 | that version already downloaded | reused, not re-fetched (§6.3) |
