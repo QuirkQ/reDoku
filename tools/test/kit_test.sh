@@ -3429,6 +3429,30 @@ test_kit_install_guards_its_kit_root() {
     "install guard: (c2) their dangling symlink was not taken over" || return 1
   assert_no_file "$_proj2/v0.1.0" "install guard: (c2) and nothing was written beside it" || return 1
 
+  # (c3) V-5: a `current` that is not a symlink at all. The early refusal asked
+  # only `[ -L … ]`, so a regular file or a directory of that name skipped it,
+  # got a version tree unpacked beside it, and was refused only at the repoint
+  # — the exact residue moving the check early was meant to stop leaving.
+  for _shape in file dir; do
+    _odd=$_w/odd-$_shape
+    mkdir -p "$_odd"
+    printf 'mine\n' > "$_odd/keepme.txt"
+    if [ "$_shape" = file ]; then
+      printf 'not a symlink\n' > "$_odd/current"
+    else
+      mkdir -p "$_odd/current/inside"
+    fi
+    assert_fails "install guard: (c3/$_shape) a non-symlink 'current' is refused" -- \
+      env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+        "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_odd" \
+        --no-symlink --host nowhere --yes < /dev/null || return 1
+    assert_contains "$ASSERT_OUTPUT" "is not a symlink" \
+      "install guard: (c3/$_shape) refused for what it is" || return 1
+    assert_no_file "$_odd/v0.1.0" \
+      "install guard: (c3/$_shape) and refused BEFORE anything was unpacked beside it" || return 1
+    assert_file "$_odd/keepme.txt" "install guard: (c3/$_shape) their file is intact" || return 1
+  done
+
   # (d) the control, and the reason (b) cannot simply refuse: a real kit root
   # still prunes exactly as §5.3 says. Two installs into a root of our own.
   _kit=$_w/kit
@@ -3448,6 +3472,213 @@ test_kit_install_guards_its_kit_root() {
   assert_no_file "$_kit/v0.1.0" \
     "install guard: (d) and the older one is still pruned — the guard did not disable pruning" || return 1
   assert_file "$_kit/v0.2.0/VERSION" "install guard: (d) with one previous kept" || return 1
+}
+
+# The gate itself, tested as a gate rather than through the defects it closes.
+#
+# A gate that cannot fail closed is worse than none, because it invites trust.
+# Two properties, and neither is visible from the exploit tests: it must refuse
+# when nothing established trust (the default), and it must sit at the choke
+# point so a caller cannot get past it — which is why it lives inside
+# push_file, the one function all twelve device-bound files go through, rather
+# than in each of the three commands.
+test_artifact_trust_fails_closed() {
+  _w=$(mktemp -d "$ROOT/trustgate.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home" "$_w/device-root"
+  write_fake_ssh "$_w/fakebin/ssh" "$_w/device-root"
+
+  # A complete, entirely legitimate kit — nothing hostile anywhere. The only
+  # thing wrong is where the CLI is run from: <kit>/v0.1.0/bin/redoku is our
+  # own tree, and a copy of that same CLI one directory to the side is not.
+  build_fake_kit_inputs "$_w/build"
+  "$KIT_SH" "$REPO/tools/mkkit.sh" --version v0.1.0 --out "$_w/out" \
+    --build-dir "$_w/build" >/dev/null || \
+    die "test_artifact_trust_fails_closed: mkkit.sh failed"
+  _kit=$_w/kit
+  mkdir -p "$_kit"
+  tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_kit" || \
+    die "test_artifact_trust_fails_closed: tar -x failed"
+  mv "$_kit/redoku" "$_kit/v0.1.0"
+  ln -s v0.1.0 "$_kit/current"
+
+  # (a) the control: run from inside the kit, everything works. Without this
+  # the test below could pass because the fixture is broken.
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_w/fakebin:$PATH" HOME="$_home" \
+    "$KIT_SH" "$_kit/current/bin/redoku" uninstall --host nowhere --yes \
+    < /dev/null 2>&1)
+  set -e
+  assert_file "$_w/device-root/uninstall.sh" \
+    "trust gate: (a) the same CLI inside its own kit does reach the device" || return 1
+
+  # (b) the identical CLI, byte for byte, one directory to the side. Its tree
+  # is complete and its contents are ours — but nothing in the run establishes
+  # that, so the gate refuses. This is the property no contents check can have.
+  _aside=$_w/aside
+  mkdir -p "$_aside/bin" "$_aside/device" "$_aside/build/rm2/bin"
+  cp "$_kit/v0.1.0/bin/redoku" "$_aside/redoku"
+  chmod +x "$_aside/redoku"
+  cp -R "$_kit/v0.1.0/device/." "$_aside/device/" || \
+    die "test_artifact_trust_fails_closed: seeding the aside tree failed"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  assert_fails "trust gate: (b) the same CLI beside its tree is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_aside/redoku" \
+      uninstall --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "nothing in this run established where it came from" \
+    "trust gate: (b) refused by the gate, and it says why" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "trust gate: (b) nothing reached the device" || return 1
+
+  # (c) a world-writable own tree. The CLI IS at <tree>/bin/redoku, so the
+  # shape is right and only the permissions are wrong — which is the one
+  # question about a directory an attacker who can write it cannot answer for
+  # us, and the reason /tmp is refused while ~/.redoku is not.
+  _open=$_w/open
+  mkdir -p "$_open/bin"
+  cp -R "$_kit/v0.1.0/." "$_open/" || \
+    die "test_artifact_trust_fails_closed: seeding the open tree failed"
+  chmod 1777 "$_open"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  assert_fails "trust gate: (c) a world-writable own tree is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_open/bin/redoku" \
+      uninstall --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "nothing in this run established where it came from" \
+    "trust gate: (c) the shape was right and the permissions were not" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "trust gate: (c) nothing reached the device" || return 1
+  chmod 755 "$_open"
+
+  # (d) a tree that HAS a bin/ — but the CLI is not the thing in it. Without
+  # this the "is this my tree" comparison is not pinned: cases (b) and (c) both
+  # fail at resolving $REPO/bin at all, so a mutation that deletes only the
+  # comparison still refuses them and survives. Here $REPO/bin resolves fine
+  # and only the identity of the running file separates trusted from not.
+  _side=$_w/side
+  mkdir -p "$_side/notbin"
+  cp -R "$_kit/v0.1.0/." "$_side/" || \
+    die "test_artifact_trust_fails_closed: seeding the side tree failed"
+  cp "$_kit/v0.1.0/bin/redoku" "$_side/notbin/redoku"
+  chmod +x "$_side/notbin/redoku"
+  assert_file "$_side/bin/redoku" "trust gate: (d) the tree really does have a bin/" || return 1
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  assert_fails "trust gate: (d) a CLI outside its tree's bin/ is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_side/notbin/redoku" \
+      uninstall --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "nothing in this run established where it came from" \
+    "trust gate: (d) running from <tree>/notbin is not running from <tree>/bin" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "trust gate: (d) nothing reached the device" || return 1
+}
+
+# Final verification V-1 (critical): §6.3's reuse gate adopted an
+# attacker-planted tree as $KIT_ROOT — with no download and no checksum
+# performed at any point — and ran its device/install.sh as ROOT on the tablet.
+#
+# The shape needs no environment pins and no --kit, which is what made it worse
+# than everything before it: `install --download` alone. A stamped CLI resolves
+# its OWN stamp as the tag (§6.1 step 2), the checkout layout puts the
+# destination at $REPO/build/download/<tag>/redoku, and for a CLI dropped in
+# /tmp/dl that is /tmp — so the tree the next run reads back and pushes is
+# whatever was planted there.
+#
+# This is also the test the round-4 suite could not have caught: its standalone
+# test drives `install` WITHOUT --download, which never reaches the reuse gate.
+test_install_download_refuses_a_planted_tree() {
+  _w=$(mktemp -d "$ROOT/planted-tree.XXXXXX")
+  _home=$_w/home
+  _plant=$_w/plantable
+  mkdir -p "$_home" "$_plant/dl" "$_w/device-root"
+
+  # A real release to point REDOKU_BASE_URL at, and the stamped standalone CLI
+  # from the same build — so the tag it resolves is its own stamp, exactly as
+  # a released CLI does.
+  build_fake_kit_inputs "$_w/build"
+  "$KIT_SH" "$REPO/tools/mkkit.sh" --version v0.9.9 --out "$_w/out" \
+    --build-dir "$_w/build" >/dev/null || \
+    die "test_install_download_refuses_a_planted_tree: mkkit.sh failed"
+  mkdir -p "$_w/release/download/v0.9.9" "$_w/release/latest"
+  cp "$_w/out/redoku-rm2.tar.gz" "$_w/out/redoku-rm2.tar.gz.sha256" \
+     "$_w/out/redoku" "$_w/out/redoku.sha256" "$_w/release/download/v0.9.9/" || \
+    die "test_install_download_refuses_a_planted_tree: cp release assets failed"
+  ln -s ../download/v0.9.9 "$_w/release/latest/download"
+  cp "$_w/out/redoku" "$_plant/dl/redoku"
+  chmod +x "$_plant/dl/redoku"
+  grep -qxF 'KIT_VERSION=v0.9.9' "$_plant/dl/redoku" || \
+    die "test_install_download_refuses_a_planted_tree: the CLI asset is not stamped"
+
+  # The plant: a COMPLETE tree at exactly the path the checkout layout reads
+  # back from, with a hostile device/install.sh — the file the device runs as
+  # root.
+  mkdir -p "$_plant/build/download/v0.9.9"
+  tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_plant/build/download/v0.9.9" || \
+    die "test_install_download_refuses_a_planted_tree: tar -x failed"
+  printf '#!/bin/sh\nprintf ran > %s/PWN_INSTALL\n' "$_w" \
+    > "$_plant/build/download/v0.9.9/redoku/device/install.sh"
+  kit_tree_is_complete_probe="$_plant/build/download/v0.9.9/redoku"
+  assert_file "$kit_tree_is_complete_probe/VERSION" \
+    "planted tree: the plant is in place and complete" || return 1
+
+  # A fake ssh that really runs what it is handed, so a failure of the gate
+  # would leave measurable evidence rather than needing to be inferred.
+  write_fake_ssh "$_w/fakebin/ssh" "$_w/device-root"
+
+  assert_fails "planted tree: install --download with no --kit is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" REDOKU_BASE_URL="file://$_w/release" \
+      "$KIT_SH" "$_plant/dl/redoku" install --download --host nowhere --yes \
+      < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "there is nowhere for this download to go" \
+    "planted tree: refused because \$REPO is not a tree of ours" || return 1
+  # The two things that actually matter, measured rather than inferred.
+  assert_no_file "$_w/PWN_INSTALL" \
+    "planted tree: the planted device/install.sh did NOT run as root on the device" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "planted tree: nothing reached the device at all" || return 1
+  # It never adopted the plant: the give-away line is §6.3's own.
+  case $ASSERT_OUTPUT in
+    *"already unpacked"*)
+      printf 'FAIL: planted tree: the reuse gate adopted a tree nobody downloaded\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # The kit-layout half of the same finding: --kit at a world-writable
+  # directory holding a planted <tag>/ tree. Here the run is allowed to
+  # proceed — the user named the root — but reuse must be refused, so what
+  # reaches the device is the DOWNLOADED tree and not the plant.
+  _shared=$_w/shared
+  mkdir -p "$_shared/v0.9.9"
+  chmod 1777 "$_shared"
+  tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_w/unpack" 2>/dev/null || {
+    mkdir -p "$_w/unpack"
+    tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_w/unpack" || \
+      die "test_install_download_refuses_a_planted_tree: tar -x (kit half) failed"
+  }
+  cp -R "$_w/unpack/redoku/." "$_shared/v0.9.9/" || \
+    die "test_install_download_refuses_a_planted_tree: seeding the plant failed"
+  printf '#!/bin/sh\nprintf ran > %s/PWN_KIT\n' "$_w" \
+    > "$_shared/v0.9.9/device/install.sh"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_w/fakebin:$PATH" HOME="$_home" \
+    REDOKU_BASE_URL="file://$_w/release" "$KIT_SH" "$_plant/dl/redoku" \
+    install --download --kit "$_shared" --no-symlink --host nowhere --yes \
+    < /dev/null 2>&1)
+  set -e
+  assert_no_file "$_w/PWN_KIT" \
+    "planted tree: the planted kit-layout install.sh did not run either" || return 1
+  # …because the download happened instead of the reuse, and replaced it.
+  assert_contains "$ASSERT_OUTPUT" "downloading" \
+    "planted tree: a world-writable base is re-downloaded, never reused" || return 1
+  case $ASSERT_OUTPUT in
+    *"already unpacked"*)
+      printf 'FAIL: planted tree: reuse happened in a world-writable base\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
 }
 
 # Final re-review NEW-1, swept as a class rather than as the one instance
@@ -4204,6 +4435,49 @@ test_kit_uninstall_self_leaves_what_is_not_ours() {
     "self foreign: the run says the root was left and why" || return 1
 }
 
+# V-4: the --self plan enumerated on is_version_dir alone while remove_kit
+# deletes on both predicates, so the plan promised to delete a §7-damaged
+# version directory that the run then kept — and the closing message called it
+# "things this installer did not put there" about a tree this installer plainly
+# made. Over-listing is the safe direction, but the plan is a contract only
+# while it is derived from the same test as the deletion.
+test_kit_uninstall_self_plan_matches_the_deletion() {
+  _w=$(mktemp -d "$ROOT/kit-planmatch.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  _install_a_kit_for_self "$_w" "$_home" "$_kit" - "plan match" || return 1
+  # A second version, then damage it the way §7 describes: VERSION intact,
+  # bin/redoku gone. remove_kit keeps it; the plan used to promise it.
+  make_fixture_release "$_w/release" v0.2.0 "$_w/cli"
+  assert_fails "plan match: the second install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.2.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  rm -rf "$_kit/v0.1.0/bin"
+  assert_file "$_kit/v0.1.0/VERSION" "plan match: the damaged tree still has its VERSION" || return 1
+  write_fake_ssh "$_w/fakebin/ssh" "$_w/device"
+
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_w/fakebin:$PATH" HOME="$_home" \
+    "$KIT_SH" "$REPO/bin/redoku" uninstall --self --kit "$_kit" \
+    --dry-run --host nowhere --yes < /dev/null 2>&1)
+  _pm_rc=$?
+  set -e
+  assert_eq 0 "$_pm_rc" "plan match: the dry-run plan exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  # The plan prints the RESOLVED kit root, so the expectation has to be
+  # resolved too — on macOS $TMPDIR sits under a /var -> /private/var symlink.
+  _pm_kit=$(CDPATH='' cd -- "$_kit" && pwd -P) || die "plan match: could not resolve $_kit"
+  # The plan may name what will go; it may not name what will stay.
+  assert_contains "$ASSERT_OUTPUT" "            $_pm_kit/v0.2.0" \
+    "plan match: the intact version is listed" || return 1
+  case $ASSERT_OUTPUT in
+    *"            $_pm_kit/v0.1.0"*)
+      printf 'FAIL: plan match: the plan promised to delete a directory remove_kit keeps\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
 # The guards, each refusing on its own and leaving everything where it is.
 # None of these reaches the device: a root that could never be removed is
 # refused before an ssh connection is opened, so the run cannot end with a
@@ -4446,6 +4720,8 @@ test_kit_upgrade_repairs_current
 test_kit_upgrade_refuses_in_a_checkout
 test_kit_upgrade_refuses_a_hand_unpacked_kit
 test_kit_upgrade_repair_keeps_one_previous
+test_artifact_trust_fails_closed
+test_install_download_refuses_a_planted_tree
 test_standalone_cli_refuses_local_artifacts
 test_kit_install_guards_its_kit_root
 test_kit_upgrade_guards_its_kit_root
@@ -4459,6 +4735,7 @@ test_kit_uninstall_self_device_first
 test_kit_uninstall_self_dry_run
 test_kit_uninstall_self_removes_kit_and_wrapper
 test_kit_uninstall_self_leaves_what_is_not_ours
+test_kit_uninstall_self_plan_matches_the_deletion
 test_kit_uninstall_self_guards_refuse
 test_kit_uninstall_names_the_right_fix_for_a_kit
 test_kit_status_line
