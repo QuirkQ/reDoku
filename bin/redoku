@@ -162,18 +162,23 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-bin/redoku — put the rm2fb display server and the reDoku game on a reMarkable 2
+redoku — put the rm2fb display server and the reDoku game on a reMarkable 2
+
+The same script, reached two ways: 'redoku' from a released kit (it lives in
+~/.redoku/current/bin/ and is normally reached through ~/.local/bin/redoku),
+or 'bin/redoku' from a checkout. Everything below is spelled 'redoku'; add
+the 'bin/' when you are in a checkout.
 
 usage:
-  bin/redoku install      copy the built binaries to the device and install
+  redoku install          copy the binaries to the device and install them
                           (safe to re-run: idempotent from any state)
-  bin/redoku upgrade      fetch the latest release into the kit, point
-                          'current' at it and keep one version back so a
-                          rollback is one symlink swap (kit installs only)
-  bin/redoku play         run the game on the device
-  bin/redoku uninstall    return the device to stock (safe, idempotent)
-  bin/redoku status       show what's running on the device
-  bin/redoku shell        open an SSH shell on the device
+  redoku upgrade          fetch a newer release into the kit — see 'keeping
+                          it up to date' below
+  redoku play             run the game on the device
+  redoku uninstall        return the device to stock (safe, idempotent)
+  redoku status           show what's running on the device, and which kit
+                          this machine has
+  redoku shell            open an SSH shell on the device
 
 how it connects (the default just works):
   Plug the reMarkable in over USB and run a command. You'll be asked for
@@ -184,16 +189,27 @@ how it connects (the default just works):
 
 playing the game:
   'install' stages the whole tree — the display server, a decoy "Sudoku"
-  document it drops into the stock library, and the watcher that launches
-  the game when you tap it — plus the game binary itself when it has been
-  cross-built (it warns and installs everything else alone when it
-  hasn't), and can be re-run at any time. 'play' then only refreshes that one
-  binary (/home/root/redoku/bin/redoku, from the cross build in
-  build/rm2/bin/ — run 'make build' first) and starts it, so working on the
-  game never means restarting the display server or re-tapping the decoy.
-  'uninstall' always takes the decoy and its watcher back out (the decoy
-  can't outlive them — a document that launches nothing is worse than none);
-  'uninstall --purge' also removes everything else.
+  document it drops into the stock library, the watcher that launches the
+  game when you tap it, and the game binary — and can be re-run at any time.
+  A kit ships all four prebuilt; in a checkout the game is whatever
+  'make build' last produced, and install warns and puts everything else on
+  alone when there isn't one. 'play' then only refreshes that one binary
+  (/home/root/redoku/bin/redoku) and starts it, so working on the game never
+  means restarting the display server or re-tapping the decoy. 'uninstall'
+  always takes the decoy and its watcher back out (the decoy can't outlive
+  them — a document that launches nothing is worse than none);
+  'uninstall --purge' also removes everything else from the device, and
+  'uninstall --self' removes the kit from this machine.
+
+keeping it up to date (kit installs):
+  'upgrade' fetches the latest release into the kit, points <kit>/current at
+  it and keeps the version 'current' pointed at before, so a rollback is one
+  symlink swap. It is host-side only and never opens an ssh connection — run
+  'install' afterwards to put the new version on the device. A 'current' that
+  is missing, dangling, or pointing at an incomplete tree is repaired rather
+  than refused. Both 'upgrade' and 'uninstall --self' refuse in a checkout,
+  where there is no kit to act on — unless --kit or $REDOKU_HOME names one
+  outright, which is a different request and is honoured.
 
 options:
   -H, --host HOST         device address or ssh alias   (default: 10.11.99.1)
@@ -209,14 +225,19 @@ options:
                           in build/download/<tag>/ and nothing outside this
                           directory is touched.
       --kit DIR           install, upgrade, uninstall --self: the kit root.
-                          install unpacks into DIR, points DIR/current at it
-                          and puts a 'redoku' on your PATH; upgrade and
+                          'install --download' unpacks into DIR and points
+                          DIR/current at it; any kit-mode install also writes
+                          the 'redoku' PATH entry for DIR. upgrade and
                           uninstall --self operate on the kit already there.
                           The curl|sh installer passes ~/.redoku; set it
                           yourself with --kit or $REDOKU_HOME. Running from
                           inside a kit, it needs no flag at all.
       --bin-dir DIR       install, upgrade, uninstall --self: where that PATH
-                          entry goes (default: ~/.local/bin, $REDOKU_BIN_DIR)
+                          entry goes (default: ~/.local/bin, $REDOKU_BIN_DIR).
+                          If it isn't on your PATH the 'export' line is
+                          printed for you to add — no shell rc file is ever
+                          edited — and a 'redoku' already there that this
+                          installer didn't write is left exactly as it is.
       --no-symlink        install, upgrade: write no PATH entry at all
       --force             install: proceed on an untested firmware version
       --purge             uninstall: also delete /home/root/redoku on the
@@ -224,7 +245,8 @@ options:
       --self              uninstall: once the device is back to stock, also
                           remove the kit and our PATH entry from THIS machine
                           (nothing extra on the device). Refused in a
-                          checkout — there is no kit there to remove.
+                          checkout, where there is no kit to remove — unless
+                          --kit or $REDOKU_HOME names one.
       --seconds N         play: stop the game after N seconds instead of
                           running it interactively (unattended smoke test)
   -y, --yes               don't ask for confirmation
@@ -234,8 +256,8 @@ options:
 environment:
   REDOKU_HOME             kit root, same as --kit DIR. install has no default
                           for it (a kit install is asked for, never guessed);
-                          upgrade and uninstall --self fall back to the kit
-                          they are running from, then to ~/.redoku.
+                          upgrade, uninstall --self and status fall back to
+                          the kit they are running from, then to ~/.redoku.
   REDOKU_BIN_DIR          PATH entry dir, same as --bin-dir DIR
   REDOKU_VERSION          pin a release tag instead of taking the latest —
                           for upgrade too, which will then install exactly
@@ -247,9 +269,13 @@ environment:
 safety:
   The install only ADDs files (no kernel, boot, or partition changes),
   binaries are checked to really be 32-bit ARM before they leave your
-  machine, and the on-device installer rolls back to stock on any
-  failure. If the device ever seems stuck, hold the power button ~10 s:
-  it reboots and a broken display server disarms itself.
+  machine, and the on-device installer rolls back to stock on any failure.
+  Anything downloaded is checked against the sha256 published beside it
+  before it is unpacked, and nothing unverified is ever run or installed —
+  which proves the bytes arrived intact, not that the release is authentic
+  (the README says why there is no signature). If the device ever seems
+  stuck, hold the power button ~10 s: it reboots and a broken display
+  server disarms itself.
 EOF
 }
 
