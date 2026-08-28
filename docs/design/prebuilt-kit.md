@@ -196,7 +196,7 @@ KIT_DIR=${REDOKU_HOME:-$HOME/.redoku}
 sh "$T/redoku" install --download --kit "$KIT_DIR" "$@"
 ```
 
-Four things in there are load-bearing:
+Five things in there are load-bearing:
 
 **`exec < /dev/tty`.** When the script is piped, stdin *is* the script, so
 `confirm()` — which reads stdin and guards with `[ -t 0 ]` **[src]** — would
@@ -303,17 +303,26 @@ were independent, and are not: a kit-mode `install` **rewrites the wrapper
 every run**, and a `redoku` that "is not our wrapper" is left alone. A
 hand-edited wrapper and a foreign one are the same observable thing — a file
 whose content the test does or does not recognise — so the same rule decides
-both. An edit that leaves the `exec` line itself intact (a comment added above
-it, a `~/.local/bin` recreated after being deleted) still passes the test, so
-it self-heals: silently overwritten back to the canonical two lines on the
-next `install`. An edit that touches the `exec` line — a different path, an
-extra flag, a wrapper of the user's own that happens to live at the same path
-— fails it, and from that point the file is indistinguishable from a package
-manager's `redoku`: left alone, never rewritten, and never removed by
-`uninstall --self` either, since its deletion rides the identical test. **The
-ownership rule wins over the self-heal promise, not the reverse** — a file
-this installer cannot prove it wrote is one it must never overwrite or delete,
-because those are the same guarantee. **[test]**
+both, though "self-heals" covers two structurally different reasons, not one.
+When the file is simply absent — `~/.local/bin` recreated after being
+deleted, or never created at all — `is_our_wrapper`'s own `[ -f "$1" ] ||
+return 1` means the test is never consulted, and `write_path_entry`'s
+"leave it alone" branch only fires when the file already exists, so nothing
+stands between it and a freshly-written wrapper; there is no ownership
+question to answer because there is nothing there to own. When the file
+exists and an edit leaves the `exec` line itself intact (a comment added
+above it, say), the test *is* consulted and passes, so it is the kit-mode
+`install`'s unconditional rewrite-on-match that silently restores the
+canonical two lines on the next run. Either way the wrapper ends up right,
+for two different mechanisms. Only when an edit touches the `exec` line
+itself — a different path, an extra flag, a wrapper of the user's own that
+happens to live at the same path — does the test run and fail, and from that
+point the file is indistinguishable from a package manager's `redoku`: left
+alone, never rewritten, and never removed by `uninstall --self` either, since
+its deletion rides the identical test. **The ownership rule wins over the
+self-heal promise, not the reverse** — a file this installer cannot prove it
+wrote is one it must never overwrite or delete, because those are the same
+guarantee. **[test]**
 
 Pruning to one previous version happens whenever `current` is repointed — by
 `upgrade` and by an `install --download` of a different version alike, not
@@ -397,7 +406,7 @@ temp dir so an interrupt, a full disk or a truncated stream can never leave
 `<kit>/<tag>/` half-populated: nothing lands at the destination until the
 verified tree is renamed over from beside it, and that destination is never
 already occupied by anything but a stray earlier attempt, so the rename has
-nothing surprising to resolve.
+nothing surprising to resolve. **[reasoned]**
 
 **The `current` repoint is not that rename, and cannot be.** The intended form
 was `ln -s <tag> <kit>/.current.new && mv -f <kit>/.current.new <kit>/current`,
@@ -415,7 +424,7 @@ The shipped repoint is two plain commands instead: `rm -f <kit>/current && ln
 into — there is nothing at `current` for either command to be clever about.
 The read-back that follows it (`readlink current` compared against `$TAG`,
 `die` on any mismatch) is what this bug bought going forward: a check that
-catches the next such surprise instead of trusting a zero exit status.
+catches the next such surprise instead of trusting a zero exit status. **[src]**
 
 That form gives up the rename's atomicity, and the trade should be said
 plainly rather than left implicit: for the instant between the `rm` and the
