@@ -145,14 +145,28 @@ KIT_ROOT=$REPO
 # default is the refusing one, so a path that forgets to establish trust fails
 # closed rather than open.
 #
-# One residual, stated rather than implied (design doc §6.4 carries it too):
-# `own` still rests on the CLI's own directory not being writable by somebody
-# else. tree_is_other_writable below rejects the case that actually occurs —
-# a world-writable directory such as /tmp — but a directory writable by a
-# GROUP the attacker is in is not detected, and cannot be without an ownership
-# model this script has no business implementing. Do not run a downloaded CLI
-# out of a directory other people can write.
+# Two residuals, stated rather than implied (design doc §6.5 carries them
+# too), because a boundary claimed wider than the code holds is what invites
+# the trust this preamble warns against:
+#
+#   * exposed_between checks WORLD-writability, from each artifact up to the
+#     trust anchor. A directory writable by a GROUP the attacker is in is not
+#     detected, and cannot be without an ownership model this script has no
+#     business implementing. Do not run a downloaded CLI, or point --kit, at a
+#     directory other people can write.
+#   * TOCTOU: between the checksum and the push, anyone with write access to
+#     the tree can swap it. Closing that needs an open descriptor held across
+#     the device stage, which POSIX sh cannot express.
 ARTIFACT_TRUST=
+
+# The tree that trust was established FOR — $REPO for `own`, $FETCH_BASE for
+# `verified`. Set wherever $ARTIFACT_TRUST is, and never anywhere else.
+#
+# It exists because $KIT_ROOT is not it: KIT_ROOT is reassigned to the unpacked
+# version directory after a fetch, so using it as the boundary for the
+# writability walk made that walk start and stop inside the version tree and
+# skip every ancestor the walk exists to examine.
+ARTIFACT_TRUST_ROOT=
 
 # Where releases live, derived exactly the way tools/install.sh derives it.
 # The bootstrap and the CLI it hands over to must agree on this, or
@@ -624,8 +638,8 @@ tree_is_other_writable() {
   [ -n "$(find "$1" -maxdepth 0 -perm -0002 2>/dev/null)" ]
 }
 
-# exposed_between <file> <root> — is ANY directory on the way from <file> up to
-# <root> writable by others?
+# exposed_between <file> <anchor> [anchor2] — is <file>, or ANY directory on
+# the way from it up to a trust anchor, writable by others?
 #
 # tree_is_other_writable asks about one directory, and artifacts do not come
 # from one directory: they come from <root>/device/, <root>/build/rm2/bin/ and
@@ -635,25 +649,44 @@ tree_is_other_writable() {
 # write $REPO/bin/redoku and so the "they could have replaced the CLI" argument
 # does not reach them.
 #
-# The walk stops AT <root> rather than continuing to /, and that is deliberate:
-# above the root, trustworthiness is what `own` or `verified` established, and
-# walking further would condemn every legitimate use of a world-writable /tmp —
-# the bootstrap's own 0700 temp directory lives there, and so does every
-# fixture this suite builds. A file outside <root> gets its own directory
-# checked and nothing more.
+# The walk stops at the TRUST ANCHOR — the tree 'own' or 'verified' was
+# established for, $REPO or $FETCH_BASE — and stopping there is what makes it
+# both sound and usable: above the anchor, trustworthiness is what the anchor
+# itself established, and walking on to / would condemn every legitimate use of
+# a world-writable /tmp, the bootstrap's own 0700 directory included.
+#
+# It must NOT be handed $KIT_ROOT, which is what it was handed at first and is
+# the bug that made this whole check ornamental on every download path:
+# $KIT_ROOT is reassigned to $FETCH_TREE after a fetch, so the walk started and
+# ended inside the version directory and never looked at build/download/ or any
+# other ancestor. Measured: a legitimate checkout with only build/download
+# world-writable had its planted device/install.sh run as root, and with
+# REDOKU_VERSION pinned it did so with no network traffic at all.
+#
+# A second anchor exists for --artifacts DIR, which is a tree the USER named
+# and which legitimately sits outside the kit.
 exposed_between() {
-  _eb_root=$(CDPATH='' cd -P -- "$2" 2>/dev/null && pwd -P) || _eb_root=
-  _eb_dir=$(CDPATH='' cd -P -- "$(dirname -- "$1")" 2>/dev/null && pwd -P) || return 1
+  _eb_file=$1
+  _eb_a=$(CDPATH='' cd -P -- "${2:-/nonexistent}" 2>/dev/null && pwd -P) || _eb_a=
+  _eb_b=$(CDPATH='' cd -P -- "${3:-/nonexistent}" 2>/dev/null && pwd -P) || _eb_b=
+  # The FILE's own mode, not only the directories holding it. A 0666 artifact
+  # in a 0755 directory is writable by anyone, and the walk below would have
+  # said nothing about it.
+  ! tree_is_other_writable "$_eb_file" || return 0
+  # Unresolvable means we cannot reason about it, which is not the same as
+  # safe: fail closed.
+  _eb_dir=$(CDPATH='' cd -P -- "$(dirname -- "$_eb_file")" 2>/dev/null && pwd -P) || return 0
   while :; do
     ! tree_is_other_writable "$_eb_dir" || return 0
-    [ -n "$_eb_root" ] || return 1
-    [ "$_eb_dir" != "$_eb_root" ] || return 1
-    case $_eb_dir in
-      "$_eb_root"/?*) ;;
-      *) return 1 ;;
-    esac
-    _eb_dir=${_eb_dir%/*}
-    [ -n "$_eb_dir" ] || return 1
+    { [ -n "$_eb_a" ] && [ "$_eb_dir" = "$_eb_a" ]; } && return 1
+    { [ -n "$_eb_b" ] && [ "$_eb_dir" = "$_eb_b" ]; } && return 1
+    _eb_parent=${_eb_dir%/*}
+    # Walked to / without meeting an anchor: the artifact resolves outside
+    # every tree this run vouched for — a symlinked branch pointing away from
+    # the kit is the case that matters — so it is refused rather than given
+    # the benefit of the doubt.
+    { [ -n "$_eb_parent" ] && [ "$_eb_parent" != "$_eb_dir" ]; } || return 0
+    _eb_dir=$_eb_parent
   done
 }
 
@@ -678,8 +711,11 @@ establish_own_tree_trust() {
   _eot_bin=$(CDPATH='' cd -P -- "$REPO/bin" 2>/dev/null && pwd -P) || return 0
   [ "$_eot_self" = "$_eot_bin" ] || return 0
   _eot_repo=$(CDPATH='' cd -P -- "$REPO" 2>/dev/null && pwd -P) || return 0
-  ! tree_is_other_writable "$_eot_repo" || return 0
+  # The walk, not a single mode bit: $REPO/bin holding the CLI matters as much
+  # as $REPO itself, and -maxdepth 0 on $REPO alone said nothing about it.
+  ! exposed_between "$0" "$_eot_repo" || return 0
   ARTIFACT_TRUST=own
+  ARTIFACT_TRUST_ROOT=$_eot_repo
 }
 
 # require_trusted_artifacts <what> — the gate. Nothing leaves this machine and
@@ -726,10 +762,13 @@ push_file() { # push_file <local> <remote-path>
   # …and the path it actually came from, not just the root. Trust was earned
   # for a TREE; this asks whether the branch of that tree holding this file is
   # one other people can write.
-  ! exposed_between "$1" "$KIT_ROOT" || \
-    die "refusing to send $1 to the device: a directory on the way to it is writable
-  by other users, so what is in it is not necessarily what this installer put
-  there. Check the permissions between $KIT_ROOT and that file."
+  # The TRUST ANCHOR, not $KIT_ROOT — see exposed_between's header for why
+  # that distinction is the whole point. $ARTIFACTS is passed as a second
+  # anchor because --artifacts DIR names a tree outside the kit on purpose.
+  ! exposed_between "$1" "$ARTIFACT_TRUST_ROOT" "$ARTIFACTS" || \
+    die "refusing to send $1 to the device: it, or a directory on the way to it, is
+  writable by other users — so what is there is not necessarily what this
+  installer put there. Check the permissions under $ARTIFACT_TRUST_ROOT."
   # Belt and braces: every remote path is a hardcoded literal under
   # $REMOTE_DIR — refuse anything else so the rm -f below can never
   # reach outside the redoku directory.
@@ -949,6 +988,12 @@ build_decoy() {
     # survives. Kept for the same reason too: this is the choke point, and the
     # command that forgets is the one that has not been written yet.
     require_trusted_artifacts "$REPO/tools/mkdecoy.rb"
+    # $REPO, not the trust anchor: the generator belongs to the CHECKOUT this
+    # CLI is part of, and after a download the anchor is the kit root — a
+    # different tree entirely, which the generator legitimately sits outside.
+    # The argument for reading it is the own-tree one (the CLI is $REPO/bin/
+    # redoku, so whoever could tamper with tools/ could have tampered with the
+    # CLI), and that argument is about $REPO.
     ! exposed_between "$REPO/tools/mkdecoy.rb" "$REPO" || \
       die "refusing to run $REPO/tools/mkdecoy.rb: a directory on the way to it is
   writable by other users, so it is not necessarily the generator this checkout
@@ -2016,6 +2061,7 @@ EOF
       # honest place for the statement, and because a future edit that
       # loosens the reuse gate would otherwise silently restore F-1.
       ARTIFACT_TRUST=verified
+      ARTIFACT_TRUST_ROOT=$_fk_base
     fi
 
     # The staging directory has done its job. Drop it and its traps together,
@@ -3422,9 +3468,11 @@ cmd_uninstall() {
     # Enumerated, not described. "every version directory in it" is a summary,
     # and a summary is not a contract: it read as reassuring on a root where
     # what would actually go was somebody's source tree. remove_kit deletes
-    # exactly the children that pass is_version_dir, so the plan lists exactly
-    # those children, by the absolute path they will be deleted under — you
-    # can read the list and stop the run if a name on it surprises you.
+    # exactly the children that pass BOTH is_version_dir and
+    # looks_like_our_tree, so the plan applies both too — eleven lines below,
+    # where the loop does it — and lists exactly those children by the absolute
+    # path they will be deleted under. You can read the list and stop the run
+    # if a name on it surprises you.
     while IFS= read -r _un_v; do
       [ -n "$_un_v" ] || continue
       # BOTH predicates, matching remove_kit exactly. Listing on
