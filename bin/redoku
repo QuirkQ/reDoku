@@ -1227,11 +1227,19 @@ is_version_dir() {
 # is_version_dir, which is the conservative "we certainly named this" test —
 # admitting a directory here only ever decides that the root as a whole is a
 # kit worth operating on.
+# The evidence is a tag-shaped name holding OUR CLI. device/install.sh was
+# required here too at first, and that was wrong in the direction that matters:
+# §7 exists to repair kits that are damaged, and a version directory which has
+# lost its device/ is still plainly ours — demanding a second file made this
+# refuse to recognise exactly the trees the repair paths are for, which the
+# suite caught as two failures in the reuse-gate tests. One file is enough to
+# tell our tree from somebody's project directory: a `v1.2.3/` of theirs may
+# well carry a VERSION, but not a bin/redoku.
 looks_like_our_tree() {
   [ -d "$1" ] || return 1
   [ ! -L "$1" ] || return 1
   valid_tag "${1##*/}" || return 1
-  [ -f "$1/bin/redoku" ] && [ -f "$1/device/install.sh" ]
+  [ -f "$1/bin/redoku" ]
 }
 
 # kit_root_holds_only_ours <root> — does <root> contain nothing that is not
@@ -1490,6 +1498,18 @@ fetch_kit() {
   _fk_was_ours=0
   if [ "$_fk_layout" = kit ]; then
     ! kit_root_is_ours "$_fk_base" || _fk_was_ours=1
+    # Refused HERE rather than at the repoint, which is where it used to be:
+    # the repoint happens after the download and the unpack, so refusing there
+    # still left a version directory sitting in somebody's deploy root. This
+    # costs nothing to ask early and means a root we will not finish installing
+    # into is one we never write to at all. The repoint keeps its own copy of
+    # this check for the states that can only be seen once the tag is known.
+    if [ -L "$_fk_base/current" ] && ! kit_current_is_ours "$_fk_base"; then
+      die "$_fk_base/current is a symlink, but not one this installer wrote: it points
+  at $(readlink "$_fk_base/current"), which is not a version directory of this kit.
+  Refusing to install here — that would take over a symlink somebody else is
+  using. Install somewhere else with --kit DIR, or move it aside first."
+    fi
   fi
 
   # design doc §6.3, consulted the FIRST of two times. 'install' is documented
