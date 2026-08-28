@@ -563,6 +563,33 @@ in_kit_tree() { [ "$IN_KIT" -eq 1 ] || [ "$KIT_ROOT" != "$REPO" ]; }
 # `make build` to offer either, because it has no checkout to run it in.
 game_is_prebuilt() { in_kit_tree || [ "$KIT_VERSION" != dev ]; }
 
+# How the user spells THIS CLI, in whichever of the two worlds this run is
+# printing into: 'redoku' on the PATH from a kit, 'bin/redoku' from a
+# checkout. Every message that tells someone to run this program again has to
+# go through it, because advice that names a command the reader does not have
+# is the same class of wrong advice as advice that names the wrong command
+# (design doc §7's last paragraph) — and the plan and closing blocks of
+# `install` used to end on 'bin/redoku status' however they were reached.
+#
+# Deliberately the same condition refetch_hint uses below, and they stay two
+# functions rather than one: this one substitutes a NAME, while refetch_hint's
+# two answers differ in the verb as well ('upgrade' against 'install
+# --download'), so neither can be derived from the other by renaming.
+#
+# The one case it cannot spell is a kit tree somebody unpacked by hand: marker
+# 2 is there, so this says 'redoku', but no PATH entry was ever written for it.
+# That state now has its own answer wherever it matters — resolve_kit_root
+# refuses it outright and names the full path to run — and inventing a third
+# spelling here would be a branch for a case the surrounding messages already
+# turn away.
+cli_name() {
+  if [ "$IN_KIT" -eq 1 ] || [ -n "$KIT_DIR" ]; then
+    printf '%s\n' "redoku"
+  else
+    printf '%s\n' "bin/redoku"
+  fi
+}
+
 # The command that re-fetches whatever the prebuilt artifacts came from —
 # printed by every "this kit is incomplete or corrupt" message in this file,
 # because a fix that names the wrong command is the class of wrong advice
@@ -2232,7 +2259,7 @@ cmd_install() {
   else
     say "  game   : WARNING — skipped, everything else goes on alone:"
     say "           $GAME_WHY"
-    say "           then re-run 'bin/redoku install' to stage the game"
+    say "           then re-run '$(cli_name) install' to stage the game"
   fi
   say "  decoy  : $DECOY_DIR ($DECOY_NOTE)"
   say "  watcher: $KIT_ROOT/device/redoku-watcher.service"
@@ -2281,12 +2308,18 @@ cmd_install() {
     else
       say "all done — xochitl is running through the display server, decoy in the library"
       if [ -n "$GAME" ]; then
-        say "  play it    : tap 'Sudoku' in the library, or bin/redoku play"
+        say "  play it    : tap 'Sudoku' in the library, or $(cli_name) play"
       else
-        say "  play it    : make build, then bin/redoku play (tapping the decoy needs the game staged too)"
+        # Not "make build, then bin/redoku play": inside a kit there is no
+        # build to run and no bin/ to run it from, and the game's real fix was
+        # already printed as $GAME_WHY in the plan above — by whichever of the
+        # two it actually is. Pointing back at it beats printing a second,
+        # checkout-only answer underneath it.
+        say "  play it    : not yet — the game wasn't staged, so tapping the decoy"
+        say "               launches nothing; fix that (see above) and re-run '$(cli_name) install'"
       fi
-      say "  check it   : bin/redoku status"
-      say "  banished it: bin/redoku uninstall"
+      say "  check it   : $(cli_name) status"
+      say "  banished it: $(cli_name) uninstall"
     fi
   else
     die "the on-device installer failed and rolled the device back to stock
