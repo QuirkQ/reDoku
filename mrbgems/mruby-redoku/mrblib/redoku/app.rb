@@ -512,10 +512,35 @@ module Redoku
       groups = ink_by_cell
       return 0 if groups.empty?
       done = 0
+      # NO PROGRESS BAR HERE, and it is not an omission — it was removed after
+      # the owner reported it "gets stuck and doesn't undraw" (2026-08-28).
+      # Three reasons it could not stay, in the order they bite:
+      #
+      # 1. IT COULD NOT BE ERASED FROM HERE. Renderer.progress_rect lives
+      #    inside board_rect (that is deliberate — draw_board's white fill is
+      #    what erases it for generation), and this pass repaints ONLY the
+      #    cells it read. The bar crosses ten cells of rows 4 and 5 that this
+      #    loop has no reason to touch, so its pixels survived to the
+      #    flush_board below and went to the glass. Worse, the last group
+      #    makes num == den, and progress_fill answers a FULL bar for that —
+      #    so what stuck there was a solid black bar across the middle of the
+      #    board, until New or a menu round-trip repainted it away.
+      # 2. IT BROKE THE WAVEFORM RULE the rest of this file obeys.
+      #    flush_progress is DU, which is two-level; the rect it flushes holds
+      #    ENTRY_GRAY (96) digits, which DU thresholds to black or white. So
+      #    every step of the bar flickered the entries under it. See
+      #    redraw_cell's WAVEFORM WARNING and PLAN.md §7.
+      # 3. IT COST MORE THAN THE WORK IT REPORTED. Unlike show_progress it
+      #    bypassed PROGRESS_STEP_PX, so it drew and DU-flushed once per inked
+      #    cell — up to ~50 panel updates to report a pass PLAN.md §6 costs at
+      #    ~1.1k operations per cell, four orders of magnitude under $P.
+      #
+      # Generation keeps its bar (new_puzzle, show_progress): that is a search
+      # measured in seconds, throttled to about twenty paints however long it
+      # runs, and fill_board repaints the whole board afterwards — which is
+      # both why the bar is erased there and why it was never erased here.
       groups.each do |index, strokes|
         done += 1
-        @renderer.draw_progress(done, groups.size)
-        @renderer.flush_progress
         digit, = Recognizer.read(strokes)
         if digit
           @grid.set_entry(index, digit)

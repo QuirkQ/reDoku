@@ -2964,6 +2964,45 @@ assert('unreadable ink is KEPT on the glass and marked, not repainted away') do
   }
 end
 
+assert('CHECK leaves no progress bar on the board') do
+  # Reported 2026-08-28: "the CHECK button actually has a progress bar that
+  # gets stuck and doesn't undraw after pressing it." It did. run_check drew
+  # and DU-flushed Renderer.progress_rect once per inked cell, and that rect
+  # lives INSIDE board_rect — while the pass repaints only the cells it read,
+  # so the bar's pixels went to the glass on the closing flush_board and
+  # stayed there. Full black, too: the last group makes num == den.
+  #
+  # Two assertions, cause and effect. The bar is generation's (new_puzzle,
+  # App#show_progress); it has no business in a pass that costs ~1.1k
+  # operations per cell.
+  app, d = new_app(generator: FakeGenerator.new)
+  app.new_puzzle
+  index = first_empty_cell(app.grid)
+  write_digit_in_cell(app, index, app.solution[index])
+  px, py, pw, ph = Redoku::Renderer.progress_rect
+  # A watermark rather than clear_calls: gray_at replays the WHOLE recorded
+  # history, and the effect assertion below needs draw_board's white fill in
+  # it. new_puzzle legitimately paints this rect (the empty bar under the
+  # splash), so only what CHECK adds may be inspected.
+  rect_mark = d.rects.size
+  update_mark = d.updates.size
+  app.run_check
+  fresh_rects = d.rects[rect_mark, d.rects.size - rect_mark] || []
+  fresh_updates = d.updates[update_mark, d.updates.size - update_mark] || []
+  assert_false fresh_rects.any? { |x, y, w, h, _g|
+    x == px && y == py && w == pw && h == ph
+  }, 'CHECK painted the progress bar'
+  assert_false fresh_updates.any? { |x, y, w, h, _wf, _fl|
+    x == px && y == py && w == pw && h == ph
+  }, 'CHECK flushed the progress bar region'
+  # And the effect: the bar's top border ran along y = progress_rect's y,
+  # which is 2 px above the row-5 boundary and clear of any digit glyph
+  # (DIGIT_SCALE leaves 21 px of vertical margin), so that pixel is white
+  # paper on a finished board and black if a bar is sitting on it.
+  assert_equal Redoku::Renderer::WHITE, d.gray_at(px + 4, py),
+               'a progress bar is still on the board after CHECK'
+end
+
 assert('CHECK never touches a given, even one with ink on it') do
   app, = new_app(generator: FakeGenerator.new)
   app.new_puzzle

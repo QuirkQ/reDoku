@@ -307,6 +307,34 @@ per cell. A press whose only visible result arrives a second later reads as a
 button that did nothing — the same finding M1 recorded for button
 acknowledgement, and the reason every press paints inverted.
 
+> **Shipped without the bar, and the paragraph above is why it was tried**
+> (removed 2026-08-28, after the owner played it: "the CHECK button actually
+> has a progress bar that gets stuck and doesn't undraw after pressing it").
+> Its premise went with stage 2. The 1–3 s is this section's own estimate for
+> **stage 1 plus $P on a shortlist** (≈3M point-distance evaluations per
+> board); the decision gate deleted stage 2, and what ships is stage 1 alone
+> at ≈1.1k operations per cell — four orders of magnitude less. Driving a
+> per-cell bar over that pass cost more than the pass: up to ~50 DU panel
+> updates, unthrottled (unlike the generator's, which `PROGRESS_STEP_PX`
+> bounds to about twenty however long a search runs).
+>
+> It could not be erased from where it was drawn, either. `progress_rect`
+> sits inside `board_rect` on purpose — `draw_board`'s white fill is what
+> erases it for generation — but the CHECK pass repaints only the cells it
+> read, so the bar crossed ten cells nothing in that loop had reason to
+> touch and survived to the closing `flush_board`; and the last cell makes
+> `num == den`, so what stuck there was a *full* black bar. Its DU flush
+> also thresholded the `ENTRY_GRAY` digits inside its own rect, which is the
+> waveform rule the rest of the renderer obeys.
+>
+> **The paragraph's actual requirement is met without it.** `App#acknowledge`
+> inverts the pressed button before the pass and releases it after, so CHECK
+> is visibly held down for the whole duration — the M1 finding this section
+> cites, applied where it belongs. If a device measurement ever shows a
+> board's worth of cells taking a second, the honest answer is a bar drawn
+> *outside* `board_rect` (or one whose region the pass repaints on the way
+> out) and throttled like the generator's, not this one restored.
+
 ### Thresholds err toward refusing to guess
 
 Accept a digit only on a high confidence score **and** a wide margin over the
