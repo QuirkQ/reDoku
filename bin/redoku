@@ -29,7 +29,7 @@
 #     it before it is unpacked, and nothing unverified is ever run or
 #     installed — a check that fails leaves your kit as it was. What that
 #     buys is integrity, not authenticity: the checksum ships in the same
-#     release as the file it vouches for (see the README).
+#     release as the file it vouches for (see INSTALL.md).
 #   * install and uninstall ask before touching the device (or pass --yes);
 #     play does not, since its only write is one binary that play alone
 #     refreshes on every run by design. --dry-run always shows the plan
@@ -38,6 +38,32 @@
 set -eu
 
 REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+# Does $REPO's derivation above actually MEAN anything for this run?
+#
+# It takes the parent of the directory holding this script, which is only a
+# tree of ours when that directory is such a tree's bin/. In a checkout it is
+# <repo>/bin, in a kit <kit>/<tag>/bin, and in the bootstrap's temp directory
+# $T/bin. Run from anywhere else — `curl -O redoku && sh redoku`, which is what
+# the README's no-pipe alternative produces — $REPO is simply the parent of
+# wherever the file was dropped, and everything under it belongs to whoever
+# else can write there. With the file in /tmp/dl, that parent is /tmp.
+#
+# This is the root cause behind three separate code-execution defects in this
+# milestone, and each was closed one instance at a time until the class was
+# swept: the bootstrap's own layout, `build_decoy` running
+# $REPO/tools/mkdecoy.rb on the HOST, and — measured, all three — `uninstall`
+# running $REPO/device/uninstall.sh as ROOT on the tablet, `install` running
+# $REPO/device/install.sh as ROOT there, and `play` pushing
+# $REPO/build/rm2/bin/redoku and executing it. So the question is answered once,
+# here, rather than at each place that trusts $REPO.
+#
+# Checking the directory NAME is not a heuristic: it is precisely the invariant
+# "$REPO is my tree's root" rests on, tested instead of assumed.
+SELF_IN_BIN=0
+case $(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) in
+  */bin) SELF_IN_BIN=1 ;;
+esac
 
 # Which version am I, and am I a release build? A checkout stays "dev"
 # forever; tools/mkkit.sh stamps this exact line to the real tag in every
@@ -57,8 +83,16 @@ KIT_VERSION=dev
 # ~/.redoku/current/bin/ know exactly the opposite. One marker cannot express
 # both states. tools/mkkit.sh writes VERSION at the root of every kit it
 # packs (§3.2); a checkout has no such file.
+#
+# $SELF_IN_BIN is required as well as the VERSION file, because the file alone
+# is a marker anyone who can write to $REPO can forge — and $REPO is exactly
+# the directory that is not ours to trust when this script was merely dropped
+# somewhere. A planted /tmp/VERSION flipped this to 1, which is what made the
+# rest of that directory look like a kit worth reading device scripts out of.
+# Both together say what §5.1 means by "are the artifacts sitting beside me?":
+# a VERSION file at the root of the tree whose bin/ I am running from.
 IN_KIT=0
-[ ! -f "$REPO/VERSION" ] || IN_KIT=1
+{ [ ! -f "$REPO/VERSION" ] || [ "$SELF_IN_BIN" -eq 0 ]; } || IN_KIT=1
 
 # Where the artifacts this run installs actually live. It is $REPO in a
 # checkout AND inside a kit — the kit deliberately mirrors a checkout's
@@ -335,7 +369,7 @@ safety:
   Anything downloaded is checked against the sha256 published beside it
   before it is unpacked, and nothing unverified is ever run or installed —
   which proves the bytes arrived intact, not that the release is authentic
-  (the README says why there is no signature). If the device ever seems
+  (INSTALL.md says why there is no signature). If the device ever seems
   stuck, hold the power button ~10 s: it reboots and a broken display
   server disarms itself.
 EOF
@@ -1226,8 +1260,28 @@ EOF
 # of this kit? The exact test guard 5's arm A applies to a RESOLVING symlink,
 # factored out because fetch_kit needs the same answer before it replaces one.
 kit_current_is_ours() {
-  _kci=$(CDPATH='' cd -P -- "$1/current" 2>/dev/null && pwd -P) || return 1
-  looks_like_our_tree "$_kci"
+  [ -L "$1/current" ] || return 1
+  _kci=$(CDPATH='' cd -P -- "$1/current" 2>/dev/null && pwd -P) || _kci=
+  if [ -n "$_kci" ]; then
+    looks_like_our_tree "$_kci"
+    return $?
+  fi
+  # Unresolvable. The four states guard 5 distinguishes, in one place now that
+  # two callers need them: a link whose target EXISTS is not dangling (a
+  # regular file, an unsearchable directory) and is not ours; a genuinely
+  # dangling one may still be ours, because §6.2's repoint window and §7's
+  # broken `current` both produce exactly that — but only when what it names
+  # reads like a tag we would have written AND nothing else in the root is
+  # somebody else's.
+  #
+  # fetch_kit's refusal used `[ -e … ]` here instead, which follows the link —
+  # so a foreign `current` whose target was gone (a botched Capistrano deploy)
+  # skipped the refusal and was silently replaced. Sharing this predicate is
+  # what stops the two callers disagreeing about the same symlink.
+  [ ! -e "$1/current" ] || return 1
+  _kcit=$(readlink "$1/current") || return 1
+  valid_tag "$_kcit" || return 1
+  kit_root_holds_only_ours "$1"
 }
 
 # kit_root_is_ours <root> — was <root> already a kit before this run touched
@@ -1335,7 +1389,21 @@ EOF
     _pk_name=$(basename "$_pk_dir")
     [ "$_pk_name" != "$_pk_keep" ] || continue
     [ -z "$_pk_keep_too" ] || [ "$_pk_name" != "$_pk_keep_too" ] || continue
+    # BOTH tests, and the structural one is why: is_version_dir asks only
+    # whether a directory is NAMED after its own VERSION, and people name
+    # directories that way. Gated on it alone, the SECOND
+    # `install --download --kit ~/Documents` swept the user's v1.2.3/ and
+    # v3.1/ away — the first install having made the root ours, which is all
+    # _fk_was_ours can ask about. Structure is what their directories do not
+    # have: our CLI and our device installer inside them.
+    #
+    # Additional, never a replacement: the conservative direction is still
+    # is_version_dir's "we certainly named this". The cost is that a version
+    # directory left half-written by an interrupted unpack is no longer swept,
+    # since it has no bin/redoku yet — it is left for the user to see rather
+    # than deleted unannounced, which is the safer way to be wrong.
     is_version_dir "$_pk_dir" || continue
+    looks_like_our_tree "$_pk_dir" || continue
     case $_pk_dir in
       "$_pk_base"/?*) ;;
       *) die "internal error: refusing to remove '$_pk_dir', which is not under $_pk_base" ;;
@@ -1670,7 +1738,7 @@ EOF
       # silently. `install --kit` reaches this line with no guard 5 in front of
       # it by design (see check_kit_root's `create` verb), so this is where
       # that shape has to be refused rather than at one caller.
-      if [ -e "$_fk_base/current" ] && ! kit_current_is_ours "$_fk_base"; then
+      if ! kit_current_is_ours "$_fk_base"; then
         die "$_fk_base/current is a symlink, but not one this installer wrote: it points
   at $(readlink "$_fk_base/current"), which is not a version directory of this kit.
   Refusing to replace it — that would take over a symlink somebody else is
@@ -2110,7 +2178,39 @@ plan_upgrade() { # plan_upgrade <what-current-points-at-now, or empty> <state>
 # Its message names a different fix for each case: inside a kit or a
 # downloaded tree these files shipped with it (§3.2), so their absence means
 # the download arrived incomplete; in a checkout it means what it always did.
+# require_own_tree — refuse to use anything found under $KIT_ROOT when this
+# copy of the CLI has no business having a tree there at all.
+#
+# Called by every command that reads a local artifact and sends or runs it: the
+# device scripts (executed as ROOT on the tablet), the rm2fb server and client
+# (loaded into xochitl), the game binary, and the decoy. All of them resolve
+# under $KIT_ROOT, which is $REPO until a download moves it — so when $REPO is
+# merely where somebody dropped this file, every one of them is attacker
+# input. Measured on all three commands before this existed: `install` and
+# `uninstall` each ran a planted device script as root on the device, and
+# `play` pushed a planted ARM binary and executed it.
+#
+# The rule is the one design doc §5.1 already implies and never enforced: a
+# RELEASED CLI standing on its own has no local artifacts. The standalone
+# release asset is the CLI file and nothing else — mkkit.sh ships device/,
+# build/ and the decoy inside the TARBALL — so a stamped CLI with no kit around
+# it and nothing downloaded is looking at somebody else's directory by
+# definition. A dev CLI is a checkout, where $REPO is the working tree and
+# reading it is the whole point.
+require_own_tree() {
+  [ "$KIT_VERSION" != dev ] || return 0
+  in_kit_tree && return 0
+  die "this is a standalone copy of redoku ($0), and the files it would send to
+  the device are not part of it — a release ships the CLI on its own and
+  everything else inside the kit tarball. Whatever is in $KIT_ROOT was put there
+  by something else, so it will not be read.
+  Install a kit and use the 'redoku' that comes with it:
+    sh $0 install --download --kit ~/.redoku
+  Already have one? Run it from there instead, e.g.  ~/.redoku/current/bin/redoku"
+}
+
 require_device_files() {
+  require_own_tree
   [ ! -f "$KIT_ROOT/device/install.sh" ] || \
     [ ! -f "$KIT_ROOT/device/uninstall.sh" ] || \
     [ ! -f "$KIT_ROOT/device/redoku-watcher.service" ] || return 0
@@ -2304,50 +2404,14 @@ check_kit_root() {
   [ "$_crk_verb" != create ] || return 0
 
   _crk_looks=0
-  if [ -L "$_crk_root/current" ]; then
-    # FOUR states, not two, and collapsing them is how a directory of the
-    # user's got back in after N3 was supposedly closed. `cd -P` failing does
-    # NOT mean "dangling": it also fails for a symlink to a regular file, to a
-    # directory that cannot be searched, and for a symlink loop. Treating all
-    # of those as dangling downgraded the strong test (the target must be one
-    # of ours) to the weak one, so `current -> active` in somebody's project
-    # directory passed, and so did `current -> somefile` — which was then
-    # reported as "dangling … which isn't there" about a file plainly there.
-    #
-    #   1. resolves to a directory of ours          -> a kit
-    #   2. resolves to anything else                -> NOT a kit
-    #   3. exists but cannot be resolved            -> NOT a kit
-    #   4. genuinely dangling (the target is gone)  -> see below
-    _crk_cres=$(CDPATH='' cd -P -- "$_crk_root/current" 2>/dev/null && pwd -P) || _crk_cres=
-    if [ -n "$_crk_cres" ]; then
-      looks_like_our_tree "$_crk_cres" && _crk_looks=1
-    elif [ ! -e "$_crk_root/current" ]; then
-      # No test pins THIS arm on its own, and that is recorded rather than
-      # hidden: with kit_root_holds_only_ours below in place, every shape that
-      # reaches it is already refused for the other reason — a link to a file
-      # in the root makes that file a child which is not ours, and a link to
-      # anything outside the root carries a slash and fails valid_tag. It is
-      # kept because the two rules are independent and this one states the
-      # intent: a link whose target EXISTS was never dangling, whatever cd -P
-      # said. (cmd_upgrade needs the same distinction and is not redundant
-      # there — see its `foreign` state, which is pinned.)
-      #
-      # State 4 only: -e follows the symlink, so it is false exactly when the
-      # target is not there. This is §6.2's repoint window and §7's dangling
-      # `current`, and the only evidence left is the name it was pointed at.
-      #
-      # Two things have to hold, because the name alone is weak. It has to read
-      # like a tag WE would have written — `releases/20240101120000` fails on
-      # the slash, and valid_tag also refuses 'current' itself, so a self-loop
-      # cannot qualify — AND the root must hold nothing that is not ours. In a
-      # real repoint window the root holds version directories and `.staging.*`
-      # and nothing else; a project directory holds notes.txt.
-      _crk_ctarget=$(readlink "$_crk_root/current") || _crk_ctarget=
-      if valid_tag "$_crk_ctarget" && kit_root_holds_only_ours "$_crk_root"; then
-        _crk_looks=1
-      fi
-    fi
-  fi
+  # Arm A, through the one predicate that knows what "our current" means. It
+  # distinguishes four states — resolves to one of ours; resolves to something
+  # else; exists but cannot be resolved; genuinely dangling — because
+  # collapsing them is how a Capistrano deploy root got admitted, and how a
+  # `current` pointing at a regular file was called "dangling". fetch_kit asks
+  # the same question before it replaces a `current`, and the two must not be
+  # free to disagree about the same symlink.
+  ! kit_current_is_ours "$_crk_root" || _crk_looks=1
   if [ "$_crk_looks" -eq 0 ]; then
     while IFS= read -r _crk_dir; do
       [ -n "$_crk_dir" ] || continue
@@ -2448,7 +2512,10 @@ remove_kit() {
 
   while IFS= read -r _rk_dir; do
     [ -n "$_rk_dir" ] || continue
+    # Both, for the reason prune_kit's sweep gives — a directory merely
+    # named after its own VERSION is not evidence that we made it.
     is_version_dir "$_rk_dir" || continue
+    looks_like_our_tree "$_rk_dir" || continue
     case $_rk_dir in
       "$_rk_root"/?*) ;;
       *) die "internal error: refusing to remove '$_rk_dir', which is not under $_rk_root" ;;
@@ -2859,6 +2926,10 @@ cmd_upgrade() {
 }
 
 cmd_play() {
+  # The game binary is pushed to the device and executed there. Same class as
+  # the device scripts, same guard — a planted $KIT_ROOT/build/rm2/bin/redoku
+  # that passes the ARM-ELF gate was sent and run before this existed.
+  require_own_tree
   find_game || die "$GAME_WHY"
   connect
 
@@ -2982,9 +3053,15 @@ cmd_uninstall() {
   # The name the user typed is not the defect here; the sentence is, so
   # cli_name() alone would only have made it read "run redoku from a reDoku
   # checkout".
-  if [ ! -f "$REPO/device/uninstall.sh" ]; then
+  # , not $REPO. They hold the same value here — nothing in this
+  # command moves KIT_ROOT — so this is not the fix for the root-running-as-root
+  # defect (require_own_tree is); it is what makes the invariant true and
+  # greppable: everything that reaches the device comes from $KIT_ROOT. The
+  # $REPO spelling here was the one place that broke it.
+  require_own_tree
+  if [ ! -f "$KIT_ROOT/device/uninstall.sh" ]; then
     if in_kit_tree; then
-      die "device/uninstall.sh not found in $REPO — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
+      die "device/uninstall.sh not found in $KIT_ROOT — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
     fi
     die "device/uninstall.sh not found next to me — run $(cli_name) from a reDoku checkout"
   fi
@@ -3080,7 +3157,7 @@ EOF
   connect
   say "copying the uninstaller"
   remote "mkdir -p $REMOTE_DIR"
-  push_file "$REPO/device/uninstall.sh" "$REMOTE_DIR/uninstall.sh"
+  push_file "$KIT_ROOT/device/uninstall.sh" "$REMOTE_DIR/uninstall.sh"
 
   _purge_arg=
   [ "$PURGE" -eq 0 ] || _purge_arg=' --purge'
