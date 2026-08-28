@@ -99,6 +99,14 @@ GAME_BIN=$REDOKU_DIR/bin/redoku
 # that is never coming back.
 WAIT_BUDGET=60
 
+# Fix round 3, item 1: how many consecutive active samples the FINAL
+# settle checks (after xochitl's own restart) require, a second apart —
+# see wait_for_active's own comment on why one sample is not enough. Not
+# used by the early, right-after-its-own-restart checks (those pass 1):
+# this is specifically for proving a service is still up seconds after
+# xochitl's restart, not merely that it came up in the first place.
+SETTLE_SAMPLES=3
+
 FORCE=0
 [ "${1:-}" = --force ] && FORCE=1
 
@@ -111,34 +119,60 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # crash and its next retry) exactly the same as for a unit that is
 # permanently gone, so a single sample partway through a restart cannot
 # tell "still coming up" apart from "never coming back". wait_for_active
-# polls once a second up to a budget instead: ActiveState=active is
-# success, ActiveState=failed is a real terminal failure worth reporting
-# immediately (no reason to burn the rest of the budget on a unit that has
-# already given up), and everything else — activating, the auto-restart
-# substate, reloading, deactivating — is "keep waiting". Logs what it last
-# saw whichever way it ends, so a real failure is diagnosable instead of
-# guessed at.
-wait_for_active() { # wait_for_active <unit> <budget_seconds>
+# polls once a second up to a budget instead: ActiveState=failed is a real
+# terminal failure worth reporting immediately (no reason to burn the rest
+# of the budget on a unit that has already given up); anything else that
+# isn't active — activating, the auto-restart substate, reloading,
+# deactivating — is "keep waiting". Logs what it last saw whichever way it
+# ends, so a real failure is diagnosable instead of guessed at.
+#
+# <required_consecutive> (fix round 3, item 1): `systemctl restart`
+# already returns only once its own start job completes, at which point
+# ActiveState is already "active" — a caller that accepts the FIRST active
+# sample proves nothing "restart"'s own exit status didn't already say.
+# That is the exact shape of the owner's real failure: the device journal
+# shows xochitl started cleanly and then failed a DNS/HTTP call 8s later —
+# work that happens AFTER the start job, not during it. Passing >1 here
+# requires that many consecutive active samples, a second apart, with
+# NRestarts unchanged between them (a bump mid-streak means it crashed and
+# came back on its own — not "up and staying up" — so the streak restarts
+# rather than counting through it). Early callers that only need "did it
+# come up at all" (right after their own restart, with nothing yet
+# depending on it) pass 1; the final settle checks, after xochitl's own
+# restart, pass more.
+wait_for_active() { # wait_for_active <unit> <budget_seconds> <required_consecutive>
   _unit=$1
   _budget=$2
+  _required=$3
   _waited=0
+  _streak=0
+  _last_nrestarts=
   while :; do
     _show=$(systemctl show -p ActiveState -p SubState -p NRestarts "$_unit" 2>/dev/null)
     _state=$(printf '%s\n' "$_show" | sed -n 's/^ActiveState=//p')
     _sub=$(printf '%s\n' "$_show" | sed -n 's/^SubState=//p')
     _nrestarts=$(printf '%s\n' "$_show" | sed -n 's/^NRestarts=//p')
-    [ "$_state" = active ] && return 0
     if [ "$_state" = failed ]; then
       printf 'ERROR: %s failed (ActiveState=%s SubState=%s NRestarts=%s)\n' \
         "$_unit" "$_state" "$_sub" "$_nrestarts" >&2
       return 1
     fi
+    if [ "$_state" = active ]; then
+      if [ "$_streak" -gt 0 ] && [ "$_nrestarts" != "$_last_nrestarts" ]; then
+        _streak=0 # restarted mid-streak: that streak belonged to a process that isn't the one running now
+      fi
+      _streak=$((_streak + 1))
+      _last_nrestarts=$_nrestarts
+      [ "$_streak" -ge "$_required" ] && return 0
+    else
+      _streak=0
+    fi
     [ "$_waited" -lt "$_budget" ] || break
     sleep 1
     _waited=$((_waited + 1))
   done
-  printf 'ERROR: %s did not become active within %ss (ActiveState=%s SubState=%s NRestarts=%s)\n' \
-    "$_unit" "$_budget" "$_state" "$_sub" "$_nrestarts" >&2
+  printf 'ERROR: %s did not stay active within %ss (ActiveState=%s SubState=%s NRestarts=%s, streak=%s/%s)\n' \
+    "$_unit" "$_budget" "$_state" "$_sub" "$_nrestarts" "$_streak" "$_required" >&2
   return 1
 }
 
@@ -348,11 +382,43 @@ rollback() {
       rm -rf "$_f" 2>/dev/null || true
     done
   fi
-  say "rollback done — check with: systemctl status xochitl"
+
+  # Fix round 3, item 3: "rollback done" used to print unconditionally —
+  # uninstall.sh warns when its own equivalent removal can't be confirmed
+  # clean; rollback() didn't. An operator reading "rollback done" over a
+  # decoy that is still there has been told something false at exactly
+  # the moment they most need the truth.
+  _still_present=0
+  for _f in "$XOCHITL_DIR/$DECOY_UUID.pdf" "$XOCHITL_DIR/$DECOY_UUID.metadata" \
+            "$XOCHITL_DIR/$DECOY_UUID.content" "$XOCHITL_DIR/$DECOY_UUID.pagedata" \
+            "$XOCHITL_DIR/$DECOY_UUID" "$XOCHITL_DIR/$DECOY_UUID.thumbnails"; do
+    [ -e "$_f" ] && _still_present=1
+  done
+  if [ "$_still_present" = 1 ]; then
+    say "WARNING: rollback could not fully remove the decoy — some of $XOCHITL_DIR/$DECOY_UUID.* remain; check by hand (systemctl status xochitl)"
+  else
+    say "rollback done — check with: systemctl status xochitl"
+  fi
 }
 STATUS=fail
-finish() { [ "$STATUS" = ok ] || rollback; }
+FINISHED=0
+# Fix round 3, item 5: `trap ... EXIT` alone is not enough — dash/ash do
+# NOT run an EXIT trap on an untrapped fatal signal, only on a normal
+# script exit. Combined with the up-to-$WAIT_BUDGET-second silent waits
+# below (now announced, but still long), an operator who Ctrl-Cs what
+# looks like a hang would get no rollback at all: SIGINT would just kill
+# the script outright, mid-install, decoy and half-started services left
+# exactly where they stood. INT/TERM/HUP all now run the same path.
+# FINISHED guards against running it twice: the handler below calls exit
+# explicitly (needed — without it, dash resumes the script after the trap
+# instead of stopping it), and `exit` itself fires the EXIT trap too.
+finish() {
+  [ "$FINISHED" = 1 ] && return
+  FINISHED=1
+  [ "$STATUS" = ok ] || rollback
+}
 trap finish EXIT
+trap 'finish; exit 1' INT TERM HUP
 
 say "writing $UNIT"
 cat > "$UNIT" <<EOF
@@ -443,7 +509,7 @@ mkdir -p "$XOCHITL_DIR/$DECOY_UUID"
 
 say "enabling + starting rm2fb.service"
 systemctl enable rm2fb.service
-systemctl restart rm2fb.service
+systemctl restart rm2fb.service || die "rm2fb.service failed to (re)start — its own output above says why"
 
 say "waiting for $SOCKET"
 i=0
@@ -456,7 +522,10 @@ done
 # Tiny race accepted here: if the server dies between this check and
 # xochitl's first preload connect, xochitl can crash-loop once into a
 # reboot — after which the arming file guarantees a stock, working boot.
-wait_for_active rm2fb.service "$WAIT_BUDGET" || die "rm2fb.service is not active"
+# Announced (fix round 3, item 5): up to $WAIT_BUDGET seconds of otherwise
+# total silence reads as a hang to whoever is watching the SSH session.
+say "waiting for rm2fb.service to report active (up to ${WAIT_BUDGET}s)..."
+wait_for_active rm2fb.service "$WAIT_BUDGET" 1 || die "rm2fb.service is not active"
 
 say "enabling redoku-watcher.service"
 # reset-failed first (fix round 1, Important 3): systemd's start-limit
@@ -476,14 +545,28 @@ systemctl enable redoku-watcher.service
 # binary does not exist is 203/EXEC, not a graceful no-op. Enabling it
 # regardless means it starts on its own at the next boot, or the next
 # time this script runs after a build exists; STARTING (and therefore
-# hard-verifying) it only happens when there is something to start. A
-# watcher with nothing to spawn must not roll back an otherwise healthy
-# display-server install.
+# hard-verifying) it only happens when there is something to start.
+#
+# Fix round 3, item 2: that only covered the missing-binary cause. Any
+# OTHER reason the watcher fails to start (a bad unit, a systemd hiccup,
+# anything) used to reach an unguarded `systemctl restart` and then
+# `wait_for_active`'s own die — both of which, being ordinary command
+# failures under `set -eu`, would roll back the whole install, decoy and
+# a working display server included, over a launcher that failed for a
+# reason that has nothing to do with either. The display server and
+# xochitl are what make the tablet usable; the launcher is a convenience
+# that can be retried — a watcher fault of ANY cause is now loud and
+# non-fatal: it's reported, left enabled for a later start (a reboot, or
+# a re-run of this script), and the install finishes around it.
 if [ -x "$GAME_BIN" ]; then
   say "starting redoku-watcher.service"
-  systemctl restart redoku-watcher.service
-  wait_for_active redoku-watcher.service "$WAIT_BUDGET" || die "redoku-watcher.service is not active"
-  WATCHER_STARTED=1
+  say "waiting for redoku-watcher.service to report active (up to ${WAIT_BUDGET}s)..."
+  if systemctl restart redoku-watcher.service && wait_for_active redoku-watcher.service "$WAIT_BUDGET" 1; then
+    WATCHER_STARTED=1
+  else
+    say "  WARNING: redoku-watcher.service failed to start — leaving it enabled for the next boot; the display server and the rest of the install are unaffected (systemctl status redoku-watcher for why)"
+    WATCHER_STARTED=0
+  fi
 else
   say "no game binary at $GAME_BIN yet — redoku-watcher.service is enabled for the next boot (or the next 'bin/redoku install' once 'make build' has produced one), not started now"
   WATCHER_STARTED=0
@@ -496,19 +579,43 @@ say "restarting xochitl with the rm2fb client preloaded — this also indexes th
 # instantly), taking the rest of the script down with it and leaving
 # xochitl stopped until a power cycle. `restart` is what has always been
 # here and is what must stay.
-systemctl restart xochitl.service
+systemctl restart xochitl.service || die "xochitl failed to restart — its own output above says why"
 
-say "verifying (bounded poll, up to ${WAIT_BUDGET}s per service)"
-# Fix round 2, finding 2: this is the exact line the owner's one real
-# install run died at — a single is-active sample, 15s after the xochitl
-# restart, that cannot tell "still coming up" from "gone for good" apart
-# (see wait_for_active's own comment). Bounded polls per service now,
-# not one blind sleep plus one sample.
-wait_for_active rm2fb.service "$WAIT_BUDGET" || die "rm2fb.service did not settle after the xochitl restart"
+say "verifying (15 s settle, then requiring $SETTLE_SAMPLES consecutive active samples per service)"
+# Fix round 3, item 1: fix round 2 deleted the old `sleep 15` and did not
+# replace what it bought. `systemctl restart` already returns only once
+# its start job completes — at which point ActiveState is already
+# "active" — so a caller that accepts the very first sample proves
+# nothing `restart`'s own exit status didn't already say, and the
+# "verifying" block became silent instead of over-eager. That is the
+# exact shape of the owner's real failure: the device journal shows
+# xochitl started cleanly ("Started reMarkable main application") and
+# then failed a DNS/HTTP call 8s later — work that happens AFTER the
+# start job, not during it. The settle below gives that window a chance
+# to happen before sampling even begins; SETTLE_SAMPLES consecutive
+# active reads from wait_for_active (NRestarts required unchanged
+# between them) extends the same proof a few seconds further. Over-eager
+# was fix round 2's bug; silent would have been this round's — a check
+# that returns the instant "active" first reads true tells you nothing
+# more than `restart`'s own exit status did.
+sleep 15
+say "waiting for rm2fb.service to stay active (up to ${WAIT_BUDGET}s)..."
+wait_for_active rm2fb.service "$WAIT_BUDGET" "$SETTLE_SAMPLES" || die "rm2fb.service did not stay active after the xochitl restart"
 if [ "$WATCHER_STARTED" = 1 ]; then
-  wait_for_active redoku-watcher.service "$WAIT_BUDGET" || die "redoku-watcher.service did not settle after the xochitl restart"
+  # Non-fatal here too (fix round 3, item 2's principle applied to this
+  # round's own new check, not just the line the finding named): a
+  # watcher that started fine but then flapped within the settle window
+  # is still just a watcher fault, and rolling back a healthy display
+  # server over it would be the exact thing item 2 exists to prevent —
+  # this check would have silently reintroduced it if left as `|| die`.
+  say "waiting for redoku-watcher.service to stay active (up to ${WAIT_BUDGET}s)..."
+  if ! wait_for_active redoku-watcher.service "$WAIT_BUDGET" "$SETTLE_SAMPLES"; then
+    say "  WARNING: redoku-watcher.service did not stay active — leaving it enabled for the next boot; the display server and the rest of the install are unaffected (systemctl status redoku-watcher for why)"
+    WATCHER_STARTED=0
+  fi
 fi
-wait_for_active xochitl.service "$WAIT_BUDGET" || die "xochitl did not settle after its restart"
+say "waiting for xochitl.service to stay active (up to ${WAIT_BUDGET}s)..."
+wait_for_active xochitl.service "$WAIT_BUDGET" "$SETTLE_SAMPLES" || die "xochitl did not stay active after its restart"
 
 STATUS=ok
 say "SUCCESS — rm2fb is installed, the decoy is in the library, and xochitl is running through it"

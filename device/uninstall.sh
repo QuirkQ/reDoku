@@ -214,6 +214,19 @@ if [ "$DECOY_REMOVED" = 1 ]; then
   rm -f "$WATCH_CONF"
 fi
 
+# Fix round 3, item 4: the restart just above is ITSELF a stop-then-start
+# cycle — the same mechanism the removal sequence above exists to survive
+# is not structurally ruled out on this restart too, and by the time
+# anyone would notice, watch.conf is already gone (DECOY_REMOVED gated
+# its removal, but not on this restart surviving). Cheap to guard:
+if [ "$DECOY_REMOVED" = 1 ]; then
+  for _f in "$DECOY_TARGET.pdf" "$DECOY_TARGET.metadata" "$DECOY_TARGET.content" \
+            "$DECOY_TARGET.pagedata" "$DECOY_TARGET" "$DECOY_TARGET.thumbnails"; do
+    [ -e "$_f" ] || continue
+    rm -rf "$_f"
+  done
+fi
+
 if systemctl is-active --quiet xochitl.service; then
   say "xochitl is running stock — uninstall complete"
 else
