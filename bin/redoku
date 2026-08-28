@@ -209,7 +209,9 @@ keeping it up to date (kit installs):
   is missing, dangling, or pointing at an incomplete tree is repaired rather
   than refused. Both 'upgrade' and 'uninstall --self' refuse in a checkout,
   where there is no kit to act on — unless --kit or $REDOKU_HOME names one
-  outright, which is a different request and is honoured.
+  outright, which is a different request and is honoured. A tarball you
+  unpacked by hand is not an installed kit either: it has no root to repoint
+  or prune, so both refuse there too and say how to install it properly.
 
 options:
   -H, --host HOST         device address or ssh alias   (default: 10.11.99.1)
@@ -255,9 +257,14 @@ options:
 
 environment:
   REDOKU_HOME             kit root, same as --kit DIR. install has no default
-                          for it (a kit install is asked for, never guessed);
-                          upgrade, uninstall --self and status fall back to
-                          the kit they are running from, then to ~/.redoku.
+                          for it (a kit install is asked for, never guessed).
+                          Unset, upgrade / uninstall --self / status use the
+                          kit they are running from — a properly installed one
+                          only, whose version directory is named after its own
+                          VERSION; a hand-unpacked tree is refused with an
+                          explanation, never guessed around. From a checkout,
+                          where there is no kit tree at all, they use
+                          ~/.redoku.
   REDOKU_BIN_DIR          PATH entry dir, same as --bin-dir DIR
   REDOKU_VERSION          pin a release tag instead of taking the latest —
                           for upgrade too, which will then install exactly
