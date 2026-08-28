@@ -117,7 +117,16 @@ Dir.mkdir(WATCHER_TMP) unless Dir.exist?(WATCHER_TMP)
 
 # Named after the pdf it watches by default, so each test's config lands at
 # its own path without pulling in an RNG this file has no other use for.
-def watcher_config(pdf:, metadata: nil, game: nil, trigger: nil, path: "#{pdf}.conf")
+#
+# `path` defaults inside the body rather than in the signature because mruby
+# 4.0.0 — what CI builds against, per the Makefile's MRUBY_DIR fallback to the
+# $(MRUBY_REF) clone — cannot evaluate a keyword default that references an
+# earlier keyword parameter: `path: "#{pdf}.conf"` looks `pdf` up as a method
+# on self and dies `undefined method 'pdf' for Object`. It works on mruby
+# master, which is what a developer with a sibling ../mruby checkout builds
+# against, so this passes locally and crashes every test in this file on CI.
+def watcher_config(pdf:, metadata: nil, game: nil, trigger: nil, path: nil)
+  path ||= "#{pdf}.conf"
   text = "pdf=#{pdf}\n"
   text += "metadata=#{metadata}\n" if metadata
   text += "game=#{game}\n" if game
