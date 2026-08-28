@@ -1,7 +1,16 @@
 # M4 — the hijack: launch reDoku by tapping a document
 
 **Date:** 2026-08-26
-**Status:** planned
+**Status: shipped 2026-08-27, host-complete and partially device-verified**
+(commits `7ae3a28`..`43b1633`; ledger `.superpowers/sdd/M4-HIJACK/progress.md`,
+git-ignored and deleted with the workspace — the facts worth keeping from it
+are folded into this document, [PLAN.md §10/§11](PLAN.md) and
+[`docs/design/m4-decoy-format.md`](docs/design/m4-decoy-format.md)). Tasks 1–4
+below are done, reviewed and on `main`; Task 5's device checklist is only
+partly discharged — see its section for exactly which checks were witnessed
+and which were not. Two of this plan's own guesses turned out wrong once the
+device was reachable — see the annotations on Task 1 and Task 2 below, kept
+rather than silently corrected.
 **Supersedes:** the M4 sketch in [PLAN.md §10](PLAN.md) (this document expands
 it into tasks; PLAN.md stays the design record).
 
@@ -93,6 +102,25 @@ Design decisions inherited from PLAN.md, restated because they are load-bearing:
   is watching `<uuid>.metadata` for `lastOpened` writes (`IN_CLOSE_WRITE`) if
   `IN_OPEN` proves noisy or cached-away on 3.27. This check gates Task 3.
 
+> **SUPERSEDED 2026-08-27 — the last sentence is wrong, kept as written**
+> because the reasoning that replaced it is worth reading against it. The
+> device was unreachable when Task 1 ran (checked at kickoff), so this could
+> not gate Task 3 as written; the controller's ruling instead was to ship
+> **both** triggers, watched simultaneously off one debounce, and treat the
+> pick as a tuning observation rather than a code fork. The device came
+> online mid-run, but the empirical answer still did not come from Task 1 —
+> it came from three later device episodes, spanning Tasks 3 and 4's fix
+> rounds. What was actually measured: `IN_OPEN` fires at the instant of a
+> tap, every time, but *also* fires with no tap at all on every boot
+> (xochitl re-reads the decoy while restoring its last-open document), and
+> gating on `.metadata`'s `lastOpened` instead trades that false trigger for
+> 13–54 s of latency, because xochitl records it at open time but flushes
+> the sidecar to disk lazily. `trigger=open` shipped as the default with a
+> 10 s startup grace and a suppress+cooldown that close the boot-phantom and
+> post-quit-relaunch hazards structurally; `trigger=lastopened` stays
+> selectable. Full evidence: PLAN.md §10, `docs/design/m4-decoy-format.md`,
+> and `watch_config.rb`'s `DEFAULT_TRIGGER` comment.
+
 ### Task 2 — `tools/mkdecoy.rb` (host-side, CRuby)
 
 - Generates a genuine single-page Sudoku PDF (a printed puzzle — it should
@@ -101,6 +129,19 @@ Design decisions inherited from PLAN.md, restated because they are load-bearing:
   - `<uuid>.metadata` — `visibleName: "Sudoku"`, etc., in xochitl's line-based
     format
   - `<uuid>.content` — the fileType/document metadata stub
+
+> **SUPERSEDED 2026-08-27 — "trio" and "line-based format" are both wrong,
+> kept as written.** A PDF document on 3.27.3.0 is **five** filesystem
+> entries (`.pdf`, `.metadata`, `.content`, `.pagedata`, and an empty
+> `<uuid>/` ink directory — a sixth, `<uuid>.thumbnails/`, is xochitl's own
+> to create on first open), and `.metadata`/`.content` are **JSON**, not a
+> line-based grammar. The guess was replaced with a measurement: a real
+> document's sidecars were dumped off the owner's device once it was
+> reachable, and `tools/mkdecoy.rb` was rewritten against that dump rather
+> than this description. The full corrected field set, the JSON grammar's
+> exact rules, and why an earlier summary of the same dump got the array
+> formatting wrong are in
+> [`docs/design/m4-decoy-format.md`](docs/design/m4-decoy-format.md).
 - UUID generated once and recorded (in the unit file's env or a small config
   the watcher reads) so the watcher knows which file to watch without
   scanning the whole directory.
@@ -122,6 +163,20 @@ Design decisions inherited from PLAN.md, restated because they are load-bearing:
     automatically); log spawn failures to journald and keep watching.
 - Ignore everything else; survive inotify queue overflow (`IN_Q_OVERFLOW`) by
   re-arming; handle SIGHUP re-read of config.
+
+**What shipped is more than this list, because the device changed the
+design twice while this task's fix rounds were running.** The debounce and
+the "already a client" check above both shipped as written, but they were
+not enough on hardware: a boot-time phantom launch (xochitl reads the decoy
+while restoring its last-open document, with nobody touching the screen)
+and a post-quit relaunch loop (xochitl returns to the still-open document,
+re-reads the PDF, and the watcher fires again) both needed a different
+mechanism. `mrbgems/mruby-redoku/mrblib/redoku/watcher.rb` and
+`watch_config.rb` ship: a `trigger=` mode (`open`, the default, or
+`lastopened`, both selectable in `watch.conf`), a 10 s startup grace, and a
+suppress-while-the-game-is-running rule plus a 10 s cooldown after every
+spawn. PLAN.md §10 has the full account, with the device evidence that
+proves each guard closes the hazard it was built for.
 
 ### Task 4 — install/uninstall wiring
 
@@ -152,15 +207,148 @@ Design decisions inherited from PLAN.md, restated because they are load-bearing:
   the library.
 - Fallback path exercised too if Task 1 chose the `.metadata` trigger.
 
+**Status: partly discharged, across three unplanned device episodes rather
+than one scripted run (`bin/redoku install` was run by the owner, not by an
+agent, each time).** Stated plainly, the way M3b's plan states its own open
+Task 11, so nothing above reads as claimed that was not:
+
+- **Witnessed:** the installer completes cleanly (owner, episode 3, after
+  the `rm -rf` and slow-restart fixes below landed); tapping the decoy
+  launches the game; quit hands the panel back to xochitl (both, episode 1,
+  even though the *installer* rolled back that same run); the boot-time
+  phantom launch is swallowed (`swallowed: 9190ms … startup grace`, episode
+  2); the post-quit relaunch loop is swallowed (`swallowed: 1504ms …
+  cooldown` and `swallowed: 1800ms … cooldown`, episode 3's latency
+  capture).
+- **Not witnessed, still open:** pen input through a spawned launch (M3a's
+  ink path has never been exercised on a game the watcher started, only on
+  one launched over SSH); the watcher killed mid-play; a battery pull during
+  play. None of these were run, on this device or any other, at any point in
+  M4 — do not read the witnessed list above as covering them.
+
 ## Risks & fallbacks
 
 | Risk | Answer |
 |---|---|
-| `IN_OPEN` noisy/cached on 3.27 | `.metadata` `lastOpened` via `IN_CLOSE_WRITE` — decided empirically in Task 1, not guessed |
+| `IN_OPEN` noisy/cached on 3.27 | Both triggers ship; `trigger=open` (default) or `trigger=lastopened` in `watch.conf` — picked from device measurement, not guessed (PLAN.md §10) |
 | xochitl rewrites metadata formats in a firmware update | Drift warning already patterned in install.sh (`/etc/version` check); decoy regen is one tool run |
-| Watcher double-spawn race | Debounce + GetClients check; worst case two clients, second loses front arbitration cleanly |
+| Watcher double-spawn race | Startup grace + suppress/cooldown, not the plan's original debounce-only design (Task 3's device evidence forced the redesign — see above); worst case two clients, second loses front arbitration cleanly |
 | User opens the decoy expecting a printable puzzle | The PDF *is* a printable puzzle — it just also launches the game |
 | Firmware update removes units | Same accepted failure mode as the existing install: revert to stock + SSH launch |
+
+## What shipped beyond this plan
+
+Two things forced changes this document did not anticipate, both found on
+the owner's own device rather than in review.
+
+- **The relaunch loop.** The first device run looked like a broken Quit: the
+  owner quit, and the game came right back. It was never a quit bug —
+  xochitl returns to the document it still has open, re-reads the PDF, and
+  the watcher's `IN_OPEN` fires again. Task 3's fix is above; the journal
+  line proving it holds is `swallowed: 1504ms since redoku was last seen
+  running, inside the 10000ms cooldown` (`device-latency-journal.txt`,
+  15:13:55).
+- **A `rm -rf` that could have deleted the owner's whole document store.**
+  Task 4's first review round (deliberately dispatched on a stronger model
+  because this is the one diff in the milestone that runs as root on the
+  owner's daily driver) found `install.sh`/`uninstall.sh` derived a delete
+  path from `watch.conf` with no shape check on the UUID; a malformed
+  `pdf=` line resolved to `rm -rf` on the entire xochitl documents
+  directory — reviewer-executed, not theoretical. Fixed the same round
+  (`looks_like_uuid`, both scripts). Recorded here because a milestone that
+  shipped a bug this severe, and then fixed it before it shipped to `main`,
+  is not a milestone to describe as trouble-free.
+- **A pre-existing, unrelated bug found on the way and deliberately left
+  alone.** `rm2fb.service`'s own `ExecStart` has the identical late-mount
+  race the watcher had (`203/EXEC` on boot, `RequiresMountsFor` is the
+  fix) — not introduced by M4, not fixed by M4, reported to the owner
+  instead. Full account: PLAN.md §11.
+- Both the installer's rollback and the watcher's crash-loop protection were
+  exercised for real, not just reasoned about: the owner's install rolled
+  back **twice** on the actual device (episode 1, then episode 2) before
+  episode 3 succeeded ("the installer now actually runs and works cleanly",
+  the owner's own words). The causes closed across Task 4's fix rounds
+  included a silent "xochitl isn't running" failure the verification step
+  itself was tripping over (round 1) and a `wait_for_active` check that was
+  first too eager to declare success and, after being fixed, briefly too
+  eager again in the opposite direction — caught by review before it shipped
+  (round 2's re-review), not by a third failed device install.
+
+## Known, deferred issues (parked minors)
+
+Found during review, not fixed, and not lost with the workspace. A final
+whole-branch review may triage or close these; until then they are
+known-and-deferred, not silently absent.
+
+**`mrbgems/mruby-rm2` (Task 1):**
+- `spawn.c:141-174` has three near-identical capture-errno/close/restore/fail
+  blocks that could share one helper.
+- `test/inotify.rb` / `test/spawn.rb` never clean up their
+  `/tmp/redoku-*-test*` fixture directories.
+- The fd-hygiene regression test's path-based tolerance would not catch a
+  future *path-backed* bookkeeping fd leaking across the exec (nothing in
+  the shim opens one today, so this is dormant).
+- The same test has a narrow TOCTOU window — a transient shell-startup pipe
+  still open at enumeration time would be wrongly flagged. Worth a looped
+  run of that one assertion before trusting it in CI.
+
+**`tools/mkdecoy.rb` (Task 2):**
+- `write_all` (`tools/mkdecoy.rb:389-390`) has no rescue around
+  `mkdir_p`/`File.write`, so an unwritable `--out` prints a Ruby backtrace
+  instead of a clean `mkdecoy:` error.
+
+**`mrbgems/mruby-redoku`'s watcher (Task 3, 8 items parked at completion):**
+- `Config` and the re-arm state machine in `watcher.rb` are two clean
+  extraction seams; the file's ~390-line size is real maintainability cost
+  that flagging did not fix.
+- No test exercises `Watcher#run` itself (an inverted loop condition would
+  only show on a first manual launch).
+- SIGHUP's "config re-read" log line reads as unconditional success
+  regardless of each role's `reconcile!` outcome.
+- A custom `game=` value is only ever exercised through `Config.parse`, not
+  through a live trigger.
+- `reconcile!(:pdf); reconcile!(:metadata)` is repeated verbatim three
+  times.
+- `note_redoku_presence` polls `RM2::Control.clients` once per tick forever
+  after the first spawn, and each call can block up to 2 s
+  (`SO_RCVTIMEO` in `control.c`), stretching SIGTERM/SIGHUP latency.
+- The child-registration race (a demoted xochitl bumping `lastOpened` while
+  the game holds the panel) is self-limiting by construction but untested.
+- `retry_pending_rearms`'s recovery path does not carry the "died" hint the
+  way the direct re-arm path does, so a re-arm that only succeeds on a later
+  retry loses it — judged essentially unreachable under the shipped
+  `trigger=open` default, since the pdf's own `IN_OPEN` carries the launch
+  either way, but not proven unreachable.
+- Cross-cutting, found by the controller rather than a task reviewer: a
+  `watch.conf` with two `pdf=` lines makes the install/uninstall shell
+  scripts take the **first** line and `watch_config.rb` take the **last**,
+  so a corrupted config could point the installer and the watcher at
+  different paths. Corrupt-config-only; not exercised by any test.
+
+**`device/install.sh` / `device/uninstall.sh` (Task 4, 4 minors parked + 1
+pre-existing at completion):**
+- `install.sh:633`'s SUCCESS summary attributes every non-started watcher to
+  "(no game binary yet)", which is no longer true for two newer failure
+  paths.
+- `FINISHED=1` is set before `rollback` runs, so a second Ctrl-C during
+  rollback truncates it (closing this needs `trap '' INT TERM HUP` as
+  `finish()`'s first statement).
+- `uninstall.sh:222-228`'s final sweep neither verifies nor reports,
+  unlike the same file's own pattern elsewhere.
+- `install.sh:570` announces the watcher wait before the restart that may
+  fail.
+- Pre-existing, widened rather than caused by this milestone's new signal
+  traps: unguarded `rm`s and a `daemon-reload` inside `rollback()` under
+  `set -e`, so a failing `daemon-reload` stops rollback after its first
+  line.
+- Also open, not a defect: `systemctl show -p` is not among the subcommands
+  verified against this specific firmware — if unsupported, every
+  `wait_for_active` sample reads "keep waiting" and the first wait burns its
+  full budget before rolling back. Fail-safe either way; a one-line
+  on-device probe would settle it. And signal-delivery *responsiveness*
+  under BusyBox ash (how fast a blocked `sleep`/`systemctl` actually reacts
+  to a trapped signal) could not be measured off-device; the trap logic
+  itself was verified, its timing was not.
 
 ## Explicitly out of scope (unchanged parking lot)
 

@@ -808,20 +808,83 @@ on the glass needs `GL16` for that region (`App#flush_ink` says so at the
 point of choice). Erase behaviour on the device is manual-verify only,
 permanently — see §9.
 
-**M4 — the hijack.** Decoy document (`tools/mkdecoy.rb` generates the PDF +
-`{uuid}.metadata`/`.content`, installed by script, one xochitl restart to
-index). `redoku-watcher.service`: inotify `IN_OPEN` on the decoy's `.pdf`
-content file, 5 s debounce, spawn game (its `Init` takes the screen
-automatically). Quit: the game closes its display connection and exits, and
-the server promotes the next client — which is xochitl. It must NOT
-`switch_to` xochitl's pid: the server SIGSTOPs the whole process group of the
-client it demotes, so a live client that switches away from itself freezes
-inside the call and never reaches its exit path (see §3's process-lifecycle
-contract, `src/control.c`'s header, and `mruby-rm2/README.md`). `GetClients`
-stays useful for the watcher's "is the game already a client" check, not for
-handing the panel back. Fallback if `IN_OPEN` proves noisy or
-cached-away on 3.27: watch the decoy's `.metadata` for `lastOpened` writes
-(`IN_CLOSE_WRITE`) instead — verified empirically in M4's first task.
+**M4 — the hijack. Shipped 2026-08-27** (`M4-HIJACK.md`; commits
+`7ae3a28`..`43b1633`). Decoy document: `tools/mkdecoy.rb` generates a real,
+uniquely-solvable Sudoku PDF plus xochitl's sidecars from a **fixed UUID
+constant**, so a re-install regenerates byte-identical files instead of
+depositing a second decoy into the library on every run. **This section
+used to call the decoy's files a "trio" in a "line-based format"; both were
+guesses and both were wrong.** A PDF document on 3.27.3.0 is **five**
+filesystem entries (`.pdf`, `.metadata`, `.content`, `.pagedata`, and an
+empty per-page ink directory — a sixth, `.thumbnails/`, is xochitl's own to
+create on first open), and `.metadata`/`.content` are **JSON**, not
+line-based. The measured, corrected format — field by field, and why an
+earlier summary of the same device dump got the JSON's array formatting
+wrong — is [`docs/design/m4-decoy-format.md`](docs/design/m4-decoy-format.md);
+`M4-HIJACK.md`'s Task 2 keeps the original wrong wording on record with the
+correction next to it, this repo's habit for a plan caught wrong rather than
+silently rewritten.
+
+`redoku-watcher.service` runs `redoku --watch`
+(`mrbgems/mruby-redoku/mrblib/redoku/watcher.rb` + `watch_config.rb`), built
+on two shim primitives new to M4: `RM2::Inotify` (host-tested against a real
+kernel inotify fd — no fake needed, the Docker container is Linux) and
+`RM2.spawn_detached` (a double fork that puts the game in its own session
+and process group before it ever execs, so the display server's SIGSTOP of
+a demoted client can never freeze the watcher along with it, leaves no
+zombie, and raises `SystemCallError` on the child's own `errno` if `exec`
+fails — `mruby-rm2/README.md`). Quit: the game closes its display connection
+and exits, and the server promotes the next client — which is xochitl. It
+must NOT `switch_to` xochitl's pid: the server SIGSTOPs the whole process
+group of the client it demotes, so a live client that switches away from
+itself freezes inside the call and never reaches its exit path (see §3's
+process-lifecycle contract, `src/control.c`'s header, and
+`mruby-rm2/README.md`). `GetClients` stays useful for the watcher's "is the
+game already a client" check, not for handing the panel back.
+
+**This section's trigger claim was also wrong, and is corrected in place
+rather than silently fixed.** It used to say the trigger was `IN_OPEN` with
+a `.metadata` fallback "verified empirically in M4's first task." Neither
+half held: the device was unreachable when that task ran, so **both**
+triggers shipped rather than one chosen by guesswork, and the empirical
+answer came from the device itself — across three later, unplanned device
+episodes — not from Task 1. What was actually measured
+(`device-watcher-journal.txt` and `device-latency-journal.txt`, captured
+into `.superpowers/sdd/M4-HIJACK/`, a git-ignored workspace deleted with the
+milestone, so the numbers are recorded here instead): `IN_OPEN` on the
+decoy's `.pdf` fires at the instant of a tap, every time — but it also fires
+with **no tap at all**, on every boot, because xochitl reads the decoy while
+restoring its last-open document. Gating the launch on the `.metadata`
+sidecar's `lastOpened` field instead avoids that false trigger structurally,
+but xochitl writes `lastOpened` at open time and flushes the file to disk
+**lazily** — measured at **13 s and 54 s** after two separate taps, read
+straight out of the recorded millisecond timestamp. That is up to nearly a
+minute of the owner staring at a static PDF, to guard against a hazard a 10 s
+startup grace and a cooldown already close on their own: the same captures
+show the grace alone swallowing the boot-time phantom
+(`swallowed: 9190ms … startup grace`) and a suppress-until-the-game-is-gone
+rule plus a 10 s cooldown alone swallowing the post-quit relaunch loop
+twice (`swallowed: 1504ms …` and, at the next tap, `1800ms … cooldown`). So
+the shipped default is
+**`trigger=open`** — the raw `IN_OPEN` event, wearing those guards — and
+`trigger=lastopened` stays selectable in `watch.conf` for a firmware that
+flushes eagerly.
+
+**The relaunch loop, once diagnosed, was never a Quit bug.** The first
+device run looked like one: the owner quit, and the game came right back.
+What actually happened is xochitl returning to the document it still has
+open, re-reading the PDF, and the watcher's `IN_OPEN` firing again — a fresh
+open long after the original 5 s debounce window, which is why the debounce
+alone never caught it. The suppress-plus-cooldown rule above is what closed
+it, confirmed on the device by the journal line quoted above.
+
+**Device verification is partial, stated plainly so nothing here reads as
+witnessed that was not** (M4-HIJACK.md's Task 5 has the full list):
+witnessed are the installer completing cleanly, a tap launching the game,
+Quit handing the panel back, the boot phantom being swallowed, and the
+relaunch loop being swallowed. **Not yet witnessed, at any point in M4:**
+the pen drawing through a spawned (not SSH-launched) game, the watcher being
+killed mid-play, and a battery pull during play.
 
 **v2 parking lot (explicitly out of scope):** live per-stroke digit
 recognition (the pre-2026-08-25 model — superseded by §6's batch-at-CHECK),
@@ -842,10 +905,48 @@ left the lot for M3a — see
   state restored on next launch.
 - **Recognition ambiguity**: never guess silently — reject-flash and let the
   user rewrite. Tunable thresholds live in one Ruby constants file.
-- **Watcher re-trigger loop**: debounce + "is the game already a client"
-  check via `GetClients`.
+- **Watcher re-trigger loop**: the plan's original single line here — "debounce
+  + is the game already a client check via `GetClients`" — undersold what M4
+  actually needed. Two distinct loops showed up on the device (§10): a
+  boot-time phantom launch, closed by a 10 s startup grace, and a post-quit
+  relaunch loop (Quit looked broken; it was xochitl re-reading its still-open
+  document), closed by a suppress-until-the-game-is-gone rule plus a 10 s
+  cooldown. `GetClients` still backs the "already running" check the plan
+  describes, but the grace and the cooldown are what actually stop the
+  loops — both measured working on hardware, not just reasoned about (§10).
+- **`rm2fb.service`'s boot-time mount race — found during M4, not M4's own
+  defect, and deliberately left unfixed pending the owner's review.**
+  `/home/root` is a separate partition (`/dev/mmcblk2p4`) that is not
+  guaranteed mounted when systemd first runs a unit's `ExecStart` at boot.
+  `redoku-watcher.service` hit exactly this as `203/EXEC` on every boot,
+  self-healing ~8 s later only because `Restart=on-failure` happened to
+  retry after the mount caught up — fixed with
+  `RequiresMountsFor=/home/root/redoku` (`device/redoku-watcher.service`).
+  `rm2fb.service`'s own `ExecStart`
+  (`/home/root/redoku/bin/rm2fb_server_swtcon`, written by `device/install.sh`)
+  sits on the same partition and carries the identical race, and it predates
+  M4 — this milestone only made it visible. Its symptom is worse than the
+  watcher's, and can be silent: one observed boot came up with xochitl
+  running **without** `LD_PRELOAD` while rm2fb held the panel, leaving the
+  tablet on a frozen splash with every systemd unit reporting healthy. The
+  fix, when reviewed, is the identical one-liner:
+  `RequiresMountsFor=/home/root/redoku` on `rm2fb.service`.
 - **Firmware update pressure**: auto-update is off; `install.sh` warns if
   `/etc/version` ≠ 3.27.3.0 (drift detection after any manual update).
+- **xochitl rewrites its own `.content`/`.pagedata` sidecars from its
+  in-memory model when it exits.** Deleting the decoy while xochitl is still
+  running and then restarting it can resurrect exactly what was just
+  deleted, because the shutdown flush lands after the delete but before the
+  new process scans the library. Learned the hard way during M4's device
+  episodes and now handled by a restart-detect-restart-again sequence in
+  both `device/install.sh` and `device/uninstall.sh` (search either for
+  "resurrect").
+- **Stopping xochitl over SSH severs SSH-over-USB.** `systemctl stop
+  xochitl.service` (not `restart`) kills the session issuing the command —
+  port 22 refuses instantly — taking the rest of the script down with it and
+  leaving xochitl stopped until a power cycle. Found on-device during M4;
+  neither install nor uninstall scripts ever `stop` xochitl for this reason
+  (search either for "SSH-over-USB").
 
 ## 12. Sources
 
