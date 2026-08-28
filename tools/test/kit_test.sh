@@ -3647,6 +3647,87 @@ test_artifact_trust_fails_closed() {
   assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
     "trust gate: (g) nothing reached the device" || return 1
   chmod 755 "$_sub/build"
+
+  # (h) THE ANCHOR. Everything above walks up to $REPO, which happens to equal
+  # $KIT_ROOT — so handing the walk $KIT_ROOT instead of the trust anchor is
+  # invisible to all of them. It is not invisible after a DOWNLOAD: $KIT_ROOT
+  # is reassigned to the unpacked version directory, so a walk bounded by it
+  # starts and finishes inside that tree and never sees build/download/ or any
+  # other ancestor. This is a real checkout with only build/download exposed,
+  # which is exactly the shape that ran a planted device/install.sh as root.
+  _co=$_w/checkout
+  mkdir -p "$_co/bin" "$_co/device" "$_co/build/download/v0.1.0"
+  cp "$_kit/v0.1.0/bin/redoku" "$_co/bin/redoku"
+  chmod +x "$_co/bin/redoku"
+  cp -R "$_kit/v0.1.0/device/." "$_co/device/" || \
+    die "test_artifact_trust_fails_closed: seeding the checkout failed"
+  cp -R "$_kit/v0.1.0/." "$_co/build/download/v0.1.0/" || \
+    die "test_artifact_trust_fails_closed: seeding the downloaded tree failed"
+  # mkkit's layout puts the tree one level down; mirror what fetch_kit writes.
+  mkdir -p "$_co/build/download/v0.1.0/redoku"
+  cp -R "$_kit/v0.1.0/." "$_co/build/download/v0.1.0/redoku/" || \
+    die "test_artifact_trust_fails_closed: seeding the inner tree failed"
+  chmod 1777 "$_co/build/download"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  assert_fails "trust gate: (h) an exposed ancestor above \$KIT_ROOT is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" REDOKU_BASE_URL="file://$_w/nowhere" \
+      REDOKU_VERSION=v0.1.0 "$KIT_SH" "$_co/bin/redoku" install --download \
+      --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "or a directory on the way to it" \
+    "trust gate: (h) the walk reached above \$KIT_ROOT to the trust anchor" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "trust gate: (h) nothing reached the device" || return 1
+  chmod 755 "$_co/build/download"
+
+  # (i) a DOWNLOAD that reaches the device. Every other test here is `own`, and
+  # every download test in the suite stops at connect() before push_file — so
+  # the anchor recorded for `verified` was exercised by nothing at all, and
+  # deleting it left the suite green while a real download-then-push would
+  # refuse every artifact (the walk, given no anchor, runs to / and fails
+  # closed). This is the case that pins it.
+  _dlkit=$_w/dlkit
+  mkdir -p "$_w/release/download/v0.1.0" "$_w/release/latest"
+  cp "$_w/out/redoku-rm2.tar.gz" "$_w/out/redoku-rm2.tar.gz.sha256" \
+     "$_w/out/redoku" "$_w/out/redoku.sha256" "$_w/release/download/v0.1.0/" || \
+    die "test_artifact_trust_fails_closed: cp release assets failed"
+  ln -s ../download/v0.1.0 "$_w/release/latest/download"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  # The run itself ends non-zero: write_fake_ssh deliberately stubs only the
+  # on-device UNinstaller, so the real device/install.sh is reached and fails
+  # off-device. That is past every push, which is what this case is about — so
+  # what is asserted is that the artifacts LANDED, not the exit code.
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_w/fakebin:$PATH" HOME="$_home" \
+    REDOKU_BASE_URL="file://$_w/release" "$KIT_SH" "$_kit/current/bin/redoku" \
+    install --download --kit "$_dlkit" --no-symlink --host nowhere --yes \
+    < /dev/null 2>&1)
+  set -e
+  case $ASSERT_OUTPUT in
+    *"or a directory on the way to it"*|*"nothing in this run established"*)
+      printf 'FAIL: trust gate: (i) a verified download was refused by its own gate\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_file "$_w/device-root/install.sh" \
+    "trust gate: (i) the artifacts a verified download vouched for are pushed" || return 1
+  assert_file "$_w/device-root/bin/rm2fb_server_swtcon" \
+    "trust gate: (i) including the binaries" || return 1
+
+  # (j) the artifact FILE itself is world-writable, in a sane directory. The
+  # walk looks at directories; without checking the file too, a 0666
+  # uninstall.sh in a 0755 device/ sailed through.
+  chmod 0666 "$_sub/device/uninstall.sh"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  assert_fails "trust gate: (j) a world-writable artifact FILE is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_sub/bin/redoku" \
+      uninstall --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "or a directory on the way to it" \
+    "trust gate: (j) refused on the file's own mode" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "trust gate: (j) nothing reached the device" || return 1
+  chmod 0644 "$_sub/device/uninstall.sh"
 }
 
 # Final verification V-1 (critical): §6.3's reuse gate adopted an
