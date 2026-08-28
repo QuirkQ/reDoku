@@ -443,7 +443,7 @@ connect() {
     die "could not connect to $TARGET
   - ssh config 'Host' blocks match the name you dial: if your config has
     the device under an alias, pass that alias too, e.g.:
-      bin/redoku $CMD --ssh-config $SSH_CFG --host <alias>
+      $(cli_name) $CMD --ssh-config $SSH_CFG --host <alias>
   - Or drop --ssh-config to use plain password auth over USB."
   fi
   die "could not connect to $TARGET
@@ -2476,7 +2476,7 @@ cmd_play() {
        'systemctl is-active rm2fb.service 2>/dev/null || true' \
        | tr -d '[:space:]')" != active ]; then
     say "WARNING: rm2fb.service is not active — the game cannot draw."
-    say "         Install the display server first:  bin/redoku install"
+    say "         Install the display server first:  $(cli_name) install"
   fi
 
   if [ -z "$PLAY_SECS" ]; then
@@ -2567,7 +2567,7 @@ cmd_play() {
   was ignoring the signal, the display server had it stopped and even SIGCONT
   did not get it to quit, or it was stuck in a display read for longer than the
   connection's own 10 s receive timeout. The panel is back either way;
-  'bin/redoku status' says what is running now." ;;
+  '$(cli_name) status' says what is running now." ;;
     *)     die "the game exited $_rc — its output above says why" ;;
   esac
 }
