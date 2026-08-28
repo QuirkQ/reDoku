@@ -517,9 +517,18 @@ below it; *"There are no prebuilt downloads yet"* goes. Add an honest
 paragraph: the checksum lives in the same release as the tarball, so it proves
 the bytes arrived intact, not that the release is authentic — a compromised
 account could publish both halves. The 32-bit-ARM-ELF gate **[src]** still
-checks every byte before it leaves the host. Document the no-pipe alternative
-(`curl -O` the CLI, verify it by hand, run it) for anyone who would rather
-read the script first, and `uninstall --self` for removal.
+runs against every binary before it leaves the host — but it must not be
+described as checking every *byte* of one, which an earlier draft of this
+section did. `is_arm_elf` reads bytes 0-4 (the ELF magic plus `ELFCLASS32`)
+and bytes 18-19 (`e_machine` = `EM_ARM`), and nothing else: a 20-byte file
+carrying only those two fields passes it, measured against the predicate as
+written. The gate therefore catches a host build or a wrong-arch binary and
+cannot catch a truncated one — which is precisely why `kit_tree_is_complete`
+checks files spread across the whole tree rather than a prefix of it, and why
+the checksum, not the gate, is what stands behind the bytes. The README
+paragraph must claim no more than that. **[test]** Document the no-pipe
+alternative (`curl -O` the CLI, verify it by hand, run it) for anyone who
+would rather read the script first, and `uninstall --self` for removal.
 
 **`bin/redoku`'s header** — its "Run it from a reDoku checkout" and "Your
 `~/.ssh/config` is IGNORED" block **[src]** gains the kit story; `--help`
