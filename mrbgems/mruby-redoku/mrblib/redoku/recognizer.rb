@@ -23,19 +23,51 @@ module Redoku
     SHAPE   = 8           # aspect, subpaths, reversals, spread, start, end
     SIZE    = DENSITY + SHAPE
 
-    # Tuned in Task 11 against recorded human clouds. These bootstrap
-    # values are set from the authored set only and are deliberately
-    # STRICT, per spec §5: a false '?' costs the player one rewrite, while
-    # a guess that happens to match the solution is a false win they can
-    # neither see nor undo.
-    ACCEPT_MAX = 450      # best squared distance must be under this
-    # 900 admitted a crossing scribble (X plus bars, the shape an unreadable
-    # verdict exists for) at d=491 to the authored 7 — inside the old bar
-    # with margin to spare. Every authored variant matches at d=0 with the
-    # worst different-digit runner-up at 749, so the bar comes down to 450:
-    # still generous for hand ink, but past it a cell is a '?' rather than a
-    # lucky guess. Tuned again in Task 11 against recorded human clouds.
+    # Set from the authored set only, and deliberately STRICT per spec §5: a
+    # false '?' costs the player one rewrite, while a guess that happens to
+    # match the solution is a false win they can neither see nor undo.
+    #
+    # BOTH ARE ON THE SCALE `distance` PRODUCES, so neither means anything
+    # once that function changes — which is exactly what happened on
+    # 2026-08-28 and is why ACCEPT_MAX moved with it. Re-measure both anchors
+    # (the nearest junk, and where real ink lands) after any change to
+    # features, resample or distance.
+    ACCEPT_MAX = 350      # best squared distance must be under this
+    # THE ANCHOR HAS ALWAYS BEEN ONE SHAPE: the crossing scribble (an X plus
+    # a plus — what test/app.rb's scribble_in_cell draws, and the shape the
+    # unreadable verdict exists for). 900 was the drafted bar and admitted it
+    # at d=491 to the authored 7, which would have made '?' unreachable, so
+    # the bar came down to 450 with 41 points of clearance.
+    #
+    # 450 became WRONG when the resampling fix landed (2026-08-28, see
+    # along_path): distances collapsed by 3-6x across the board, because the
+    # old index resampling was inflating every comparison. On the corrected
+    # scale that same scribble sits at d=370 — inside 450 — and pen-sampled
+    # authored digits sit at a median of 37, so the identical piece of
+    # reasoning now gives 350, with 20 points of clearance under the
+    # scribble.
+    #
+    # It costs nothing measurable: over 105 pen-sampled samples per regime,
+    # 450 -> 350 leaves clean at 100%, ±2 px tremor at 100% and ±4 px tremor
+    # at 99%, and takes the deliberately-harsh slant-plus-anisotropic-scale
+    # regime from 90% to 88%. Below 350 that last regime falls away fast
+    # (320 -> 84%, 300 -> 79%) and refuses no junk that 350 does not.
+    #
+    # MARGIN_MIN is left alone, because this scribble is not a margin case:
+    # its runner-up is a 4 at d=1117, so it leads by 747 and only the
+    # distance bar can refuse it. Real digits' margins are a median of 743
+    # with 5% under 220 — which is the conservatism spec §5 asks for, and
+    # the reason nothing in these sweeps MISREADS rather than refusing.
     MARGIN_MIN = 220      # runner-up must exceed the best by this
+    # Both are still bootstrap values, and Task 11's recorded human clouds
+    # are still what should set them: every number above comes from one
+    # author's templates plus modelled distortion, not from a player's hand.
+
+    # The smallest axis step `reversals` will read a DIRECTION off, in the
+    # normalised 0..255 frame — anything under it is sampling noise rather
+    # than a turn. See reversals for the measurement that set it and for why
+    # the feature is kept with a deadband rather than dropped.
+    TURN_MIN = 12
 
     def self.read(strokes)
       live = playable(strokes)
@@ -116,17 +148,8 @@ module Redoku
     # bounding box width can be a single pixel, and dividing by it would
     # blow the shape up to nonsense.
     def self.resample(strokes, n)
-      flat = []
-      strokes.each { |s| s[:subpaths].each { |sub| sub.each { |p| flat << p } } }
-      # A release packet repeats the last position (see App#end_stroke), so
-      # every captured stroke ends in a zero-length segment — and spread_evenly
-      # below picks by INDEX, where one duplicated point distorts the whole
-      # resampled cloud. Drop consecutive duplicates: a zero-length segment
-      # carries no shape information and replays as a line of no length.
-      clean = []
-      flat.each { |p| clean << p if clean.empty? || clean[-1] != p }
-      return nil if clean.empty?
-      pts = spread_evenly(clean, n)
+      pts = along_path(strokes, n)
+      return nil if pts.nil?
       min_x = min_y = max_x = max_y = nil
       pts.each do |x, y|
         if min_x.nil?
@@ -154,19 +177,94 @@ module Redoku
       out
     end
 
-    # Picks n points evenly by INDEX, not by arc length. Arc-length
-    # resampling is the textbook step and is skipped deliberately: the
-    # digitizer already reports at a near-constant rate, so index spacing
-    # approximates it closely, and the exact version costs a full
-    # path-length pass plus an interpolation per point. If Task 11's
-    # accuracy falls short, this is the first thing to upgrade.
-    def self.spread_evenly(flat, n)
-      return flat.dup if flat.size == n
+    # n points spaced evenly ALONG THE DRAWN PATH — by arc length, with a
+    # real interpolation between the two vertices each one falls between.
+    #
+    # THIS IS THE FIX FOR "recognition is really weak" (owner report,
+    # 2026-08-28), and the old version is worth stating because the bug is
+    # not obvious: it picked n points by INDEX out of the vertex list
+    # (`flat[i * (flat.size - 1) / (n - 1)]`), on the argument that the
+    # digitizer reports at a near-constant rate so index spacing approximates
+    # arc length. That argument holds for pen input and fails completely for
+    # the AUTHORED templates, which are 2 to 9 vertices, not hundreds of
+    # samples: picking 32 points by index out of a 2-point line returns the
+    # first vertex THIRTY-ONE times and the second once. So a template's
+    # feature vector was a histogram of its vertices, while live ink's was a
+    # histogram of its path, and the two are not comparable — the authored
+    # `1` scored d=2032 against the same straight line sampled the way a pen
+    # samples it, 4.5x over ACCEPT_MAX, for an IDENTICAL shape.
+    #
+    # Measured on the host (mrbgems/mruby-redoku/test/recognizer.rb's
+    # pen-sampled sweeps, and see the MEASURE block for the running numbers):
+    # authored templates delivered as pen samples read 14/21 before this and
+    # 21/21 after. The suite could not see it because the corpus WAS the
+    # templates: both sides of every comparison went through the same broken
+    # step, so every template matched itself at d=0 and the file measured
+    # 100%. The tests added with this fix feed pen-sampled ink for exactly
+    # that reason.
+    #
+    # `spread_evenly` (the old name) is gone rather than kept alongside: it
+    # had one caller and its comment named this upgrade as the thing to do
+    # "if Task 11's accuracy falls short", which is what happened.
+    #
+    # SUBPATH GAPS ARE NOT PATH. Only within-subpath segments become
+    # segments here, so a digit written as two strokes never receives sample
+    # points along the pen-up jump between them — the same rule
+    # Ink.path_length states ("bridging it would invent travel the pen never
+    # made"). It also subsumes the old dedup pass: a release packet repeats
+    # the last position (App#end_stroke), which is a zero-length segment, and
+    # `len > 0` drops it.
+    #
+    # Cost: one Math.sqrt per input segment, the same pass `playable` already
+    # runs through Ink.path_length, plus two multiplies and a divide per
+    # output point. Against ~1.1k operations per cell (PLAN.md §6) that is
+    # noise, and it buys the accuracy above.
+    def self.along_path(strokes, n)
+      segs = []
+      total = 0
+      strokes.each do |s|
+        s[:subpaths].each do |sub|
+          i = 1
+          while i < sub.size
+            a = sub[i - 1]
+            b = sub[i]
+            dx = b[0] - a[0]
+            dy = b[1] - a[1]
+            len = Math.sqrt(dx * dx + dy * dy).to_i
+            if len > 0
+              # Each segment carries the arc length BEFORE it, so the walk
+              # below can seek by comparison instead of re-accumulating.
+              segs << [a, b, len, total]
+              total += len
+            end
+            i += 1
+          end
+        end
+      end
+      # Nothing that moved a whole pixel: a knuckle, or a stroke that begins
+      # and ends on the same point. read()'s dot guard normally answers this
+      # first (Ink::MIN_PATH), and nil says the same thing one layer down
+      # rather than dividing by a zero length.
+      return nil if segs.empty?
+      # Seek rather than accumulate: `want` is computed from the total, so
+      # rounding cannot drift over 32 steps the way `+= step` would. The
+      # denominator is clamped because n = 1 asks for "one point" and would
+      # otherwise divide by zero; POINTS is 32 and nothing calls it with 1.
+      den = n - 1
+      den = 1 if den < 1
       out = []
-      i = 0
-      while i < n
-        out << flat[i * (flat.size - 1) / (n - 1)]
-        i += 1
+      k = 0
+      si = 0
+      while k < n
+        want = total * k / den
+        si += 1 while si < segs.size - 1 && segs[si + 1][3] <= want
+        seg = segs[si]
+        a = seg[0]
+        b = seg[1]
+        t = want - seg[3]
+        out << [a[0] + (b[0] - a[0]) * t / seg[2],
+                a[1] + (b[1] - a[1]) * t / seg[2]]
+        k += 1
       end
       out
     end
@@ -206,6 +304,25 @@ module Redoku
     # How often the path doubles back. A 1 barely turns; an 8 turns
     # constantly. Counted on the sign of each axis delta rather than on an
     # angle, because atan2 per point is dear and the sign is enough.
+    #
+    # TURN_MIN is what makes that true of REAL ink, and it is the second half
+    # of the 2026-08-28 accuracy fix. Ink arrives as integer panel pixels
+    # (App#note_ink records every sample verbatim), so on a near-vertical
+    # stroke dx is not "about zero" — it is quantisation and hand tremor, and
+    # its SIGN is therefore noise that flips on about half of the steps. With
+    # no deadband a hand-drawn 1 scored 204 on this feature where its
+    # template scores 0, contributing 1734 of a total distance of 1740: this
+    # one feature spent the whole ACCEPT_MAX budget four times over on noise.
+    # Measured over the pen-sampled corpus with ±2 px of tremor: 59% correct
+    # at deadband 0, 100% at 12 (and 100% at 8 and 16 too — 12 is the middle
+    # of a plateau, not a knife edge).
+    #
+    # DELETING the feature reaches the same accuracy on digits (126/126 either
+    # way over the clean and ±2 px sweeps) and is still the wrong fix, because
+    # turn count is precisely what tells a scribble from a digit: drop it and
+    # ACCEPT_MAX's own anchor scribble falls from d=370 to d=220 and reads as
+    # a 7. The deadband keeps the signal and throws away the noise; deleting
+    # the feature throws away both.
     def self.reversals(pts)
       n = 0
       last_sx = 0
@@ -214,8 +331,8 @@ module Redoku
       while i < pts.size
         dx = pts[i][0] - pts[i - 1][0]
         dy = pts[i][1] - pts[i - 1][1]
-        sx = dx > 0 ? 1 : (dx < 0 ? -1 : 0)
-        sy = dy > 0 ? 1 : (dy < 0 ? -1 : 0)
+        sx = dx > TURN_MIN ? 1 : (dx < -TURN_MIN ? -1 : 0)
+        sy = dy > TURN_MIN ? 1 : (dy < -TURN_MIN ? -1 : 0)
         n += 1 if sx != 0 && last_sx != 0 && sx != last_sx
         n += 1 if sy != 0 && last_sy != 0 && sy != last_sy
         last_sx = sx if sx != 0

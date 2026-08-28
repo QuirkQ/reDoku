@@ -374,13 +374,34 @@ What actually runs per inked cell when CHECK fires:
    old "fully inside" guard contradicted it; digits written slightly over a
    cell line are normal handwriting on a 140 px cell, and the guard would
    have silently discarded exactly those).
-2. Normalise: resample the combined cloud to 32 points, scale uniformly by
-   the larger bounding-box side (aspect preserved — it separates 1 from 7;
-   the near-vertical "1" is guarded against divide-by-tiny width),
-   translate the box to origin.
+2. Normalise: resample the combined cloud to 32 points spaced evenly **by arc
+   length along the drawn path**, scale uniformly by the larger bounding-box
+   side (aspect preserved — it separates 1 from 7; the near-vertical "1" is
+   guarded against divide-by-tiny width), translate the box to origin.
+   Subpath gaps are not path: a two-stroke digit gets no sample points along
+   the pen-up jump, the rule `Ink.path_length` already states.
+   **This said "resample to 32 points" until 2026-08-28 and the code picked
+   them by INDEX**, on the argument that the digitizer reports at a
+   near-constant rate so index spacing approximates arc length. True of pen
+   input, false of the authored templates, which are 2-to-9-vertex polylines:
+   32 points picked by index out of a 2-point line is the first vertex 31
+   times. So a template's vector was a histogram of its vertices while live
+   ink's was a histogram of its path, and the authored `1` scored d = 2032
+   against the same straight line pen-sampled — 4.5× over ACCEPT_MAX, for an
+   identical shape. That is what "the recognition is really weak" was.
+   Corrected here rather than annotated below, because the sentence describes
+   the algorithm rather than arguing for it.
 3. Reduce to a fixed integer vector: 16 ink-density boxes (4×4) plus 8 shape
    features — aspect, stroke count, direction reversals, spread, and the
-   START and END points of the resampled cloud. That is **24 integers**, each
+   START and END points of the resampled cloud. Reversals reads a direction
+   only off a step larger than `TURN_MIN` (12 in the normalised 0..255
+   frame), which is the second half of the same fix: ink arrives as integer
+   panel pixels, so on a near-vertical stroke dx is quantisation noise whose
+   SIGN flips on half the steps, and a hand-drawn 1 scored 204 on this
+   feature against its template's 0 — one feature spending four ACCEPT_MAX
+   budgets on noise. Dropping the feature reaches the same accuracy on digits
+   and is the wrong fix: turn count is what refuses a scribble, which then
+   reads as a 2. That is **24 integers**, each
    scaled 0..255 so the squared distance stays inside mruby's fixnum range on
    32-bit ARM. The start/end features were added when the authored 3 and 5
    collided below MARGIN_MIN on silhouette alone — both are S-curves of near
@@ -393,11 +414,28 @@ What actually runs per inked cell when CHECK fires:
    runner-up digit by MARGIN_MIN; otherwise the cell reads *unreadable* —
    corner `?`, ink kept — and not "marked wrong like any other mismatch",
    which is what this plan used to say. Spec §2's verdict table governs.
-   Shipped thresholds are **ACCEPT_MAX = 450 / MARGIN_MIN = 220**: 900 was
+   Shipped thresholds are **ACCEPT_MAX = 350 / MARGIN_MIN = 220** (450 until
+   2026-08-28 — see the annotation below): 900 was
    the drafted bar until a crossing scribble scored d = 491 inside it, which
    would have made the unreadable verdict unreachable, so the bar came down
    and the authored corpus re-measured identically (STAGE1 total=84
-   right=84 refused=0 misread=0 accuracy=100%). The recognized digit lands
+   right=84 refused=0 misread=0 accuracy=100%).
+   **That 100% was worthless, and ACCEPT_MAX is now 350** (2026-08-28). The
+   corpus WAS the template set, so both sides of every comparison went
+   through the identical pipeline and every template matched itself at
+   d = 0 — a number that cannot fall however broken the pipeline is. Feeding
+   the same shapes as a pen delivers them measured **53%**, all of the loss
+   refusals. Fixing that (steps 2 and 3) collapsed every distance by 3–6×,
+   because the old resampling was inflating them all, which *invalidated the
+   bar rather than the reasoning behind it*: the anchor scribble that scored
+   491 against the drafted 900 now scores **370**, inside 450, so the same
+   argument gives 350 — 20 points of clearance under it, against a
+   pen-sampled median of 37 for real digits. The cost of the move is 100%
+   clean / 100% at ±2 px tremor / 99% at ±4 px unchanged, and 90% → 88% on a
+   deliberately harsh slant-plus-anisotropic regime. MARGIN_MIN stays at 220:
+   that scribble leads its runner-up by 747, so only the distance bar can
+   refuse it. The suite prints both lines now (`STAGE1 vertices` and `STAGE1
+   pen`); only the second one is accuracy. The recognized digit lands
     in the game record's `entries` column (the column M3a future-proofed),
     so the check result is itself persisted and re-checkable without
     re-recognizing.
@@ -792,6 +830,27 @@ Split into two slices:
   and §9's corpus split train/holdout, and the thresholds are re-tuned
   against the holdout. Until then every accuracy number here describes one
   hand's authored templates plus jitter, not a player's writing.
+
+  **That decision gate was measured wrong, and the sentence above stands as
+  written for the record** (found 2026-08-28, when the owner played it on the
+  device and reported the recognition "really weak"). The 100% was the
+  template set graded against itself, which the pipeline's own defect could
+  not fail; pen-sampled it was 53%. Two pipeline bugs, both fixed in §6's
+  steps 2 and 3 — index resampling and a noise-sensitive turn count. Neither
+  threshold was the cause, but ACCEPT_MAX moved to **350** as a consequence:
+  the fix changed the scale the bar is denominated in, and a bar means
+  nothing apart from its distance function (§6 step 5).
+  Pen-sampled accuracy over the same
+  corpus is now 100% (0 misreads) with ±2 px of tremor, and the suite prints
+  that line rather than only the self-graded one. **What this does NOT fix:
+  stroke order and direction.** §6 records that trade, and it is now
+  measured: of eight plausible unauthored ways to write a digit, four read
+  (a slanted serif-less 1, a 9 as loop-then-tail, a flat-bottomed 2, a tight
+  6) and four refuse (a 7 whose diagonal is drawn upward, a 4 with the
+  vertical first, a 5 with a separate top bar, an 8 as two circles) — all
+  refusals, no misreads. That is template coverage, not the matcher, and
+  `--record` is still the answer to it. Task 11 remains open for exactly the
+  reason it was opened.
 
 **Erase is off that list, and was M3's before it.** The pen's own eraser end
 landed on main on 2026-08-24, between M2 and M3, and supersedes the
