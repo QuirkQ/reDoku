@@ -90,8 +90,9 @@ code in here.
   describe authored templates, not a stranger's handwriting.
 - **Three device checks were never witnessed.** The pen drawing through a
   tap-launched game rather than an SSH-launched one, the watcher being killed
-  mid-play, and a battery pull during play. [M4-HIJACK.md](M4-HIJACK.md) keeps
-  the full ledger of what was and wasn't seen on hardware.
+  mid-play, and a battery pull during play.
+  [docs/plans/2026-08-27-m4-hijack.md](docs/plans/2026-08-27-m4-hijack.md)
+  keeps the full ledger of what was and wasn't seen on hardware.
 - **Palm rejection is unverified, on-device generation timing is unmeasured,
   and the digits are a placeholder font.** No timer, undo, printed pencil
   marks or landscape.

@@ -4,10 +4,10 @@
 # Returns the device to stock: stops and removes the rm2fb display
 # server, the M4 hijack watcher, and the decoy "Sudoku" document it
 # watches — the decoy must not outlive the watcher, or the library keeps
-# a document that silently does nothing (M4-HIJACK.md). Idempotent: safe
-# to run repeatedly and on partial installs (it removes whatever it
-# finds, step by step). Like preload.env and the systemd files, the
-# watcher/decoy removal below is unconditional, not gated by --purge —
+# a document that silently does nothing (docs/plans/2026-08-27-m4-hijack.md).
+# Idempotent: safe to run repeatedly and on partial installs (it removes
+# whatever it finds, step by step). Like preload.env and the systemd files,
+# the watcher/decoy removal below is unconditional, not gated by --purge —
 # --purge only decides the fate of $REDOKU_DIR itself.
 #
 # Usage: uninstall.sh [--purge]

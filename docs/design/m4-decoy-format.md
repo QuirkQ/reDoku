@@ -2,17 +2,17 @@
 
 **Date:** 2026-08-27, measured on the owner's reMarkable 2, firmware
 **3.27.3.0** (`IMG_VERSION="3.27.3.0"`, Codex Linux 5.7.126).
-**Why this document exists:** M4-HIJACK.md originally guessed at the decoy's
-shape — it called it a "trio" of files in a "line-based format." Both
-guesses were wrong, and the correction was made by dumping a real document's
-sidecars off the device rather than by reasoning about it further. The raw
-capture and the working notes taken from it
+**Why this document exists:** docs/plans/2026-08-27-m4-hijack.md originally
+guessed at the decoy's shape — it called it a "trio" of files in a "line-based
+format." Both guesses were wrong, and the correction was made by dumping a
+real document's sidecars off the device rather than by reasoning about it
+further. The raw capture and the working notes taken from it
 (`.superpowers/sdd/M4-HIJACK/device-doc-dump.txt` and
 `xochitl-3.27-format.md`) live in this repo's git-ignored SDD workspace and
 are deleted when the M4 milestone closes, so this document is what survives
 them. `tools/mkdecoy.rb` is the tested, executable form of everything below
-(`tools/test/mkdecoy_test.rb` checks its JSON byte-for-byte); read this
-first for the shape and the reasoning, that file for the exact bytes.
+(`tools/test/mkdecoy_test.rb` checks its JSON byte-for-byte); read this first
+for the shape and the reasoning, that file for the exact bytes.
 
 ## A PDF document is five filesystem entries, not three
 
@@ -95,8 +95,8 @@ not a JSON number). Page counts and scale factors are plain numbers.
 - `lastOpened` is the field the watcher's `lastopened` trigger mode reads
   (`mrbgems/mruby-redoku/mrblib/redoku/watcher.rb`), and the device proved
   it is written at open time but the sidecar is flushed to disk lazily —
-  see M4-HIJACK.md's "the trigger, measured" section for that evidence and
-  what it decided.
+  see docs/plans/2026-08-27-m4-hijack.md's "the trigger, measured" section for
+  that evidence and what it decided.
 
 ## `<uuid>.content`
 

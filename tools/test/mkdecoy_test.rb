@@ -4,7 +4,8 @@
 # tools/test/mkdecoy_test.rb — asserts tools/mkdecoy.rb's output against
 # the field sets, types and byte format measured off a real reMarkable 2 on
 # firmware 3.27.3.0 (.superpowers/sdd/M4-HIJACK/xochitl-3.27-format.md) and
-# the M4-HIJACK.md task-2 brief. No test framework — see support.rb.
+# the docs/plans/2026-08-27-m4-hijack.md task-2 brief. No test framework — see
+# support.rb.
 #
 #   ruby tools/test/mkdecoy_test.rb     (directly, CRuby stdlib only)
 #   make test-tools                     (same thing, inside the build image)

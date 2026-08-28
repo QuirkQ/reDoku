@@ -72,7 +72,7 @@ Designs go in [`docs/plans/`](docs/plans/) and
 [`docs/design/`](docs/design/); `PLAN.md` is the standing design record. When a
 plan turns out to have guessed wrong, the habit here is to annotate it with the
 correction next to the original rather than silently rewrite it — `PLAN.md`
-§10 and `M4-HIJACK.md` both carry examples.
+§10 and `docs/plans/2026-08-27-m4-hijack.md` both carry examples.
 
 `PLAN.md` also distinguishes, per milestone, what has been **witnessed on real
 hardware** from what is only host-tested. Keep that line honest: don't promote

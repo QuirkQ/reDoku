@@ -667,8 +667,9 @@ would rather read the script first, and `uninstall --self` for removal.
 `~/.ssh/config` is IGNORED" block **[src]** gains the kit story; `--help`
 gains §5.2.
 
-**`M4-HIJACK.md`** — one line: released kits ship a prebuilt decoy;
-`mkdecoy.rb` is still the source of truth and CI still runs it.
+**`docs/plans/2026-08-27-m4-hijack.md`** — one line: released kits ship a
+prebuilt decoy; `mkdecoy.rb` is still the source of truth and CI still runs
+it.
 
 **Step 0 is not code.** Merge the release-please PR so a tag and a release
 exist. Until then `latest/download/…` 404s and there is nothing to fetch.

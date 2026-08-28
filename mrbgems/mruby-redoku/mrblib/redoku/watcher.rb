@@ -1,10 +1,11 @@
 module Redoku
-  # `redoku --watch` — the hijack's other half (M4-HIJACK.md, PLAN.md §10).
-  # A systemd service holding an inotify watch and the control socket and
-  # NOTHING ELSE: it never calls RM2::Display.open, which is what keeps it
-  # structurally incapable of stealing the screen. RM2::Control.clients is
-  # fine here because it rides the separate control-socket datagram RPC, not
-  # the display connection (PLAN.md §3).
+  # `redoku --watch` — the hijack's other half
+  # (docs/plans/2026-08-27-m4-hijack.md, PLAN.md §10). A systemd service
+  # holding an inotify watch and the control socket and NOTHING ELSE: it never
+  # calls RM2::Display.open, which is what keeps it structurally incapable of
+  # stealing the screen. RM2::Control.clients is fine here because it rides
+  # the separate control-socket datagram RPC, not the display connection
+  # (PLAN.md §3).
   #
   # **The launch policy below is rewritten twice from what the device
   # actually measured**, not from the plan's original guess — read

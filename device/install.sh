@@ -5,7 +5,8 @@
 # reDoku and other clients can draw to the e-ink panel while xochitl
 # keeps working normally; and the M4 hijack — a decoy "Sudoku" document
 # in xochitl's own library plus redoku-watcher.service, which spawns the
-# game when that document is tapped (PLAN.md §10, M4-HIJACK.md).
+# game when that document is tapped (PLAN.md §10,
+# docs/plans/2026-08-27-m4-hijack.md).
 #
 # Safety design:
 #   * Userland + systemd files only. No kernel, boot, or partition

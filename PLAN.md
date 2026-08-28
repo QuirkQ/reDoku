@@ -812,22 +812,22 @@ on the glass needs `GL16` for that region (`App#flush_ink` says so at the
 point of choice). Erase behaviour on the device is manual-verify only,
 permanently — see §9.
 
-**M4 — the hijack. Shipped 2026-08-27** (`M4-HIJACK.md`; commits
-`7ae3a28`..`43b1633`). Decoy document: `tools/mkdecoy.rb` generates a real,
-uniquely-solvable Sudoku PDF plus xochitl's sidecars from a **fixed UUID
+**M4 — the hijack. Shipped 2026-08-27** (`docs/plans/2026-08-27-m4-hijack.md`;
+commits `7ae3a28`..`43b1633`). Decoy document: `tools/mkdecoy.rb` generates a
+real, uniquely-solvable Sudoku PDF plus xochitl's sidecars from a **fixed UUID
 constant**, so a re-install regenerates byte-identical files instead of
-depositing a second decoy into the library on every run. **This section
-used to call the decoy's files a "trio" in a "line-based format"; both were
-guesses and both were wrong.** A PDF document on 3.27.3.0 is **five**
-filesystem entries (`.pdf`, `.metadata`, `.content`, `.pagedata`, and an
-empty per-page ink directory — a sixth, `.thumbnails/`, is xochitl's own to
-create on first open), and `.metadata`/`.content` are **JSON**, not
-line-based. The measured, corrected format — field by field, and why an
-earlier summary of the same device dump got the JSON's array formatting
-wrong — is [`docs/design/m4-decoy-format.md`](docs/design/m4-decoy-format.md);
-`M4-HIJACK.md`'s Task 2 keeps the original wrong wording on record with the
-correction next to it, this repo's habit for a plan caught wrong rather than
-silently rewritten.
+depositing a second decoy into the library on every run. **This section used
+to call the decoy's files a "trio" in a "line-based format"; both were guesses
+and both were wrong.** A PDF document on 3.27.3.0 is **five** filesystem
+entries (`.pdf`, `.metadata`, `.content`, `.pagedata`, and an empty per-page
+ink directory — a sixth, `.thumbnails/`, is xochitl's own to create on first
+open), and `.metadata`/`.content` are **JSON**, not line-based. The measured,
+corrected format — field by field, and why an earlier summary of the same
+device dump got the JSON's array formatting wrong — is
+[`docs/design/m4-decoy-format.md`](docs/design/m4-decoy-format.md);
+`docs/plans/2026-08-27-m4-hijack.md`'s Task 2 keeps the original wrong wording
+on record with the correction next to it, this repo's habit for a plan caught
+wrong rather than silently rewritten.
 
 `redoku-watcher.service` runs `redoku --watch`
 (`mrbgems/mruby-redoku/mrblib/redoku/watcher.rb` + `watch_config.rb`), built
@@ -883,10 +883,10 @@ alone never caught it. The suppress-plus-cooldown rule above is what closed
 it, confirmed on the device by the journal line quoted above.
 
 **Device verification is partial, stated plainly so nothing here reads as
-witnessed that was not** (M4-HIJACK.md's Task 5 has the full list):
-witnessed are the installer completing cleanly, a tap launching the game,
-Quit handing the panel back, the boot phantom being swallowed, and the
-relaunch loop being swallowed. **Not yet witnessed, at any point in M4:**
+witnessed that was not** (docs/plans/2026-08-27-m4-hijack.md's Task 5 has the
+full list): witnessed are the installer completing cleanly, a tap launching
+the game, Quit handing the panel back, the boot phantom being swallowed, and
+the relaunch loop being swallowed. **Not yet witnessed, at any point in M4:**
 the pen drawing through a spawned (not SSH-launched) game, the watcher being
 killed mid-play, and a battery pull during play.
 

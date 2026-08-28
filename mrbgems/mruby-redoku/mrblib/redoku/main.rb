@@ -77,11 +77,12 @@ module Redoku
     play
   end
 
-  # `redoku --watch` (M4-HIJACK.md Task 3): the resident watcher, run under
-  # `redoku-watcher.service`. RM2.setup_signals is called here rather than
-  # inside Watcher — the same split play/record_templates already use — so
-  # Watcher's own `signals:` default (plain RM2) can be exercised in tests
-  # without a real signal handler installed on the test process.
+  # `redoku --watch` (docs/plans/2026-08-27-m4-hijack.md Task 3): the resident
+  # watcher, run under `redoku-watcher.service`. RM2.setup_signals is called
+  # here rather than inside Watcher — the same split play/record_templates
+  # already use — so Watcher's own `signals:` default (plain RM2) can be
+  # exercised in tests without a real signal handler installed on the test
+  # process.
   #
   # Nothing about a missing or unreadable config is fatal here, or anywhere
   # downstream (M4-HIJACK fix round 2, requirement D): the device measured
