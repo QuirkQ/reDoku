@@ -493,6 +493,52 @@ If `<kit>/<tag>/VERSION` already exists and the game binary there passes
 `install` is documented as safe to re-run from any state **[src]**; adding a
 network fetch must not weaken that.
 
+### 6.4 What may be deleted in a kit root
+
+Three commands write and delete inside a kit root — `install --download --kit`,
+`upgrade` and `uninstall --self` — because all three reach the same repoint and
+prune through `fetch_kit`. §5.3 already says the prune belongs to `install` as
+much as to `upgrade`; what it did not say is what stops any of them deleting
+something that is not ours. That mechanism existed only in code comments, and
+it cost two rounds of review, so it is written down here. **[reasoned]**
+
+**Two predicates, deliberately different questions.**
+
+| predicate | asks | used for |
+|---|---|---|
+| `is_version_dir` | is this directory NAMED after its own `VERSION`? | the conservative "we certainly named this" |
+| `looks_like_our_tree` | does it have a release-tag name and OUR `bin/redoku` inside? | is this structurally one of ours |
+
+They look interchangeable and are not. `is_version_dir` alone is far too weak
+to decide anything, because people name directories `v1.2.3` and put a
+`VERSION` file at a project root: a user's `~/Documents` satisfied it and had
+`v3.1/` recursively deleted. **Every deletion requires BOTH** — structure as an
+additional test, never a replacement, so the conservative direction is kept.
+`looks_like_our_tree` deliberately does not also require `device/install.sh`:
+§7 exists to repair damaged kits, and a version directory that has lost its
+`device/` is still plainly ours.
+
+**Five guards before any of it** (`check_kit_root`, three verbs). The root must
+be non-empty, absolute, not `/` and not `$HOME` in either spelling, and not an
+ancestor of the running script except as a kit holds its versions. The fifth —
+"does this look like a kit root at all" — is asked of `upgrade` (`write`) and
+`uninstall --self` (`remove`) but **not** of `install` (`create`), because it is
+circular for the command that makes it true. `install`'s safety comes from the
+deletion site instead: `fetch_kit` prunes only a root that was already ours
+**before this run** (captured before the download — the unpack itself makes any
+root look like a kit), and refuses to replace a `current` symlink that is not
+ours.
+
+**A released CLI standing on its own has no local artifacts.** `$REPO` is the
+parent of the CLI's own directory, which is a tree of ours only when that
+directory is that tree's `bin/`. Dropped anywhere else — the no-pipe flow in §9
+produces exactly this — `$REPO` is the parent of wherever the file landed, and
+on a shared machine that is `/tmp`. The standalone release asset is the CLI and
+nothing else, so a *stamped* CLI with no kit around it and nothing downloaded
+must refuse to read device scripts, binaries or the decoy from `$REPO`; and the
+§5.1 marker requires the `bin/` shape as well as the `VERSION` file, since the
+file alone is forgeable by whoever else can write there. **[reasoned]**
+
 ## 7. Failure catalogue
 
 Every row is a message that names its own fix, and none leaves a partial
