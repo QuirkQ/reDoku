@@ -7,3 +7,10 @@ dist/
 build_config.rb.lock
 tmp/
 .superpowers/
+# A local one-shot admin tool, not part of the build or the game: it reads a
+# privileged GitHub token from the environment and rewrites this repository's
+# own settings. Nothing in the kit, the device install or CI calls it, so
+# shipping it would only invite someone to run a script that can publish a
+# private repo and rewrite its branch protection. Keep it out of the clone
+# people get, and out of the release tarball.
+script/github-repo.rb
