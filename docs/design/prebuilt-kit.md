@@ -512,11 +512,15 @@ it cost two rounds of review, so it is written down here. **[reasoned]**
 They look interchangeable and are not. `is_version_dir` alone is far too weak
 to decide anything, because people name directories `v1.2.3` and put a
 `VERSION` file at a project root: a user's `~/Documents` satisfied it and had
-`v3.1/` recursively deleted. **Every deletion requires BOTH** — structure as an
+`v3.1/` recursively deleted. **Every deletion of a version directory requires BOTH** — structure as an
 additional test, never a replacement, so the conservative direction is kept.
 `looks_like_our_tree` deliberately does not also require `device/install.sh`:
 §7 exists to repair damaged kits, and a version directory that has lost its
-`device/` is still plainly ours.
+`device/` is still plainly ours. The one recursive delete that takes neither
+predicate is `clean_stale_staging`, which removes `.staging.*` entries by name;
+it is gated on the base not being world-writable instead, because the leftovers
+it reclaims are left by a run that died before creating a version directory —
+so the root is legitimately not yet "ours".
 
 **Five guards before any of it** (`check_kit_root`, three verbs). The root must
 be non-empty, absolute, not `/` and not `$HOME` in either spelling, and not an
@@ -529,15 +533,57 @@ deletion site instead: `fetch_kit` prunes only a root that was already ours
 root look like a kit), and refuses to replace a `current` symlink that is not
 ours.
 
-**A released CLI standing on its own has no local artifacts.** `$REPO` is the
-parent of the CLI's own directory, which is a tree of ours only when that
-directory is that tree's `bin/`. Dropped anywhere else — the no-pipe flow in §9
-produces exactly this — `$REPO` is the parent of wherever the file landed, and
-on a shared machine that is `/tmp`. The standalone release asset is the CLI and
-nothing else, so a *stamped* CLI with no kit around it and nothing downloaded
-must refuse to read device scripts, binaries or the decoy from `$REPO`; and the
-§5.1 marker requires the `bin/` shape as well as the `VERSION` file, since the
-file alone is forgeable by whoever else can write there. **[reasoned]**
+### 6.5 The artifact-trust invariant
+
+Six code-execution defects in this milestone were one defect, patched six
+times. Each was: a path was derived (`$REPO` from `$0`, `$KIT_ROOT` from a
+download), something *about the directory* was read as evidence that its
+contents were ours — a `VERSION` file, a directory named `bin`, a
+complete-looking tree, "`$KIT_ROOT` moved, so a download must have happened" —
+and artifacts were then read from it and run, twice as **root on the user's
+tablet**. Every one of those inferences is forgeable by whoever can write the
+directory, because each is a statement about the contents made by reading the
+contents. The invariant that makes the class impossible: **[reasoned]**
+
+> No file is executed, pushed to the device, or read as an installable
+> artifact unless **this run** established that the tree it came from is
+> trustworthy — and trust is a property of the process, never of the
+> filesystem.
+
+`$ARTIFACT_TRUST` is set by the process and no file can influence it. Exactly
+two things establish it:
+
+| value | how | why it is not an inference from contents |
+|---|---|---|
+| `verified` | `fetch_kit` downloaded this tree and its sha256 matched, **this run** | provenance from the network plus the checksum |
+| `own` | the tree **is** the one the running CLI is part of — `$KIT_ROOT` is `$REPO` and this script is `$REPO/bin/redoku`, compared as resolved paths | anyone able to tamper with it could have tampered with the CLI now executing, so a gate would be defending a process that is already the attacker's |
+
+Empty is the default and refuses, so a path that forgets to establish trust
+fails closed.
+
+**Enforced at two choke points, not per command.** `push_file` — which all
+twelve device-bound files pass through, including the two device scripts run
+as root — and `build_decoy`'s `ruby`, the only thing this script executes out
+of a directory it merely found. A future command that pushes a file cannot
+forget the check, because the check is inside the push. The commands also
+refuse early, but that is for the message, not the guarantee.
+
+**Two consequences worth stating.** The checkout layout unpacks into
+`$REPO/build/download/` and reads back from it on a later run, so it is
+refused when `$REPO` is not our own tree — a standalone CLI must pass
+`--kit DIR`. And §6.3's reuse skips the download and therefore the checksum,
+so it is refused in a base other people can write; idempotence survives
+everywhere legitimate.
+
+**The residual, stated rather than implied.** `own` still rests on the CLI's
+own directory not being writable by somebody else. `tree_is_other_writable`
+rejects the case that actually occurs — a world-writable directory such as
+`/tmp`, mode 1777 — but a directory writable by a **group the attacker is in**
+is not detected, and cannot be without an ownership model this script has no
+business implementing. So: **do not run a downloaded CLI out of a directory
+other people can write.** The `bin/`-name check that preceded this was weaker
+still and is gone; it was forgeable by the same actor, since anyone who can
+write `$REPO` can create `$REPO/bin`. **[reasoned]**
 
 ## 7. Failure catalogue
 
