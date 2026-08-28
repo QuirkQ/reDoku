@@ -34,19 +34,38 @@ jobs:
       - name: Cross-compile rm2fb display server
         run: make rm2fb
 
-      - name: Package release tarball
-        run: |
-          mkdir -p dist/redoku/bin
-          cp build/rm2/bin/redoku build/rm2/bin/mruby build/rm2/bin/mirb \
-            dist/redoku/bin/
-          cp build/rm2fb/dist/rm2fb_server_swtcon \
-            build/rm2fb/dist/rm2fbctl \
-            build/rm2fb/dist/librm2fb_client_swtcon.so \
-            dist/redoku/
-          tar -czf redoku-rm2.tar.gz -C dist redoku
+      # Design doc §3.4: both workflows call the SAME packager, so the kit CI
+      # tests is the kit the release publishes. This step used to be an inline
+      # mkdir/cp/tar block; tools/mkkit.sh replaced it precisely so that logic
+      # could not exist in two places and drift. Nothing may be packed here.
+      #
+      # mkkit.sh needs a stdlib-only CRuby for tools/mkdecoy.rb (json, optparse
+      # and fileutils — all default gems). ubuntu-latest ships Ruby 3.2.3
+      # preinstalled, so no setup-ruby step is needed; if that ever changes,
+      # mkkit.sh dies with a named error rather than producing a kit with no
+      # decoy in it.
+      - name: Build the five release assets
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: tools/mkkit.sh --version "$TAG"
 
+      # Exactly the five §3.1 assets, uploaded under their basenames — which is
+      # what makes .../releases/latest/download/<name> resolve. Those names must
+      # never carry the version: the version lives INSIDE the artifacts (the
+      # stamped KIT_VERSION line and the kit's VERSION file), so that one stable
+      # URL always points at the newest release.
+      #
+      # No install.sh.sha256, deliberately (§3.1): you cannot verify the thing
+      # you are already piping into a shell, and shipping a checksum that
+      # protects nothing is worse than shipping none.
       - name: Upload to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release-please.outputs.tag_name }}
-        run: gh release upload "$TAG" redoku-rm2.tar.gz --clobber
+        run: |
+          gh release upload "$TAG" --clobber \
+            dist/install.sh \
+            dist/redoku \
+            dist/redoku.sha256 \
+            dist/redoku-rm2.tar.gz \
+            dist/redoku-rm2.tar.gz.sha256

@@ -11,6 +11,69 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The two cheap gates run before `make build`, which builds a Docker
+      # image and cross-compiles mruby — minutes, and by far the slowest thing
+      # in this workflow. Both of these need nothing but the checkout and the
+      # runner's stock tools, and both fail in seconds. Putting them first
+      # means a lint regression or a broken installer is reported on its own
+      # terms instead of arriving after (or behind) a toolchain failure that
+      # has nothing to do with it.
+
+      # Decision D9: shellcheck over every shell file in the repo.
+      #
+      # shellcheck is preinstalled on ubuntu-latest (0.9.0 on the 24.04 image
+      # as of this writing) — no action, no apt install. --version is printed
+      # because findings differ between releases: 0.9 raises an SC2015 that
+      # 0.11 does not. The tree is verified clean under 0.9.0, 0.10.0 and
+      # 0.11.0, so a runner-image bump cannot break this gate in either
+      # direction, and the log says which version judged the code.
+      #
+      # No -s override: every one of these files declares #!/bin/sh, and the
+      # shebang is what actually runs them, so forcing a dialect could only let
+      # the lint drift from the real interpreter. No -x: nothing here sources
+      # anything. Default severity (style and up) — a gate that ignores the
+      # cheap findings is a gate you stop reading. shellcheck's own exit status
+      # is what fails the build; there is no `|| true` here on purpose.
+      - name: Shellcheck
+        run: |
+          shellcheck --version
+          # Written out rather than globbed: bin/redoku carries no .sh suffix,
+          # so *.sh would leave the largest script in the repo unlinted.
+          shellcheck bin/redoku device/install.sh device/uninstall.sh \
+            tools/install.sh tools/mkkit.sh tools/test/kit_test.sh
+          # A written-out list goes stale silently, which is the one failure
+          # mode a lint gate cannot afford. Re-derive the set the way D9
+          # defines it — tracked files whose first line is a sh shebang — and
+          # refuse to pass if it disagrees with what was just linted. Adding a
+          # script then becomes a review decision, never an unnoticed hole.
+          found=$(git ls-files | while IFS= read -r f; do
+            case $(head -n 1 -- "$f" 2>/dev/null) in
+              '#!'*sh | '#!'*sh[!A-Za-z0-9]*) printf '%s\n' "$f" ;;
+            esac
+          done)
+          # These continuation lines sit at the block scalar's own indent, so
+          # YAML strips it and the shell sees them flush left — do not "tidy"
+          # them. If that ever breaks, this guard fails loudly rather than
+          # quietly passing, which is the right way round.
+          expected='bin/redoku
+          device/install.sh
+          device/uninstall.sh
+          tools/install.sh
+          tools/mkkit.sh
+          tools/test/kit_test.sh'
+          if [ "$found" != "$expected" ]; then
+            printf 'shellcheck scope drift.\n\nthis step lints:\n%s\n\nthe repo contains:\n%s\n\nAdd the new file to the list above, or say in the commit why it is excluded.\n' \
+              "$expected" "$found" >&2
+            exit 1
+          fi
+
+      # Needs no Docker, no mruby and no cross-toolchain: kit_test.sh builds
+      # its fixture kits from synthetic files via mkkit.sh's --build-dir, and
+      # the Makefile runs it on the host on purpose (tools/install.sh's whole
+      # risk surface IS the host's curl, shasum and tar).
+      - name: Test kit
+        run: make test-kit
+
       - name: Build
         run: make build
 

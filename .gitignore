@@ -1,4 +1,9 @@
 build/
+# tools/mkkit.sh's default --out, and what release.yml now uploads from.
+# It holds five build products, never sources; and mkkit refuses to run
+# against an --out holding anything but its own five assets, so a stray
+# committed file here would break the release rather than sit harmlessly.
+dist/
 build_config.rb.lock
 tmp/
 .superpowers/
