@@ -325,6 +325,94 @@ Host *
 EOF
 }
 
+# write_mktemp_shim <shim-dir> <parent-dir> <record-file> — a stand-in for
+# the mktemp BINARY, to be put on $PATH ahead of the real one.
+#
+# It exists because `TMPDIR=... ; count what landed in it` is NOT a portable
+# way to observe where a script put its temp directory, and the two tests that
+# used to do it were therefore vacuous on this machine: measured directly,
+# macOS's `mktemp -d` with no template ignores $TMPDIR entirely and uses the
+# per-user Darwin temp dir, so the directory those tests inspected was never
+# the one tools/install.sh used and their assertions passed whatever the code
+# did. (test_kit_tarball_entry_outside_redoku records the same measurement for
+# its own reasons.)
+#
+# The shim gives the assertion something it can actually fail: it forwards to
+# the real mktemp, but with an explicit template under <parent-dir>, and
+# APPENDS the path it created to <record-file>. A test can then assert on the
+# exact directory install.sh used, by name — and can prove it is observing
+# anything at all, because an empty record means the shim never ran.
+#
+# It shims the BINARY, on PATH; nothing inside tools/install.sh knows it is
+# there, and no seam was added to the product to make this observable.
+# `mktemp -d` with no template is install.sh's only use of it, so that is the
+# single shape handled specially; everything else is passed straight through.
+write_mktemp_shim() {
+  _wms_dir=$1
+  _wms_parent=$2
+  _wms_record=$3
+  mkdir -p "$_wms_dir" "$_wms_parent" || die "write_mktemp_shim: mkdir failed"
+  _wms_real=$(command -v mktemp) || die "write_mktemp_shim: no 'mktemp' on this machine"
+  cat > "$_wms_dir/mktemp" <<MKTEMPEOF
+#!/bin/sh
+if [ "\$#" -eq 1 ] && [ "\$1" = -d ]; then
+  _d=\$('$_wms_real' -d '$_wms_parent/bootstrap.XXXXXX') || exit 1
+  printf '%s\n' "\$_d" >> '$_wms_record'
+  printf '%s\n' "\$_d"
+  exit 0
+fi
+exec '$_wms_real' "\$@"
+MKTEMPEOF
+  chmod +x "$_wms_dir/mktemp"
+}
+
+# write_fake_ssh <path> <device-root> [uninstaller-exit-code] — a stand-in for
+# the ssh BINARY, to be put on $PATH ahead of the real one.
+#
+# make_dead_ssh_config above is the seam for "the device stage must FAIL";
+# this is the seam for the one case that needs it to SUCCEED — design doc §8's
+# test 6, `uninstall --self`, whose entire ordering rule is that the host kit
+# is deleted only AFTER the device is back to stock. With no way to satisfy
+# the device stage there is no way to observe the deletion at all, and the
+# alternative — a bypass inside bin/redoku — would be a test seam in
+# safety-critical product code, which is exactly what must not be added.
+#
+# What it emulates is deliberately tiny and exact: it takes the last argument
+# (which is how `remote()` passes its one command), rewrites the fixed literal
+# /home/root/redoku to <device-root> so the "device" is a directory under the
+# test's own tree, and runs the result with `sh -c`. That is enough for
+# `true`, `mkdir -p`, push_file's `rm -f && cat >` plus its `wc -c` size
+# check — the whole of cmd_uninstall's device stage.
+#
+# The ONE command it does not really run is the on-device uninstaller itself:
+# `sh <device-root>/uninstall.sh` is matched EXACTLY (not as a substring —
+# push_file's own commands also mention uninstall.sh) and answered with a
+# printed line and <uninstaller-exit-code>. device/uninstall.sh is written for
+# a reMarkable running systemd and must never be executed against a developer's
+# own machine. Its exit code is a parameter so a test can also drive the
+# "device stage failed" branch through the uninstaller rather than through
+# connect().
+write_fake_ssh() {
+  _wfs_path=$1
+  _wfs_dev=$2
+  _wfs_rc=${3:-0}
+  mkdir -p "$(dirname -- "$_wfs_path")" || die "write_fake_ssh: mkdir failed"
+  cat > "$_wfs_path" <<FAKESSHEOF
+#!/bin/sh
+# Harness-written stand-in for ssh — see write_fake_ssh in tools/test/kit_test.sh.
+_cmd=
+for _a in "\$@"; do _cmd=\$_a; done
+_cmd=\$(printf '%s' "\$_cmd" | sed 's#/home/root/redoku#$_wfs_dev#g')
+case \$_cmd in
+  "sh $_wfs_dev/uninstall.sh"|"sh $_wfs_dev/uninstall.sh --purge")
+    printf 'fake device: ran the on-device uninstaller\n'
+    exit $_wfs_rc ;;
+esac
+sh -c "\$_cmd"
+FAKESSHEOF
+  chmod +x "$_wfs_path"
+}
+
 # ---- the fixture-release builder ---------------------------------------
 #
 # make_fixture_release <dir> <version> <cli-source-file>
@@ -719,38 +807,78 @@ test_empty_checksum_file() {
   assert_no_file "$_record" "empty checksum file: the stub CLI never ran" || return 1
 }
 
+# tools/install.sh's EXIT/INT/HUP/TERM trap removes the temp directory it
+# downloads into, on success and on failure alike.
+#
+# Both of these tests used to set $TMPDIR and count what was left in it, and
+# both were VACUOUS on this machine for the reason write_mktemp_shim's header
+# records: macOS's `mktemp -d` with no template ignores $TMPDIR, so the
+# directory they counted was never the one install.sh used and the assertion
+# could not fail however broken the cleanup was. They now capture the real
+# path — the one the shimmed mktemp actually created — and assert that exact
+# directory is gone, which is an assertion that fails the moment the trap is
+# removed. The record file being non-empty is checked first, because an
+# assertion about a path nobody recorded would be the same vacuity again in a
+# new disguise.
+_assert_bootstrap_tmpdir_gone() { # <record-file> <label>
+  assert_file "$1" "$2: the mktemp shim ran, so there is a real temp path to assert on" || return 1
+  _abtg_dir=
+  read -r _abtg_dir < "$1" || true
+  [ -n "$_abtg_dir" ] || {
+    printf 'FAIL: %s: the mktemp shim recorded no path\n' "$2" >&2
+    return 1
+  }
+  assert_no_file "$_abtg_dir" "$2: install.sh removed the temp dir it created ($_abtg_dir)" || return 1
+}
+
 test_tmpdir_cleanup_on_success() {
   _w=$(mktemp -d "$ROOT/cleanup-ok.XXXXXX")
   _home=$_w/home
   mkdir -p "$_home"
   write_stub_cli "$_w/cli"
   make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
-  _tmpdir=$(mktemp -d "$ROOT/cleanup-ok-tmpdir.XXXXXX")
-  [ "$(count_entries "$_tmpdir")" = 0 ] || die "test_tmpdir_cleanup_on_success: dedicated TMPDIR not empty before the run"
+  _record=$_w/mktemp-record
+  _clidir=$_w/cli-dir
+  write_mktemp_shim "$_w/shim" "$_w/tmp" "$_record"
 
   set +e
-  ASSERT_OUTPUT=$(REDOKU_BASE_URL="file://$_w/release" HOME="$_home" TMPDIR="$_tmpdir" \
-    REDOKU_TEST_RECORD="$_w/record" \
+  ASSERT_OUTPUT=$(PATH="$_w/shim:$PATH" REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    REDOKU_TEST_TMPDIR_RECORD="$_clidir" \
     "$KIT_SH" "$REPO/tools/install.sh" < /dev/null 2>&1)
   _rc=$?
   set -e
 
   assert_eq 0 "$_rc" "cleanup on success: install.sh exit code (output: $ASSERT_OUTPUT)" || return 1
-  assert_eq 0 "$(count_entries "$_tmpdir")" "cleanup on success: install.sh's temp dir is gone afterwards" || return 1
+  # Two independent observations of the same directory: the shim's record says
+  # what mktemp handed install.sh, and the stub CLI's own `dirname "$0"` says
+  # what install.sh ran the CLI out of. If those agree, the path asserted on
+  # below is unambiguously install.sh's own temp dir and not some bystander's.
+  assert_file "$_clidir" "cleanup on success: the stub CLI ran" || return 1
+  _shim_dir=
+  read -r _shim_dir < "$_record" || true
+  assert_eq "$_shim_dir" "$(cat "$_clidir")" \
+    "cleanup on success: the shim's directory is the one install.sh ran the CLI from" || return 1
+  _assert_bootstrap_tmpdir_gone "$_record" "cleanup on success" || return 1
 }
 
 test_tmpdir_cleanup_on_failure() {
   _w=$(mktemp -d "$ROOT/cleanup-fail.XXXXXX")
   _home=$_w/home
   mkdir -p "$_home" "$_w/empty-release"
-  _tmpdir=$(mktemp -d "$ROOT/cleanup-fail-tmpdir.XXXXXX")
-  [ "$(count_entries "$_tmpdir")" = 0 ] || die "test_tmpdir_cleanup_on_failure: dedicated TMPDIR not empty before the run"
+  _record=$_w/mktemp-record
+  write_mktemp_shim "$_w/shim" "$_w/tmp" "$_record"
 
   assert_fails "cleanup on failure: install.sh exits non-zero" -- \
-    env REDOKU_BASE_URL="file://$_w/empty-release" HOME="$_home" TMPDIR="$_tmpdir" \
+    env PATH="$_w/shim:$PATH" REDOKU_BASE_URL="file://$_w/empty-release" HOME="$_home" \
     "$KIT_SH" "$REPO/tools/install.sh" < /dev/null || return 1
 
-  assert_eq 0 "$(count_entries "$_tmpdir")" "cleanup on failure: install.sh's temp dir is gone afterwards" || return 1
+  # The failure is a download that 404s, i.e. install.sh's own `die` — after
+  # the temp dir exists and before anything else has run in it. That is the
+  # window the trap is for, and the only reason the path is knowable here at
+  # all is that the shim recorded it on the way in.
+  assert_contains "$ASSERT_OUTPUT" "could not download" \
+    "cleanup on failure: it failed at the download, which is the window the trap covers" || return 1
+  _assert_bootstrap_tmpdir_gone "$_record" "cleanup on failure" || return 1
 }
 
 # ---- mkkit.sh tests (design doc §8 test 1) -------------------------------
@@ -1907,6 +2035,14 @@ test_kit_prompt_download_rechecks_device_files() {
     "prompt device re-check: (b) the replacement is announced, not silent" || return 1
   assert_contains "$ASSERT_OUTPUT" "install.sh" \
     "prompt device re-check: (b) it names which script" || return 1
+  # Re-review F4: round 2 corrected the remedy line here — the old wording
+  # said "install without downloading: make rm2fb", which is wrong advice on
+  # an `install --download --kit DIR`, where dropping the download also means
+  # dropping --kit — and nothing pinned the new wording, so the correction
+  # passed with itself reverted. "neither --download nor --kit" is the phrase
+  # the corrected line exists to say and appears nowhere else in this file.
+  assert_contains "$ASSERT_OUTPUT" "neither --download nor --kit" \
+    "prompt device re-check: (b) the remedy names both flags to drop, not just the download" || return 1
   # And the RELEASED ones really are what would go on: the plan's watcher line
   # is the only device/ path printed before connect() ends the run, and it
   # names the downloaded tree rather than the checkout.
@@ -2212,6 +2348,94 @@ test_kit_mv_failure_leaves_nothing_behind() {
   assert_eq 0 "$_left" "mv failure: the staging directory was cleaned up" || return 1
 }
 
+# Fix round 3: design doc §6.3's idempotence on the STEP-4 tag-resolution
+# path, which is the path every offline install takes and which had the least
+# coverage in this suite rather than the most.
+#
+# The reuse gate runs once before the download, but on this path $TAG is still
+# empty then — a file:// base URL has no redirects, so §6.1 steps 1-3 resolve
+# nothing and the tag is only knowable from the tarball's own VERSION. So the
+# gate has to be consulted a SECOND time, after step 4, before the existing
+# tree is touched. Without that, a complete <kit>/<tag>/ was deleted and
+# replaced by a freshly downloaded copy of itself on every re-run, and the run
+# said "replacing an incomplete earlier download" about a tree that was
+# neither incomplete nor in need of replacing.
+#
+# The DOWNLOAD staying unconditional is deliberate and is not what this tests:
+# §6.2 settles that trade ("one wasted download, still correct") because step
+# 4 cannot learn the tag without the bytes. What is asserted is what happens
+# to the tree on disk once the tag IS known.
+#
+# A marker file planted inside the version directory is what separates "reused"
+# from "replaced" beyond any wording: a replacement rm -rf's the tree and the
+# marker goes with it.
+test_kit_step4_reuses_a_complete_tree() {
+  _w=$(mktemp -d "$ROOT/kit-step4.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # UNPINNED on purpose — no REDOKU_VERSION, so the tag can only come from
+  # inside the tarball. This is the whole point of the test.
+  _run() {
+    assert_fails "step-4 reuse: $1" -- \
+      env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+        "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+        --no-symlink --host nowhere --yes < /dev/null
+  }
+
+  _run "first install ends at the connect step" || return 1
+  assert_contains "$ASSERT_OUTPUT" "downloading" \
+    "step-4 reuse: the first run fetched" || return 1
+  assert_file "$_kit/v0.1.0/VERSION" "step-4 reuse: the first run unpacked" || return 1
+  printf 'planted\n' > "$_kit/v0.1.0/MARKER"
+
+  # Second run: the tag still has to be downloaded to be learned, but the tree
+  # it names is already here and complete, so the tree must survive untouched.
+  _run "second install ends at the connect step" || return 1
+  assert_file "$_kit/v0.1.0/MARKER" \
+    "step-4 reuse: the existing tree was reused, not deleted and re-unpacked" || return 1
+  assert_contains "$ASSERT_OUTPUT" "reusing it" \
+    "step-4 reuse: the run says it reused the tree" || return 1
+  # The downloaded tree really was discarded rather than moved somewhere. An
+  # unguarded `mv` onto the existing directory would not delete anything — it
+  # would move the staging tree INSIDE it, leaving <tag>/redoku/ and a kit
+  # whose every path resolves one level short. The marker assertion above
+  # cannot see that; this one can.
+  assert_no_file "$_kit/v0.1.0/redoku" \
+    "step-4 reuse: the discarded download was not moved inside the reused tree" || return 1
+  # The wording that used to be printed here was false — the tree was neither
+  # incomplete nor replaced.
+  case $ASSERT_OUTPUT in
+    *"replacing an incomplete earlier download"*)
+      printf 'FAIL: step-4 reuse: a complete tree was announced as an incomplete one\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_eq "v0.1.0" "$(readlink "$_kit/current")" \
+    "step-4 reuse: current still points at it — reusing is not leaving current alone" || return 1
+
+  # The complement: a tree that genuinely fails the gate IS replaced, and then
+  # the message is true and should stay. Removing device/ is the same shape of
+  # damage test_kit_reuse_gate_rejects_a_partial_tree uses, and it leaves
+  # VERSION and the ARM-passing game binary in place — so only the full gate
+  # can tell the difference.
+  rm -rf "$_kit/v0.1.0/device"
+  _run "third install ends at the connect step" || return 1
+  assert_contains "$ASSERT_OUTPUT" "replacing an incomplete earlier download" \
+    "step-4 reuse: a tree that fails the gate is still replaced" || return 1
+  assert_no_file "$_kit/v0.1.0/MARKER" \
+    "step-4 reuse: the replacement really did replace the tree" || return 1
+  assert_file "$_kit/v0.1.0/device/install.sh" \
+    "step-4 reuse: and what replaced it is complete" || return 1
+  case $ASSERT_OUTPUT in
+    *"reusing it"*)
+      printf 'FAIL: step-4 reuse: an incomplete tree was reused\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
 # MINOR 9: $KIT_VERSION was the only source of a tag not passed through
 # valid_tag. It is mkkit-stamped, so the risk is low — but a tag becomes a
 # directory name and a URL component, and "every source is checked" is a
@@ -2292,6 +2516,713 @@ test_kit_download_dry_run_writes_nothing() {
   esac
 }
 
+# Re-review F1: 'current' is the kit root's OTHER reserved name (design doc
+# §5.3 gives it to the symlink), and valid_tag let it through where it refused
+# .staging.*. The same two entry points as test_kit_staging_shaped_tag_is_refused,
+# because it is the same class of defect — a tag is remote input that becomes a
+# directory name next to names this installer already owns.
+#
+# What makes this MAJOR rather than untidy, and what the second half asserts:
+# against an existing kit the tag did not merely fail, it destroyed. The reuse
+# gate followed <kit>/current into the live version directory and called it
+# "already unpacked", the repoint produced current -> current (whose read-back
+# guard passes, because the loop's own name is the tag), and prune_kit then
+# rm -rf'd the one-back version — the rollback target §5.3 exists to keep. So
+# the assertions below are not only "it was refused": they are that 'current'
+# is still a SYMLINK pointing where it did, and that the one-back version is
+# still on disk.
+test_kit_current_shaped_tag_is_refused() {
+  _w=$(mktemp -d "$ROOT/kit-currenttag.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+
+  # (a) explicit, via $REDOKU_VERSION — "current" is the word a user reaches
+  # for when they mean "the current release", so this is a plain typo as much
+  # as it is an attack. Refused before anything is fetched or created.
+  _kit_a=$_w/kit-a
+  assert_fails "current-shaped tag: REDOKU_VERSION is refused" -- \
+    env REDOKU_BASE_URL="file://$_w/no-such-release" REDOKU_VERSION=current \
+      HOME="$_home" "$KIT_SH" "$REPO/bin/redoku" install --download \
+      --kit "$_kit_a" --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "REDOKU_VERSION='current'" \
+    "current-shaped tag: the message names the value it refused" || return 1
+  # Re-review F2: the refusal used to explain itself with a character-set rule
+  # that 'current' satisfies, i.e. it named a fix the user had already applied.
+  # This phrase is what says which rule actually fired.
+  assert_contains "$ASSERT_OUTPUT" "may not be 'current'" \
+    "current-shaped tag: the message names the rule that fired, not one the value already meets" || return 1
+  assert_no_file "$_kit_a" "current-shaped tag: nothing was created for it" || return 1
+
+  # (b) the remote path, against a kit that already has two versions in it —
+  # the state in which this tag was destructive rather than merely fatal. The
+  # first two installs are pinned so the fixture's own 'latest' can be moved on
+  # to the hostile release afterwards.
+  _kit=$_w/kit
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  make_fixture_release "$_w/release" v0.2.0 "$_w/cli"
+  for _v in v0.1.0 v0.2.0; do
+    assert_fails "current-shaped tag: install $_v ends at the connect step" -- \
+      env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION="$_v" HOME="$_home" \
+        "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+        --no-symlink --host nowhere --yes < /dev/null || return 1
+  done
+  assert_eq "v0.2.0" "$(readlink "$_kit/current")" \
+    "current-shaped tag: the kit is set up as expected before the hostile release" || return 1
+  assert_file "$_kit/v0.1.0/VERSION" \
+    "current-shaped tag: and the one-back version is there to be destroyed" || return 1
+
+  # Published last, so it is what 'latest' resolves to and the tag can only
+  # come out of the tarball's own VERSION (§6.1 step 4 — the path every
+  # offline install takes).
+  make_fixture_release "$_w/release" current "$_w/cli"
+  assert_fails "current-shaped tag: a tarball VERSION of 'current' is refused too" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "carries a VERSION this installer" \
+    "current-shaped tag: refused at the step-4 fallback, not somewhere else" || return 1
+  assert_contains "$ASSERT_OUTPUT" "('current')" \
+    "current-shaped tag: the message names the VERSION it refused" || return 1
+  # It never got as far as the reuse gate's lie about a symlink.
+  case $ASSERT_OUTPUT in
+    *"already unpacked"*)
+      printf 'FAIL: current-shaped tag: the reuse gate followed the current symlink\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  # The three states the defect produced, each asserted directly.
+  [ -L "$_kit/current" ] || {
+    printf 'FAIL: current-shaped tag: %s is no longer a symlink\n' "$_kit/current" >&2
+    return 1
+  }
+  assert_eq "v0.2.0" "$(readlink "$_kit/current")" \
+    "current-shaped tag: current still points where it did (not at itself)" || return 1
+  assert_file "$_kit/v0.1.0/VERSION" \
+    "current-shaped tag: the one-back version was not pruned" || return 1
+}
+
+# Re-review F9, the defence in depth behind F1's tag guard: -f and is_arm_elf
+# all follow symlinks, so kit_tree_is_complete would report a SYMLINKED
+# destination complete and the caller would then treat the link as the tree.
+#
+# Provoked directly rather than through a hostile tag, because the tag is now
+# refused: a second kit root whose <tag> entry is a symlink into a real,
+# complete kit elsewhere. The gate must say "incomplete" about it, and the
+# replacement must remove the LINK and not the tree it points at.
+test_kit_reuse_gate_rejects_a_symlinked_destination() {
+  _w=$(mktemp -d "$ROOT/kit-linkgate.XXXXXX")
+  _home=$_w/home
+  _real=$_w/real-kit
+  _kit=$_w/kit
+  mkdir -p "$_home" "$_kit"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  assert_fails "symlinked destination: the real kit installs" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_real" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_file "$_real/v0.1.0/VERSION" "symlinked destination: the real tree is complete" || return 1
+  printf 'planted\n' > "$_real/v0.1.0/MARKER"
+
+  ln -s "$_real/v0.1.0" "$_kit/v0.1.0"
+
+  assert_fails "symlinked destination: the second install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  case $ASSERT_OUTPUT in
+    *"already unpacked"*)
+      printf 'FAIL: symlinked destination: the gate adopted a symlink as a complete tree\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+  assert_contains "$ASSERT_OUTPUT" "replacing an incomplete earlier download" \
+    "symlinked destination: the link is replaced, not adopted" || return 1
+  [ ! -L "$_kit/v0.1.0" ] || {
+    printf 'FAIL: symlinked destination: %s is still a symlink\n' "$_kit/v0.1.0" >&2
+    return 1
+  }
+  assert_file "$_kit/v0.1.0/VERSION" "symlinked destination: a real tree took its place" || return 1
+  # `rm -rf <symlink>` removes the link, never what it points at — asserted
+  # rather than assumed, because getting this wrong would have deleted a
+  # complete kit belonging to a different root.
+  assert_file "$_real/v0.1.0/MARKER" \
+    "symlinked destination: the tree the link pointed at was not touched" || return 1
+}
+
+# Re-review F4, half G: warn_device_scripts_replaced's `command -v cmp` guard.
+# With no cmp, all three comparisons fail and the NOTE fires claiming the
+# scripts differ when they are identical — a warning that goes off when nothing
+# is wrong, which is worse than no warning. Nothing pinned the guard, and on
+# every machine this suite runs on cmp exists, so removing it changed no test.
+#
+# Driven as a kit-mode dry-run install, which is where the comparison is
+# between a file and itself ($KIT_ROOT is $REPO in a kit) — so ANY output from
+# that function is false by construction, and a minimal PATH is cheap because
+# no download, tarball or checksum is involved. The PATH deliberately carries
+# everything this run reaches for EXCEPT cmp, so "no NOTE" cannot be satisfied
+# by the run dying early somewhere else.
+test_kit_no_cmp_prints_no_false_warning() {
+  _w=$(mktemp -d "$ROOT/kit-nocmp.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home" "$_kit"
+  build_fake_kit_inputs "$_w/build"
+  "$KIT_SH" "$REPO/tools/mkkit.sh" --version v0.9.9 --out "$_w/out" \
+    --build-dir "$_w/build" >/dev/null || \
+    die "test_kit_no_cmp_prints_no_false_warning: mkkit.sh failed"
+  mkdir -p "$_kit/v0.9.9"
+  tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_w" || \
+    die "test_kit_no_cmp_prints_no_false_warning: tar -x failed"
+  mv "$_w/redoku"/* "$_w/redoku"/.[!.]* "$_kit/v0.9.9/" 2>/dev/null || true
+  [ -f "$_kit/v0.9.9/VERSION" ] || \
+    die "test_kit_no_cmp_prints_no_false_warning: the fixture kit did not land"
+  ln -s v0.9.9 "$_kit/current"
+
+  _minpath=$_w/minpath
+  build_minpath "$_minpath" basename chmod dd dirname find mkdir od sh sort ssh tr
+  command -v cmp >/dev/null 2>&1 || \
+    die "test_kit_no_cmp_prints_no_false_warning: this machine has no cmp at all, so the guard under test cannot be exercised here"
+  [ ! -e "$_minpath/cmp" ] || \
+    die "test_kit_no_cmp_prints_no_false_warning: cmp reached the minimal PATH"
+
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_minpath" HOME="$_home" \
+    "$_minpath/sh" "$_kit/current/bin/redoku" install --dry-run --yes --host nowhere \
+    < /dev/null 2>&1)
+  _nocmp_rc=$?
+  set -e
+  assert_eq 0 "$_nocmp_rc" "no cmp: the install plan still runs (output: $ASSERT_OUTPUT)" || return 1
+  # Proof the run got past warn_device_scripts_replaced rather than dying
+  # before it: the plan's watcher line is printed well after it.
+  assert_contains "$ASSERT_OUTPUT" "  watcher: $_kit/current/device/redoku-watcher.service" \
+    "no cmp: the run reached the plan, so the function under test really ran" || return 1
+  case $ASSERT_OUTPUT in
+    *"device/ scripts differ"*)
+      printf 'FAIL: no cmp: warned that identical scripts differ\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
+# ---- upgrade (design doc §8 test 5) --------------------------------------
+#
+# Every upgrade below is driven through the KIT'S OWN CLI ($_kit/current/bin/
+# redoku), never through $REPO/bin/redoku, and that is load-bearing rather than
+# realism for its own sake: mkkit STAMPS the CLI inside a kit with that kit's
+# version, and §6.1's step 2 says a stamped CLI resolves its own tag. Applied
+# to 'upgrade' that would resolve the version already installed, find its tree
+# complete, and report success having changed nothing. Run through the
+# unstamped checkout CLI these tests would pass with that bug present.
+
+# §8 test 5 proper: v1 -> v2 -> v3, one previous kept, older pruned, and the
+# wrapper — which points through <kit>/current and not at a version — comes out
+# byte-identical.
+#
+# Each version is published to the fixture in turn, so 'latest' moves and every
+# upgrade is UNPINNED, which is the real command a user runs. (A file:// base
+# has no redirects, so the tag comes from the tarball's VERSION each time —
+# §6.1 step 4, exactly as the design doc predicts for offline tests.)
+test_kit_upgrade_repoints_and_prunes() {
+  _w=$(mktemp -d "$ROOT/kit-upgrade.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  assert_fails "upgrade: the initial install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --bin-dir "$_bin" --host nowhere --yes < /dev/null || return 1
+  assert_eq "v0.1.0" "$(readlink "$_kit/current")" "upgrade: v0.1.0 is installed" || return 1
+  assert_file "$_bin/redoku" "upgrade: the install wrote the PATH entry" || return 1
+  _wrapper=$(kit_digest "$_bin/redoku")
+
+  # upgrade_to <version> <label> — publishes it, then upgrades through the
+  # kit's own (stamped) CLI. --bin-dir is passed to prove the option now
+  # reaches 'upgrade' as well as 'install'.
+  _upgrade_to() {
+    make_fixture_release "$_w/release" "$1" "$_w/cli"
+    set +e
+    ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$_kit/current/bin/redoku" upgrade --bin-dir "$_bin" \
+      < /dev/null 2>&1)
+    _up_rc=$?
+    set -e
+    assert_eq 0 "$_up_rc" "upgrade: $2 exits 0 (output: $ASSERT_OUTPUT)"
+  }
+
+  _upgrade_to v0.2.0 "v0.1.0 -> v0.2.0" || return 1
+  assert_contains "$ASSERT_OUTPUT" "upgraded: v0.1.0 -> v0.2.0" \
+    "upgrade: it says what it did, from and to" || return 1
+  assert_eq "v0.2.0" "$(readlink "$_kit/current")" "upgrade: current follows v0.2.0" || return 1
+
+  _upgrade_to v0.3.0 "v0.2.0 -> v0.3.0" || return 1
+  assert_contains "$ASSERT_OUTPUT" "upgraded: v0.2.0 -> v0.3.0" \
+    "upgrade: and again, from the new current" || return 1
+
+  assert_eq "v0.3.0" "$(readlink "$_kit/current")" "upgrade: current points at the newest" || return 1
+  assert_eq "v0.3.0" "$(cat "$_kit/current/VERSION")" "upgrade: and the tree there is that version" || return 1
+  assert_file "$_kit/v0.2.0/VERSION" "upgrade: one previous is kept, so a rollback is one swap" || return 1
+  assert_no_file "$_kit/v0.1.0" "upgrade: the version before that is pruned" || return 1
+  # The wrapper execs through <kit>/current, so two upgrades must not have
+  # changed a byte of it.
+  assert_eq "$_wrapper" "$(kit_digest "$_bin/redoku")" \
+    "upgrade: the PATH entry is byte-identical after two upgrades" || return 1
+
+  # Already latest, UNPINNED: §6.1 step 3 finds nothing over file://, so the
+  # tag is only knowable from the tarball — one wasted download, still correct.
+  # What must not happen is any change on disk.
+  _dirs_before=$(find "$_kit" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    "$KIT_SH" "$_kit/current/bin/redoku" upgrade --bin-dir "$_bin" < /dev/null 2>&1)
+  _up_rc=$?
+  set -e
+  assert_eq 0 "$_up_rc" "upgrade: already-latest is not an error (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "already on v0.3.0 — nothing changed" \
+    "upgrade: already-latest says so" || return 1
+  assert_eq "v0.3.0" "$(readlink "$_kit/current")" "upgrade: already-latest left current alone" || return 1
+  assert_eq "$_dirs_before" "$(find "$_kit" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')" \
+    "upgrade: already-latest created no new version directory" || return 1
+  assert_file "$_kit/v0.2.0/VERSION" \
+    "upgrade: already-latest did not prune the rollback target" || return 1
+
+  # Already latest, and the tag known WITHOUT a download — §6.1 step 1 here,
+  # standing in for step 3's redirect, which file:// cannot provide. This is
+  # the path the brief's cost argument is about: no bytes are fetched at all.
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.3.0 \
+    HOME="$_home" "$KIT_SH" "$_kit/current/bin/redoku" upgrade --bin-dir "$_bin" \
+    < /dev/null 2>&1)
+  _up_rc=$?
+  set -e
+  assert_eq 0 "$_up_rc" "upgrade: already-current with a known tag exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "already on v0.3.0 — nothing to download" \
+    "upgrade: it took the cheap path and says so" || return 1
+  # "downloading" is printed on the line immediately before fetch_kit's first
+  # fetch_url, so its absence is proof no download was started.
+  case $ASSERT_OUTPUT in
+    *downloading*)
+      printf 'FAIL: upgrade: the already-current check still downloaded\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # REDOKU_VERSION still pins, even backwards, and the run says so rather than
+  # leaving a surprising result unexplained.
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.2.0 \
+    HOME="$_home" "$KIT_SH" "$_kit/current/bin/redoku" upgrade --bin-dir "$_bin" \
+    < /dev/null 2>&1)
+  _up_rc=$?
+  set -e
+  assert_eq 0 "$_up_rc" "upgrade: a pinned downgrade exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_eq "v0.2.0" "$(readlink "$_kit/current")" "upgrade: REDOKU_VERSION pinned it to v0.2.0" || return 1
+  assert_contains "$ASSERT_OUTPUT" "REDOKU_VERSION=v0.2.0 asked for that version specifically" \
+    "upgrade: it explains why it installed something older" || return 1
+}
+
+# design doc §7's row "current missing or dangling | upgrade repairs it by
+# installing latest" — a documented recovery path, not an error case.
+#
+# Both sub-cases are driven through <kit>/<version>/bin/redoku rather than
+# through <kit>/current/bin/redoku, because with 'current' broken the latter is
+# not runnable — which is also the reason resolve_kit_root derives the kit root
+# from marker 2 alone rather than through resolve_kit_mode's stricter test.
+# With the strict test, the repair would walk away from the kit it is standing
+# in and install a fresh one into ~/.redoku instead.
+test_kit_upgrade_repairs_current() {
+  _w=$(mktemp -d "$ROOT/kit-repair.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  assert_fails "repair: the initial install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  assert_file "$_kit/v0.1.0/VERSION" "repair: the kit installed" || return 1
+
+  # (a) current deleted outright.
+  rm -f "$_kit/current"
+  assert_no_file "$_kit/current" "repair: (a) current really is gone before the run" || return 1
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    "$KIT_SH" "$_kit/v0.1.0/bin/redoku" upgrade --no-symlink < /dev/null 2>&1)
+  _rp_rc=$?
+  set -e
+  assert_eq 0 "$_rp_rc" "repair: (a) a missing current is repaired, not an error (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "was missing — repaired" \
+    "repair: (a) it says what it repaired" || return 1
+  assert_eq "v0.1.0" "$(readlink "$_kit/current")" "repair: (a) current points at a real version again" || return 1
+
+  # (b) current dangling — pointing at a version directory that is not there.
+  rm -f "$_kit/current"
+  ln -s v9.9.9 "$_kit/current"
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    "$KIT_SH" "$_kit/v0.1.0/bin/redoku" upgrade --no-symlink < /dev/null 2>&1)
+  _rp_rc=$?
+  set -e
+  assert_eq 0 "$_rp_rc" "repair: (b) a dangling current is repaired (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "was dangling (it pointed at v9.9.9" \
+    "repair: (b) it names what current pointed at" || return 1
+  assert_eq "v0.1.0" "$(readlink "$_kit/current")" "repair: (b) current points at a real version again" || return 1
+  # A repair is not "already up to date": the tag it landed on happens to be
+  # the one that was there, and saying "nothing changed" would be false. The
+  # needle is the whole sentence, not a bare "nothing changed" — the closing
+  # "on the device: nothing changed" line contains that phrase legitimately,
+  # and matching it made this assertion fire on a correct run.
+  case $ASSERT_OUTPUT in
+    *"already on v0.1.0 — nothing changed"*)
+      printf 'FAIL: repair: (b) a repair reported itself as a no-op\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
+# design doc §5.4's last row: in a checkout, upgrade refuses with the advice
+# the doc gives verbatim. Nothing is fetched and nothing is written.
+test_kit_upgrade_refuses_in_a_checkout() {
+  _w=$(mktemp -d "$ROOT/kit-upgrade-co.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  build_fake_checkout "$_w/checkout"
+
+  assert_fails "upgrade in a checkout: exits non-zero" -- \
+    env REDOKU_BASE_URL="file://$_w/no-such-release" HOME="$_home" \
+      "$KIT_SH" "$_w/checkout/bin/redoku" upgrade < /dev/null || return 1
+  # "git pull && make build" appears in exactly one place in bin/redoku; a bare
+  # "make build" would also match find_game's checkout-mode hint.
+  assert_contains "$ASSERT_OUTPUT" "git pull && make build" \
+    "upgrade in a checkout: the message names the right thing to do instead" || return 1
+  assert_contains "$ASSERT_OUTPUT" "you're in a checkout" \
+    "upgrade in a checkout: and says why" || return 1
+  assert_no_file "$_w/checkout/build" "upgrade in a checkout: nothing was downloaded" || return 1
+  assert_no_file "$_home/.redoku" "upgrade in a checkout: no kit was created behind its back" || return 1
+}
+
+# ---- uninstall --self (design doc §8 test 6) -----------------------------
+#
+# The device stage is what makes this hard to test offline, and the two seams
+# are opposite ones: make_dead_ssh_config for "the device stage must FAIL"
+# (the ordering rule), write_fake_ssh for "the device stage must SUCCEED" (the
+# deletion). Both replace or configure the ssh BINARY from outside; no seam was
+# added to bin/redoku to make any of this observable. write_fake_ssh's header
+# says exactly how much of a device it emulates and which single command it
+# refuses to really run.
+
+# install_a_kit_for_self <work> <home> <kit> <bin|-> <label> — the setup every
+# uninstall --self test starts from. "-" means --no-symlink.
+_install_a_kit_for_self() {
+  _ias_w=$1; _ias_home=$2; _ias_kit=$3; _ias_bin=$4; _ias_label=$5
+  write_stub_cli "$_ias_w/cli"
+  make_fixture_release "$_ias_w/release" v0.1.0 "$_ias_w/cli"
+  if [ "$_ias_bin" = - ]; then
+    set -- --no-symlink
+  else
+    set -- --bin-dir "$_ias_bin"
+  fi
+  assert_fails "$_ias_label: the setup install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_ias_w/release" HOME="$_ias_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_ias_kit" \
+      "$@" --host nowhere --yes < /dev/null || return 1
+  assert_file "$_ias_kit/v0.1.0/VERSION" "$_ias_label: the kit is there to be removed" || return 1
+}
+
+# The ordering rule, and the only sub-case that can be proved without a device
+# at all: the device stage fails, so NOTHING host-side may be deleted and the
+# run has to say the kit is still here. Both connect() and remote() fail by
+# exiting the process, which is why that sentence comes from an EXIT trap.
+test_kit_uninstall_self_device_first() {
+  _w=$(mktemp -d "$ROOT/kit-self-order.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  mkdir -p "$_home"
+  _install_a_kit_for_self "$_w" "$_home" "$_kit" "$_bin" "self ordering" || return 1
+  _wrapper=$(kit_digest "$_bin/redoku")
+  make_dead_ssh_config "$_w/ssh_config"
+
+  assert_fails "self ordering: the run ends non-zero at the connect step" -- \
+    env HOME="$_home" "$KIT_SH" "$_kit/current/bin/redoku" uninstall --self \
+      --bin-dir "$_bin" --ssh-config "$_w/ssh_config" --host nowhere --yes \
+      < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "could not connect to root@nowhere" \
+    "self ordering: it failed at the device, not somewhere host-side" || return 1
+  # "was NOT removed" appears only in that trap.
+  assert_contains "$ASSERT_OUTPUT" "was NOT removed" \
+    "self ordering: it says the host kit is still there" || return 1
+  assert_contains "$ASSERT_OUTPUT" "$_kit" \
+    "self ordering: and names the kit it left alone" || return 1
+
+  assert_file "$_kit/v0.1.0/VERSION" "self ordering: the kit was NOT deleted" || return 1
+  assert_eq "v0.1.0" "$(readlink "$_kit/current")" "self ordering: current is untouched" || return 1
+  assert_eq "$_wrapper" "$(kit_digest "$_bin/redoku")" \
+    "self ordering: the PATH entry is untouched too" || return 1
+}
+
+# --dry-run: the plan names, by absolute path, everything that would be
+# deleted, and deletes none of it. §5.3's rule is that nothing is removed that
+# was not in that plan, so the plan is the contract.
+test_kit_uninstall_self_dry_run() {
+  _w=$(mktemp -d "$ROOT/kit-self-dry.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  mkdir -p "$_home"
+  _install_a_kit_for_self "$_w" "$_home" "$_kit" "$_bin" "self dry-run" || return 1
+  _wrapper=$(kit_digest "$_bin/redoku")
+  # The install resolved the kit root before recording it in the wrapper, so
+  # the plan prints the resolved form and the expectation has to match it.
+  _kit_resolved=$(CDPATH= cd -- "$_kit" && pwd -P) || \
+    die "test_kit_uninstall_self_dry_run: could not resolve $_kit"
+
+  set +e
+  ASSERT_OUTPUT=$(env HOME="$_home" "$KIT_SH" "$_kit/current/bin/redoku" uninstall \
+    --self --dry-run --bin-dir "$_bin" --host nowhere --yes < /dev/null 2>&1)
+  _dr_rc=$?
+  set -e
+  assert_eq 0 "$_dr_rc" "self dry-run: exits 0 (output: $ASSERT_OUTPUT)" || return 1
+
+  assert_contains "$ASSERT_OUTPUT" "            $_kit_resolved" \
+    "self dry-run: the plan names the kit root by absolute path" || return 1
+  assert_contains "$ASSERT_OUTPUT" "            $_bin/redoku" \
+    "self dry-run: the plan names the wrapper by absolute path" || return 1
+  assert_contains "$ASSERT_OUTPUT" "on THIS machine (not the device)" \
+    "self dry-run: the plan says which machine --self is about" || return 1
+  assert_contains "$ASSERT_OUTPUT" "still there and nothing was removed" \
+    "self dry-run: it stops rather than doing it" || return 1
+
+  assert_file "$_kit/v0.1.0/VERSION" "self dry-run: the kit is still there" || return 1
+  assert_eq "v0.1.0" "$(readlink "$_kit/current")" "self dry-run: current is still there" || return 1
+  assert_eq "$_wrapper" "$(kit_digest "$_bin/redoku")" "self dry-run: the wrapper is untouched" || return 1
+}
+
+# The success path: device stage satisfied by write_fake_ssh, so the deletion
+# actually runs. Kit root gone, wrapper gone, nothing else asked for.
+test_kit_uninstall_self_removes_kit_and_wrapper() {
+  _w=$(mktemp -d "$ROOT/kit-self-done.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  mkdir -p "$_home"
+  _install_a_kit_for_self "$_w" "$_home" "$_kit" "$_bin" "self removal" || return 1
+  assert_file "$_bin/redoku" "self removal: the wrapper is there to be removed" || return 1
+  write_fake_ssh "$_w/fakebin/ssh" "$_w/device"
+
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_w/fakebin:$PATH" HOME="$_home" \
+    "$KIT_SH" "$_kit/current/bin/redoku" uninstall --self --bin-dir "$_bin" \
+    --host nowhere --yes < /dev/null 2>&1)
+  _rm_rc=$?
+  set -e
+  assert_eq 0 "$_rm_rc" "self removal: exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  # Non-vacuity: without this the whole test would still "pass" if the device
+  # stage had been skipped rather than satisfied, which is the one thing the
+  # ordering rule says must never happen.
+  assert_contains "$ASSERT_OUTPUT" "fake device: ran the on-device uninstaller" \
+    "self removal: the device stage really ran before anything was deleted" || return 1
+  assert_contains "$ASSERT_OUTPUT" "done — the device is back to stock and this machine has no reDoku kit left" \
+    "self removal: it reports both halves" || return 1
+  # The EXIT trap that carries the "kit left in place" sentence has to be
+  # DISARMED once the device stage succeeds, or every successful run ends by
+  # claiming it removed nothing.
+  case $ASSERT_OUTPUT in
+    *"was NOT removed"*)
+      printf 'FAIL: self removal: a successful run still claimed the kit was left in place\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  assert_no_file "$_kit" "self removal: the kit root is gone" || return 1
+  assert_no_file "$_bin/redoku" "self removal: the PATH entry is gone" || return 1
+  # …and nothing beyond what the plan named: the bin directory itself is not
+  # ours to delete.
+  assert_file "$_bin" "self removal: the bin directory itself was not removed" 2>/dev/null || {
+    [ -d "$_bin" ] || {
+      printf 'FAIL: self removal: the bin directory itself was removed\n' >&2
+      return 1
+    }
+  }
+}
+
+# The two things --self must leave alone, in one run: a `redoku` at the bin dir
+# that is not ours (§5.3's ownership test — a package manager's, or a script of
+# the user's), and anything of the user's own sitting in the kit root, which
+# also stops the root itself from being removed.
+test_kit_uninstall_self_leaves_what_is_not_ours() {
+  _w=$(mktemp -d "$ROOT/kit-self-foreign.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  _bin=$_w/bindir
+  mkdir -p "$_home" "$_bin"
+  # --no-symlink, so nothing of ours is ever written to the bin dir.
+  _install_a_kit_for_self "$_w" "$_home" "$_kit" - "self foreign" || return 1
+  printf '#!/bin/sh\n# somebody else put this here\necho not ours\n' > "$_bin/redoku"
+  chmod +x "$_bin/redoku"
+  _foreign=$(kit_digest "$_bin/redoku")
+  mkdir -p "$_kit/notes"
+  printf 'keep me\n' > "$_kit/notes/README"
+  write_fake_ssh "$_w/fakebin/ssh" "$_w/device"
+
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_w/fakebin:$PATH" HOME="$_home" \
+    "$KIT_SH" "$_kit/current/bin/redoku" uninstall --self --bin-dir "$_bin" \
+    --host nowhere --yes < /dev/null 2>&1)
+  _fg_rc=$?
+  set -e
+  assert_eq 0 "$_fg_rc" "self foreign: exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "fake device: ran the on-device uninstaller" \
+    "self foreign: the device stage really ran" || return 1
+
+  assert_eq "$_foreign" "$(kit_digest "$_bin/redoku")" \
+    "self foreign: a 'redoku' that is not ours is byte-unchanged" || return 1
+  assert_contains "$ASSERT_OUTPUT" "$_bin/redoku" \
+    "self foreign: its path is printed" || return 1
+  assert_contains "$ASSERT_OUTPUT" "is NOT ours" \
+    "self foreign: and the plan said it would be left" || return 1
+
+  assert_no_file "$_kit/v0.1.0" "self foreign: the version directory was still removed" || return 1
+  assert_no_file "$_kit/current" "self foreign: and so was current" || return 1
+  assert_file "$_kit/notes/README" "self foreign: the user's own file survived" || return 1
+  assert_contains "$ASSERT_OUTPUT" "did not put there" \
+    "self foreign: the run says the root was left and why" || return 1
+}
+
+# The guards, each refusing on its own and leaving everything where it is.
+# None of these reaches the device: a root that could never be removed is
+# refused before an ssh connection is opened, so the run cannot end with a
+# device returned to stock and a kit still sitting there for no reason.
+test_kit_uninstall_self_guards_refuse() {
+  _w=$(mktemp -d "$ROOT/kit-self-guards.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home"
+  build_fake_checkout "$_w/checkout"
+
+  # (a) a checkout: there is no kit here to remove.
+  assert_fails "self guards: (a) a checkout is refused" -- \
+    env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" uninstall --self \
+      --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "you're in a checkout — there is no kit here" \
+    "self guards: (a) says why" || return 1
+  assert_contains "$ASSERT_OUTPUT" "bin/redoku uninstall" \
+    "self guards: (a) names the right thing to do instead" || return 1
+
+  # (b) an ordinary directory of the user's, named with --kit.
+  _plain=$_w/not-a-kit
+  mkdir -p "$_plain"
+  printf 'mine\n' > "$_plain/notes.txt"
+  assert_fails "self guards: (b) a non-kit directory is refused" -- \
+    env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" uninstall --self \
+      --kit "$_plain" --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "does not look like a reDoku kit" \
+    "self guards: (b) says what is wrong with it" || return 1
+  assert_file "$_plain/notes.txt" "self guards: (b) its contents are untouched" || return 1
+  case $ASSERT_OUTPUT in
+    *"connecting to"*)
+      printf 'FAIL: self guards: (b) it opened an ssh connection before refusing\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # (c) the home directory itself. $HOME here is under a symlinked path
+  # (/var -> /private/var on macOS), and resolve_kit_root resolves --kit while
+  # $HOME stays as written — so this only refuses because the guard compares
+  # against BOTH spellings, which is the reason it does.
+  assert_fails "self guards: (c) \$HOME is refused as a kit root" -- \
+    env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" uninstall --self \
+      --kit "$_home" --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "refusing to remove your home directory" \
+    "self guards: (c) says so by name" || return 1
+
+  # (d) a directory that holds this very script directly, rather than holding
+  # it the way a kit holds its versions (<root>/<version>/bin/redoku). It has
+  # a 'current' symlink, so it passes the looks-like-a-kit test and only this
+  # guard stands between it and an rm -rf.
+  _odd=$_w/oddkit
+  mkdir -p "$_odd/bin" "$_odd/device" "$_odd/v0.1.0"
+  cp "$REPO/bin/redoku" "$_odd/bin/redoku"
+  chmod +x "$_odd/bin/redoku"
+  cp "$REPO/device/uninstall.sh" "$_odd/device/uninstall.sh"
+  printf 'v0.1.0\n' > "$_odd/v0.1.0/VERSION"
+  ln -s v0.1.0 "$_odd/current"
+  assert_fails "self guards: (d) a root holding this script directly is refused" -- \
+    env HOME="$_home" "$KIT_SH" "$_odd/bin/redoku" uninstall --self \
+      --kit "$_odd" --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "which sits directly in it rather than inside one of its version directories" \
+    "self guards: (d) says exactly what is wrong with the shape" || return 1
+  assert_file "$_odd/v0.1.0/VERSION" "self guards: (d) nothing was removed" || return 1
+
+  # (e) --self is uninstall-only, validated like --purge.
+  assert_fails "self guards: (e) --self on another command is refused" -- \
+    env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" status --self \
+      --host nowhere < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "--self only applies to uninstall" \
+    "self guards: (e) says so" || return 1
+}
+
+# ---- status's kit line (design doc §5.2) ---------------------------------
+#
+# The one line of `status` that is about this machine. Driven with --dry-run so
+# connect() returns before any ssh is attempted; the remote block is then a
+# dry-run echo and the kit line is printed after it either way.
+test_kit_status_line() {
+  _w=$(mktemp -d "$ROOT/kit-status.XXXXXX")
+  _home=$_w/home
+  _kit=$_home/.redoku
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # (a) a checkout has no kit, and must say what IS true there rather than
+  # printing an empty value.
+  build_fake_checkout "$_w/checkout"
+  _co_repo=$(CDPATH= cd -- "$_w/checkout" && pwd) || die "test_kit_status_line: cd failed"
+  set +e
+  ASSERT_OUTPUT=$(env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" status \
+    --dry-run --host nowhere < /dev/null 2>&1)
+  _st_rc=$?
+  set -e
+  assert_eq 0 "$_st_rc" "status line: (a) a checkout status exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "kit      : none — running from $_co_repo (KIT_VERSION=dev)" \
+    "status line: (a) it names the checkout and KIT_VERSION" || return 1
+
+  # (b) inside a kit: the version and the path, aligned with the device's own
+  # lines and with $HOME abbreviated to ~.
+  assert_fails "status line: the setup install ends at the connect step" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+      --no-symlink --host nowhere --yes < /dev/null || return 1
+  set +e
+  ASSERT_OUTPUT=$(env HOME="$_home" "$KIT_SH" "$_kit/current/bin/redoku" status \
+    --dry-run --host nowhere < /dev/null 2>&1)
+  _st_rc=$?
+  set -e
+  assert_eq 0 "$_st_rc" "status line: (b) a kit status exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "kit      : v0.1.0 (~/.redoku/current)" \
+    "status line: (b) the version, the path, ~-abbreviated, aligned like the rest" || return 1
+  # It is host-side and stays host-side: the remote script is echoed verbatim
+  # by the dry run, and "kit" must not appear inside it.
+  case $ASSERT_OUTPUT in
+    *'printf "kit'*)
+      printf 'FAIL: status line: the kit line was smuggled into the remote script\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # (c) a broken kit says so, and names the command that repairs it, rather
+  # than printing an empty version.
+  rm -f "$_kit/current"
+  set +e
+  ASSERT_OUTPUT=$(env HOME="$_home" "$KIT_SH" "$_kit/v0.1.0/bin/redoku" status \
+    --dry-run --host nowhere < /dev/null 2>&1)
+  _st_rc=$?
+  set -e
+  assert_eq 0 "$_st_rc" "status line: (c) a broken kit's status still exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "kit      : ~/.redoku/current — broken, repair it with: redoku upgrade" \
+    "status line: (c) it says what is wrong and how to fix it" || return 1
+}
+
 # ---- main -----------------------------------------------------------------
 
 TESTS='
@@ -2345,6 +3276,29 @@ test_kit_reuse_gate_rejects_a_partial_tree
 test_kit_stamped_version_is_validated
 test_kit_staging_shaped_tag_is_refused
 test_kit_mv_failure_leaves_nothing_behind
+test_kit_step4_reuses_a_complete_tree
+test_kit_current_shaped_tag_is_refused
+test_kit_reuse_gate_rejects_a_symlinked_destination
+test_kit_no_cmp_prints_no_false_warning
+'
+
+# design doc §8's tests 5 and 6, plus §5.2's status line. All three drive the
+# real bin/redoku offline against a file:// fixture; none of them touches a
+# device except through make_dead_ssh_config (which must fail) or
+# write_fake_ssh (which stands in for one).
+UPGRADE_TESTS='
+test_kit_upgrade_repoints_and_prunes
+test_kit_upgrade_repairs_current
+test_kit_upgrade_refuses_in_a_checkout
+'
+
+UNINSTALL_SELF_TESTS='
+test_kit_uninstall_self_device_first
+test_kit_uninstall_self_dry_run
+test_kit_uninstall_self_removes_kit_and_wrapper
+test_kit_uninstall_self_leaves_what_is_not_ours
+test_kit_uninstall_self_guards_refuse
+test_kit_status_line
 '
 
 for KIT_SH in $KIT_SHELLS; do
@@ -2371,6 +3325,20 @@ done
 for KIT_SH in $KIT_SHELLS; do
   printf '=== fetch_kit / install --download tests under KIT_SH=%s ===\n' "$KIT_SH"
   for _t in $FETCH_KIT_TESTS; do
+    run_test "$_t"
+  done
+done
+
+for KIT_SH in $KIT_SHELLS; do
+  printf '=== upgrade tests under KIT_SH=%s ===\n' "$KIT_SH"
+  for _t in $UPGRADE_TESTS; do
+    run_test "$_t"
+  done
+done
+
+for KIT_SH in $KIT_SHELLS; do
+  printf '=== uninstall --self / status tests under KIT_SH=%s ===\n' "$KIT_SH"
+  for _t in $UNINSTALL_SELF_TESTS; do
     run_test "$_t"
   done
 done
