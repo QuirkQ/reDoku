@@ -160,6 +160,41 @@ WANT_LATEST=0
 say()  { printf '==> %s\n' "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# How the user spells THIS CLI, in whichever of the two worlds this run is
+# printing into: 'redoku' on the PATH from a kit, 'bin/redoku' from a
+# checkout. Every message that tells someone to run this program again has to
+# go through it, because advice that names a command the reader does not have
+# is the same class of wrong advice as advice that names the wrong command
+# (design doc §7's last paragraph) — and the plan and closing blocks of
+# `install` used to end on 'bin/redoku status' however they were reached.
+#
+# It sits up here with say() and die(), rather than beside refetch_hint where
+# it began, because the argument parser's "unknown argument" die is one of its
+# callers and that loop is top-level code that RUNS while this file is still
+# being read: a definition further down had not happened yet, and the call
+# produced "cli_name: command not found" and an empty name. Measured, once,
+# rather than reasoned about — which is also why nothing above this line may
+# call it. Both variables it reads are set well before here.
+#
+# Deliberately the same condition refetch_hint uses further down, and they
+# stay two functions rather than one: this one substitutes a NAME, while
+# refetch_hint's two answers differ in the verb as well ('upgrade' against
+# 'install --download'), so neither can be derived from the other by renaming.
+#
+# The one case it cannot spell is a kit tree somebody unpacked by hand: marker
+# 2 is there, so this says 'redoku', but no PATH entry was ever written for it.
+# That state now has its own answer wherever it matters — resolve_kit_root
+# refuses it outright and names the full path to run — and inventing a third
+# spelling here would be a branch for a case the surrounding messages already
+# turn away.
+cli_name() {
+  if [ "$IN_KIT" -eq 1 ] || [ -n "$KIT_DIR" ]; then
+    printf '%s\n' "redoku"
+  else
+    printf '%s\n' "bin/redoku"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 redoku — put the rm2fb display server and the reDoku game on a reMarkable 2
@@ -309,7 +344,7 @@ while [ $# -gt 0 ]; do
     -y|--yes)        YES=1 ;;
     -n|--dry-run)    DRY=1 ;;
     -h|--help)       usage; exit 0 ;;
-    *)               die "unknown argument '$1' — see bin/redoku --help" ;;
+    *)               die "unknown argument '$1' — see $(cli_name) --help" ;;
   esac
   shift
 done
@@ -562,33 +597,6 @@ in_kit_tree() { [ "$IN_KIT" -eq 1 ] || [ "$KIT_ROOT" != "$REPO" ]; }
 # it and nothing downloaded yet (the bootstrap's temp directory) has no
 # `make build` to offer either, because it has no checkout to run it in.
 game_is_prebuilt() { in_kit_tree || [ "$KIT_VERSION" != dev ]; }
-
-# How the user spells THIS CLI, in whichever of the two worlds this run is
-# printing into: 'redoku' on the PATH from a kit, 'bin/redoku' from a
-# checkout. Every message that tells someone to run this program again has to
-# go through it, because advice that names a command the reader does not have
-# is the same class of wrong advice as advice that names the wrong command
-# (design doc §7's last paragraph) — and the plan and closing blocks of
-# `install` used to end on 'bin/redoku status' however they were reached.
-#
-# Deliberately the same condition refetch_hint uses below, and they stay two
-# functions rather than one: this one substitutes a NAME, while refetch_hint's
-# two answers differ in the verb as well ('upgrade' against 'install
-# --download'), so neither can be derived from the other by renaming.
-#
-# The one case it cannot spell is a kit tree somebody unpacked by hand: marker
-# 2 is there, so this says 'redoku', but no PATH entry was ever written for it.
-# That state now has its own answer wherever it matters — resolve_kit_root
-# refuses it outright and names the full path to run — and inventing a third
-# spelling here would be a branch for a case the surrounding messages already
-# turn away.
-cli_name() {
-  if [ "$IN_KIT" -eq 1 ] || [ -n "$KIT_DIR" ]; then
-    printf '%s\n' "redoku"
-  else
-    printf '%s\n' "bin/redoku"
-  fi
-}
 
 # The command that re-fetches whatever the prebuilt artifacts came from —
 # printed by every "this kit is incomplete or corrupt" message in this file,
@@ -1147,6 +1155,23 @@ self_tree_dir() {
 # keeps in here — a note, a tarball, a source tree of their own that happens
 # to carry a VERSION — is left alone. Then it must be a direct child of the
 # base by string prefix. Then it must not be the tree we are executing from.
+#
+# "Keep one previous" is a promise about THIS KIT (§5.2, §5.3), and keeping it
+# takes more than trusting <keep-too>. That argument names whatever `current`
+# pointed at before the repoint, and on the repair paths §7 exists for it names
+# nothing that is there: a dangling `current`, a missing one, or one made by
+# hand with an absolute target. Every one of those left the kit with ZERO
+# rollback targets, because a keep-too that matches no directory excludes no
+# directory from the sweep.
+#
+# So the keep-too is VALIDATED here rather than trusted, and replaced when it
+# names nothing. The replacement needs no version sorting, which is what makes
+# it portable: §5.2 promises *a* rollback target, not the newest one — and the
+# preference order below reflects which target is most useful rather than which
+# is highest. First choice is the tree this run is executing from, because
+# deleting that is never what anyone meant and it is the version the user
+# demonstrably has in hand; failing that, the first surviving version directory
+# `find` reports, because any rollback target beats none.
 prune_kit() {
   _pk_base=$1
   _pk_keep=$2
@@ -1155,6 +1180,42 @@ prune_kit() {
   # the base is already resolved by every caller, but proving that here costs
   # one cd and removes the need to trust it.
   _pk_self=$(self_tree_dir) || _pk_self=
+  # A keep-too that arrived as a path rather than a bare tag — which a hand-made
+  # `ln -s /abs/path/to/v0.1.0 current` produces — is reduced to the name the
+  # loop below actually compares against. Reducing it can only ever make this
+  # function keep MORE than it was asked to, never less, which is the safe
+  # direction for the one function here that deletes.
+  _pk_keep_too=${_pk_keep_too##*/}
+  if [ -z "$_pk_keep_too" ] || ! is_version_dir "$_pk_base/$_pk_keep_too"; then
+    _pk_keep_too=
+    _pk_why=
+    while IFS= read -r _pk_cand; do
+      [ -n "$_pk_cand" ] || continue
+      _pk_cname=$(basename "$_pk_cand")
+      [ "$_pk_cname" != "$_pk_keep" ] || continue
+      is_version_dir "$_pk_cand" || continue
+      if [ -n "$_pk_self" ]; then
+        _pk_cres=$(CDPATH='' cd -P -- "$_pk_cand" 2>/dev/null && pwd -P) || _pk_cres=
+        if [ -n "$_pk_cres" ] && [ "$_pk_cres" = "$_pk_self" ]; then
+          _pk_keep_too=$_pk_cname
+          _pk_why="it is the version this command is running from"
+          break
+        fi
+      fi
+      if [ -z "$_pk_keep_too" ]; then
+        _pk_keep_too=$_pk_cname
+        _pk_why="it is the first version still here"
+      fi
+    done <<EOF
+$(find "$_pk_base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+EOF
+    # Which of the two reasons applied is worth saying: one of them means the
+    # kit kept the version you have in hand, the other that it kept whatever
+    # was left. Both beat "no rollback target at all", which is what naming
+    # neither used to produce.
+    [ -z "$_pk_keep_too" ] || \
+      say "  keeping $_pk_keep_too as the rollback target — 'current' named no usable version, and $_pk_why"
+  fi
   while IFS= read -r _pk_dir; do
     [ -n "$_pk_dir" ] || continue
     _pk_name=$(basename "$_pk_dir")
@@ -1165,12 +1226,17 @@ prune_kit() {
       "$_pk_base"/?*) ;;
       *) die "internal error: refusing to remove '$_pk_dir', which is not under $_pk_base" ;;
     esac
-    # The backstop for design doc §7's repair case. When `current` was missing
-    # or dangling there is no meaningful "one previous" to name, so prune_kit
-    # would otherwise be handed a keep-too that does not exist and would sweep
-    # every real version — including this one, the one being executed. Keeping
-    # it is both the safety rule and what makes the repair still leave exactly
-    # one previous version behind.
+    # The safety rule, kept separate from the rollback promise above on
+    # purpose: that one is about THIS KIT having a previous version, this one
+    # is about never unlinking the tree whose bytes the shell is still reading.
+    # They coincide when the CLI lives in the kit being repaired and diverge
+    # when --kit or $REDOKU_HOME names a different one, which is exactly the
+    # case keying the promise on this rule alone got wrong.
+    #
+    # Its one visible cost: run an OLD version's CLI directly against a kit
+    # whose `current` is healthy, and the kit keeps three version directories
+    # (the new one, the one-previous, and the one you ran from) where §5.3
+    # pictures two. Harmless, and much better than the alternative.
     if [ -n "$_pk_self" ]; then
       _pk_res=$(CDPATH='' cd -P -- "$_pk_dir" 2>/dev/null && pwd -P) || _pk_res=
       if [ -n "$_pk_res" ] && [ "$_pk_res" = "$_pk_self" ]; then
@@ -1942,16 +2008,35 @@ warn_device_scripts_replaced() {
 # not merely present. Each one therefore says what makes the path it approves
 # impossible to point somewhere else, and each has its own message.
 
-# check_removable_kit_root <root> — dies unless <root> is a path this script
-# may recursively delete. Called TWICE on purpose: once by cmd_uninstall
-# before it has touched the device, so a root that could never be removed is
-# refused before anything happens rather than after the device has been
-# returned to stock; and once by remove_kit, immediately before the first
+# check_kit_root <root> <verb> — dies unless <root> is a directory this script
+# may operate on as a kit root. <verb> is `remove` or `write`, and it does two
+# things: it picks the voice every message speaks in, and it decides guard 5's
+# strictness. Everything else is identical for both, which is the point — the
+# two commands that touch a kit root are held to one standard by one function,
+# and a second copy of these rules would be a second answer free to disagree.
+#
+# Called THREE times: by cmd_uninstall before it has touched the device (so a
+# root that could never be removed is refused before anything happens rather
+# than after the device has been returned to stock), by cmd_upgrade before it
+# writes or prunes anything, and by remove_kit immediately before the first
 # `rm -rf`, so the check cannot be skipped by a future caller that forgets it.
 # Same belt-and-braces shape as push_file's refusal to write outside
 # $REMOTE_DIR and fetch_kit's refusal to unpack outside its base.
-check_removable_kit_root() {
+#
+# The verb exists because sharing the function was right and sharing the VOICE
+# was not: every message here used to say the command was about to remove
+# something, and `upgrade` removes nothing — so `upgrade --kit ~` refused with
+# "refusing to remove your home directory", describing a command the user had
+# not run. That is the same misdescribes-state defect this file treats as real
+# wherever else it appears.
+check_kit_root() {
   _crk_root=$1
+  _crk_verb=$2
+  case $_crk_verb in
+    remove) _crk_act='remove'; _crk_asa='to remove' ;;
+    write)  _crk_act='install into'; _crk_asa='to install into' ;;
+    *) die "internal error: unknown check_kit_root verb '$_crk_verb'" ;;
+  esac
 
   # 1. Non-empty. `set -u` catches an UNSET variable and says nothing at all
   #    about an EMPTY one, so `rm -rf "$root"/*` with an empty root walks the
@@ -1959,7 +2044,7 @@ check_removable_kit_root() {
   #    empty-uuid rm -rf" for exactly that shape; an explicit check is what
   #    closes it, not errexit and not careful quoting.
   [ -n "$_crk_root" ] || \
-    die "internal error: refusing to remove an empty kit path — say which kit with --kit DIR"
+    die "internal error: refusing to $_crk_act an empty kit path — say which kit with --kit DIR"
 
   # 2. Absolute. A relative path would be resolved against whatever directory
   #    the user happened to be standing in, so the SAME kit root would name
@@ -1967,7 +2052,7 @@ check_removable_kit_root() {
   #    this is what proves it did.
   case $_crk_root in
     /*) ;;
-    *)  die "internal error: refusing to remove the relative path '$_crk_root' — a kit root must be absolute" ;;
+    *)  die "internal error: refusing to $_crk_act the relative path '$_crk_root' — a kit root must be absolute" ;;
   esac
 
   # 3. Not the filesystem root, and not the home directory itself. Both are
@@ -1977,12 +2062,12 @@ check_removable_kit_root() {
   #    as resolved, because ~ is a symlinked path on some systems and a guard
   #    that only catches one spelling of your home directory is not a guard.
   [ "$_crk_root" != / ] || \
-    die "refusing to remove / as a kit root. Point --kit at the kit directory itself, e.g. --kit ~/.redoku"
+    die "refusing $_crk_asa / as a kit root. Point --kit at the kit directory itself, e.g. --kit ~/.redoku"
   _crk_home=$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P) || _crk_home=$HOME
   { [ "$_crk_root" != "$HOME" ] && [ "$_crk_root" != "$_crk_home" ]; } || \
-    die "refusing to remove your home directory ($_crk_root) as a kit root. A kit
-  root is a directory holding version directories and a 'current' symlink —
-  point --kit at that, e.g. --kit ~/.redoku"
+    die "refusing $_crk_asa your home directory ($_crk_root) as a kit root. A kit
+  root is a directory of its own holding version directories and a 'current'
+  symlink — point --kit at that, e.g. --kit ~/.redoku"
 
   # 4. Not an ancestor of this running script except in the one way a kit root
   #    legitimately is one. `uninstall --self` is normally run FROM inside the
@@ -1996,61 +2081,103 @@ check_removable_kit_root() {
     case $_crk_self in
       "$_crk_root"/?*/?*) ;;   # <root>/<version>/bin — the expected shape
       "$_crk_root" | "$_crk_root"/?*)
-        die "refusing to remove $_crk_root: this script is running from $_crk_self,
+        die "refusing $_crk_asa $_crk_root: this script is running from $_crk_self,
   which sits directly in it rather than inside one of its version directories.
-  That is not the shape of a kit root, so removing it would delete more than a
-  kit. Name the real kit root with --kit DIR." ;;
+  That is not the shape of a kit root, so treating it as one would reach well
+  beyond a kit. Name the real kit root with --kit DIR." ;;
     esac
   fi
 
   # 5. And it has to LOOK like a kit root, which is the guard that turns all of
-  #    the above from "not obviously wrong" into "this is a kit". Two arms, and
-  #    both name something only this installer creates:
+  #    the above from "not obviously wrong" into "this is a kit". Every arm
+  #    names something only this installer creates, and each is written to the
+  #    shape of a real defect rather than to a general feeling of caution.
   #
-  #      * a 'current' symlink — §5.3 gives that name to us, and valid_tag now
-  #        refuses it as a tag so nothing else in a kit root can be called it;
-  #      * at least one direct child that passes is_version_dir, i.e. named
-  #        after its own VERSION.
+  #    Arm A, the 'current' symlink. §5.3 gives us that name, but the NAME
+  #    alone proves nothing: `current -> releases/<timestamp>` is the canonical
+  #    Capistrano deploy root, so "has a symlink called current" admitted a
+  #    user's deploy directory whole — `uninstall --self` deleted their symlink,
+  #    and `upgrade` wrote a version directory into their project folder and
+  #    called their directory "still there but incomplete". So the symlink has
+  #    to point at one of OURS: a resolved target that passes is_version_dir,
+  #    or — for the one window §6.2 documents, between the `rm -f` and the
+  #    `ln -s` of a repoint, and for the dangling `current` §7 exists to
+  #    repair — a target that at least reads like a tag we would have written.
+  #    `releases/20240101120000` fails that on the slash alone.
   #
-  #    "Holds a VERSION file" was the earlier test for the second arm and it
-  #    was far too loose: ~/Documents holding a source tree coolproject-1.2/
-  #    with a VERSION at its root passed all five guards, and coolproject-1.2
-  #    was then recursively deleted while the plan block called it "every
-  #    version directory in it". A directory of somebody's projects is now
-  #    refused with its contents intact.
+  #    Arm B, a direct child that passes is_version_dir — named after its own
+  #    VERSION. "Holds a VERSION file" was the earlier test and it was far too
+  #    loose: ~/Documents holding a source tree coolproject-1.2/ with a VERSION
+  #    at its root passed all five guards and was recursively deleted, while
+  #    the plan block called it "every version directory in it".
   #
-  #    An ABSENT or EMPTY root passes, and that is deliberate rather than a
-  #    hole: this guard exists to stop a recursive delete reaching content that
-  #    is not ours, and a directory with no children has no content for any
-  #    rm -rf to reach. It is also the state `upgrade` legitimately starts from
-  #    — a fresh kit root, or one left empty by a download that failed after
-  #    fetch_kit's mkdir — and refusing there would refuse the repair §7
-  #    promises.
+  #    Arm C is `write` only, and the asymmetry is the point. An ABSENT or
+  #    EMPTY root, or one holding nothing but our own `.staging.*` leftovers,
+  #    is somewhere `upgrade` may legitimately create a kit — a fresh root, or
+  #    one a SIGKILLed download left mid-flight — and refusing there would
+  #    refuse §7's repair for a state that contains nothing of the user's at
+  #    all. It is NOT somewhere `uninstall --self` may act: there is no kit to
+  #    remove, and passing it made the closing `rmdir` delete an empty
+  #    directory this installer never created, which is the line this milestone
+  #    drew. `remove` therefore stops at arms A and B.
   _crk_looks=0
-  if [ ! -d "$_crk_root" ]; then
-    _crk_looks=1
-  elif [ -L "$_crk_root/current" ]; then
-    _crk_looks=1
-  else
-    _crk_children=0
+  if [ -L "$_crk_root/current" ]; then
+    _crk_ctarget=$(readlink "$_crk_root/current") || _crk_ctarget=
+    _crk_cres=$(CDPATH='' cd -P -- "$_crk_root/current" 2>/dev/null && pwd -P) || _crk_cres=
+    if [ -n "$_crk_cres" ]; then
+      ! is_version_dir "$_crk_cres" || _crk_looks=1
+    else
+      # Dangling. Nothing to resolve, so the only evidence left is the name it
+      # was pointed at, which for ours is always a bare tag.
+      ! valid_tag "$_crk_ctarget" || _crk_looks=1
+    fi
+  fi
+  if [ "$_crk_looks" -eq 0 ]; then
     while IFS= read -r _crk_dir; do
       [ -n "$_crk_dir" ] || continue
-      _crk_children=1
       is_version_dir "$_crk_dir" || continue
       _crk_looks=1
       break
     done <<EOF
+$(find "$_crk_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+EOF
+  fi
+  if [ "$_crk_looks" -eq 0 ] && [ "$_crk_verb" = write ]; then
+    if [ ! -d "$_crk_root" ]; then
+      _crk_looks=1
+    else
+      _crk_looks=1
+      while IFS= read -r _crk_ent; do
+        [ -n "$_crk_ent" ] || continue
+        case ${_crk_ent##*/} in
+          .staging.*) ;;
+          *) _crk_looks=0; break ;;
+        esac
+      done <<EOF
 $(find "$_crk_root" -mindepth 1 -maxdepth 1 2>/dev/null)
 EOF
-    [ "$_crk_children" -eq 1 ] || _crk_looks=1
+    fi
   fi
-  [ "$_crk_looks" -eq 1 ] || \
+  if [ "$_crk_looks" -eq 0 ]; then
+    if [ "$_crk_verb" = write ]; then
+      die "$_crk_root does not look like a reDoku kit, so nothing was installed into it.
+  A kit root holds a 'current' symlink pointing at one of its own version
+  directories, or version directories named after their own VERSION file
+  (v0.3.0/ containing a VERSION that reads v0.3.0). This one holds neither, so
+  what is in it belongs to you rather than to this installer, and 'upgrade' has
+  no kit here to upgrade. To put a kit somewhere, install one — that creates the
+  root and everything in it:
+    redoku install --download --kit DIR
+  If your kit is somewhere else, name it with --kit DIR."
+    fi
     die "$_crk_root does not look like a reDoku kit, so nothing was removed.
-  A kit root holds a 'current' symlink, or version directories named after their
-  own VERSION file (v0.3.0/ containing a VERSION that reads v0.3.0) — this one
-  holds neither, so whatever is in it belongs to you rather than to this
-  installer. If your kit is somewhere else, name it with --kit DIR; if you meant
-  to delete this directory, delete it yourself."
+  A kit root holds a 'current' symlink pointing at one of its own version
+  directories, or version directories named after their own VERSION file
+  (v0.3.0/ containing a VERSION that reads v0.3.0) — this one holds neither, so
+  whatever is in it belongs to you rather than to this installer. If your kit is
+  somewhere else, name it with --kit DIR; if you meant to delete this directory,
+  delete it yourself."
+  fi
 }
 
 # remove_kit <root> — delete the version directories, then 'current', then the
@@ -2068,7 +2195,7 @@ EOF
 # removed.
 remove_kit() {
   _rk_root=$1
-  check_removable_kit_root "$_rk_root"
+  check_kit_root "$_rk_root" remove
 
   # Nothing to do, and saying so beats the alternative: the loop below would
   # find nothing, and the rmdir at the end would fail on a directory that was
@@ -2354,17 +2481,31 @@ cmd_upgrade() {
   # came to create `current` and a version directory in a user's $HOME and
   # `rm -rf` a sibling source tree, in a directory `uninstall --self` refuses
   # by name. One function, two callers, one answer.
-  check_removable_kit_root "$KIT_DIR"
+  check_kit_root "$KIT_DIR" write
 
   # What 'current' points at right now: the answer to "is there anything to
   # do?", and — through fetch_kit's own prune — the version kept as the
-  # rollback target. Read with `readlink` rather than by resolving the path,
-  # because a DANGLING current still names a target while a missing one names
-  # nothing, and §7 says upgrade repairs both rather than refusing either.
+  # rollback target.
+  #
+  # Two different readings, because they answer two different questions.
+  # `readlink` gives what the link SAYS, which is what a message about a
+  # dangling link has to quote and the only thing left when nothing resolves.
+  # `cd -P` gives what it POINTS AT, and that is what every test below wants:
+  # string-joining readlink's output onto $KIT_DIR was wrong for a `current`
+  # made by hand as `ln -s /abs/path/to/v0.1.0 current` — a plausible manual
+  # rollback — which built "<kit>//abs/path/..." and then reported a complete
+  # version directory sitting right there as "which isn't there".
   _up_now=
+  _up_target=
   if [ -L "$KIT_DIR/current" ]; then
     _up_now=$(readlink "$KIT_DIR/current") || _up_now=
+    _up_target=$(CDPATH='' cd -P -- "$KIT_DIR/current" 2>/dev/null && pwd -P) || _up_target=
   fi
+  # The tag `current` names, for comparing against $TAG — the basename of what
+  # it RESOLVES to, so an absolute link and a relative one to the same
+  # directory give the same answer.
+  _up_tag=
+  [ -z "$_up_target" ] || _up_tag=${_up_target##*/}
   # Is that target actually a usable version tree? A dangling or half-deleted
   # one is not "the version you are on", it is the damage this command
   # repairs — and the closing message has to be able to tell those apart, or
@@ -2379,13 +2520,13 @@ cmd_upgrade() {
   _up_ok=0
   _up_state=missing
   if [ -n "$_up_now" ]; then
-    if kit_tree_is_complete "$KIT_DIR/$_up_now"; then
+    if [ -z "$_up_target" ]; then
+      _up_state=dangling
+    elif kit_tree_is_complete "$_up_target"; then
       _up_ok=1
       _up_state=ok
-    elif [ -e "$KIT_DIR/$_up_now" ]; then
-      _up_state=incomplete
     else
-      _up_state=dangling
+      _up_state=incomplete
     fi
   fi
 
@@ -2405,7 +2546,7 @@ cmd_upgrade() {
   # a cost worth restructuring for.
   WANT_LATEST=1
   resolve_tag
-  if [ "$_up_ok" -eq 1 ] && [ -n "$TAG" ] && [ "$TAG" = "$_up_now" ]; then
+  if [ "$_up_ok" -eq 1 ] && [ -n "$TAG" ] && [ "$TAG" = "$_up_tag" ]; then
     say "already on $TAG — nothing to download"
     say "  ($KIT_DIR/current -> $TAG, and that is the latest this run could find)"
     return 0
@@ -2442,10 +2583,10 @@ cmd_upgrade() {
       *)
         say "$KIT_DIR/current pointed at $_up_now, which is still there but incomplete — repaired: it now points at $FETCH_TAG" ;;
     esac
-  elif [ "$FETCH_TAG" = "$_up_now" ]; then
+  elif [ "$FETCH_TAG" = "$_up_tag" ]; then
     say "already on $FETCH_TAG — nothing changed"
   else
-    say "upgraded: $_up_now -> $FETCH_TAG"
+    say "upgraded: $_up_tag -> $FETCH_TAG"
   fi
   # REDOKU_VERSION pins upgrade exactly as it pins install (§5.2), which means
   # an 'upgrade' can legitimately install something OLDER than what was there.
@@ -2600,7 +2741,7 @@ cmd_uninstall() {
     # stock — the deletion re-checks for itself immediately before its first
     # rm -rf, but a root that could never pass has no business getting as far
     # as an ssh connection.
-    check_removable_kit_root "$KIT_DIR"
+    check_kit_root "$KIT_DIR" remove
     # §5.3's ownership test, through the one helper that knows it: the file is
     # ours only if it holds the exec line for THIS kit. Anything else is
     # somebody's own `redoku` — a package manager's, a script of their own —
