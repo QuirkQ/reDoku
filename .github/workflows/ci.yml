@@ -96,8 +96,15 @@ jobs:
       # its fixture kits from synthetic files via mkkit.sh's --build-dir, and
       # the Makefile runs it on the host on purpose (tools/install.sh's whole
       # risk surface IS the host's curl, shasum and tar).
+      # KIT_SHELLS is set explicitly, and the third entry is the point. On
+      # ubuntu-latest /bin/sh IS dash, so the suite's own default of "sh dash"
+      # runs dash twice and gives CI no bash coverage at all — bash 3.2 exists
+      # only on a developer's macOS, which CI does not run. Naming all three
+      # takes the run from 136 assertions to 204.
       - name: Test kit
         run: make test-kit
+        env:
+          KIT_SHELLS: sh dash bash
 
       - name: Build
         run: make build
