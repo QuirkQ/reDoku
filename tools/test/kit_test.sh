@@ -402,7 +402,21 @@ write_fake_ssh() {
 # Harness-written stand-in for ssh — see write_fake_ssh in tools/test/kit_test.sh.
 _cmd=
 for _a in "\$@"; do _cmd=\$_a; done
-_cmd=\$(printf '%s' "\$_cmd" | sed 's#/home/root/redoku#$_wfs_dev#g')
+# Every occurrence of the fixed remote path replaced with this fake device's
+# root, in pure shell rather than with sed (review N4): the replacement text is
+# a path from mktemp, and a '#', '&' or '\\' anywhere in it would corrupt a sed
+# substitution and surface as what looks like a product bug. \${var%%pat*} and
+# \${var#*pat} do it with no escaping question at all.
+_out=
+while :; do
+  case \$_cmd in
+    *"/home/root/redoku"*) ;;
+    *) break ;;
+  esac
+  _out=\$_out\${_cmd%%/home/root/redoku*}'$_wfs_dev'
+  _cmd=\${_cmd#*/home/root/redoku}
+done
+_cmd=\$_out\$_cmd
 case \$_cmd in
   "sh $_wfs_dev/uninstall.sh"|"sh $_wfs_dev/uninstall.sh --purge")
     printf 'fake device: ran the on-device uninstaller\n'
@@ -2887,6 +2901,43 @@ test_kit_upgrade_repairs_current() {
       printf 'FAIL: repair: (b) a repair reported itself as a no-op\n  output: %s\n' "$ASSERT_OUTPUT" >&2
       return 1 ;;
   esac
+
+  # (c) review F4: current points at a tree that IS there but is incomplete.
+  # One message used to cover this and the dangling case together, so a
+  # directory still sitting on disk was reported as "which isn't there" — the
+  # message-that-misdescribes-state class this file treats as a real defect.
+  rm -f "$_kit/current"
+  ln -s v0.1.0 "$_kit/current"
+  rm -f "$_kit/v0.1.0/build/rm2/bin/redoku"
+  assert_file "$_kit/v0.1.0/VERSION" "repair: (c) the target really is still on disk" || return 1
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    "$KIT_SH" "$_kit/v0.1.0/bin/redoku" upgrade --no-symlink < /dev/null 2>&1)
+  _rp_rc=$?
+  set -e
+  assert_eq 0 "$_rp_rc" "repair: (c) an incomplete target is repaired (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "which is still there but incomplete" \
+    "repair: (c) the message describes the state it actually found" || return 1
+  case $ASSERT_OUTPUT in
+    *"which isn't there"*)
+      printf 'FAIL: repair: (c) a present directory was reported as absent\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+
+  # …and the --dry-run plan tells the same story, rather than printing
+  # "from : v0.1.0 — what <kit>/current points at now" as though that were
+  # the version you are on.
+  rm -f "$_kit/current"
+  ln -s v9.9.9 "$_kit/current"
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    "$KIT_SH" "$_kit/v0.1.0/bin/redoku" upgrade --no-symlink --dry-run < /dev/null 2>&1)
+  _rp_rc=$?
+  set -e
+  assert_eq 0 "$_rp_rc" "repair: (d) the dry-run plan exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "  from    : nothing usable" \
+    "repair: (d) the plan does not claim a broken current is a version you are on" || return 1
+  assert_no_file "$_kit/v9.9.9" "repair: (d) the dry run created nothing" || return 1
 }
 
 # design doc §5.4's last row: in a checkout, upgrade refuses with the advice
@@ -2908,6 +2959,114 @@ test_kit_upgrade_refuses_in_a_checkout() {
     "upgrade in a checkout: and says why" || return 1
   assert_no_file "$_w/checkout/build" "upgrade in a checkout: nothing was downloaded" || return 1
   assert_no_file "$_home/.redoku" "upgrade in a checkout: no kit was created behind its back" || return 1
+}
+
+# Review F1 (critical): `upgrade` derived its kit root as `dirname "$REPO"` on
+# marker 2 alone, and marker 2 is carried by a kit tree unpacked BY HAND just
+# as much as by an installed one. So `tar xzf redoku-rm2.tar.gz -C ~` followed
+# by `~/redoku/bin/redoku upgrade` made $HOME a kit root and recursively
+# deleted every child of it holding a VERSION file — a source tree with a
+# VERSION at its root being entirely commonplace — with no flag, no
+# confirmation and exit 0.
+#
+# The sibling here is deliberately the reviewer's own shape: an ordinary
+# project directory whose VERSION says something OTHER than its own name,
+# which is exactly what separates it from a directory this installer created.
+test_kit_upgrade_refuses_a_hand_unpacked_kit() {
+  _w=$(mktemp -d "$ROOT/kit-handunpack.XXXXXX")
+  _home=$_w/home
+  mkdir -p "$_home/myapp"
+  printf '1.2.0\n' > "$_home/myapp/VERSION"
+  printf 'my source\n' > "$_home/myapp/src.c"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+
+  # Unpacked by hand into $HOME, which is what a user who did not want the
+  # curl|sh installer actually does.
+  tar -xzf "$MFR_PINNED/redoku-rm2.tar.gz" -C "$_home" || \
+    die "test_kit_upgrade_refuses_a_hand_unpacked_kit: tar -x failed"
+  assert_file "$_home/redoku/VERSION" "hand-unpacked: the kit tree is there" || return 1
+
+  assert_fails "hand-unpacked: upgrade refuses" -- \
+    env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+      "$KIT_SH" "$_home/redoku/bin/redoku" upgrade --no-symlink < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "is not part of an installed kit" \
+    "hand-unpacked: it says why it will not guess a kit root" || return 1
+  assert_contains "$ASSERT_OUTPUT" "install --download --kit" \
+    "hand-unpacked: and names the way to install it properly" || return 1
+
+  # The three things the defect did, each asserted directly.
+  assert_file "$_home/myapp/src.c" \
+    "hand-unpacked: the sibling project was NOT deleted" || return 1
+  assert_no_file "$_home/current" \
+    "hand-unpacked: no 'current' symlink was created in \$HOME" || return 1
+  assert_no_file "$_home/v0.1.0" \
+    "hand-unpacked: no version directory was created in \$HOME" || return 1
+  assert_file "$_home/redoku/VERSION" \
+    "hand-unpacked: and the kit tree itself is still there" || return 1
+
+  # …and `status` no longer routes the user into the command that did it. It
+  # printed "broken, repair it with: redoku upgrade" on exactly this kit.
+  set +e
+  ASSERT_OUTPUT=$(env HOME="$_home" "$KIT_SH" "$_home/redoku/bin/redoku" status \
+    --dry-run --host nowhere < /dev/null 2>&1)
+  _hu_rc=$?
+  set -e
+  assert_eq 0 "$_hu_rc" "hand-unpacked: status still exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_contains "$ASSERT_OUTPUT" "was unpacked by hand, not installed" \
+    "hand-unpacked: status says what is true" || return 1
+  case $ASSERT_OUTPUT in
+    *"repair it with: redoku upgrade"*)
+      printf 'FAIL: hand-unpacked: status still advises the command that would delete siblings\n  output: %s\n' "$ASSERT_OUTPUT" >&2
+      return 1 ;;
+  esac
+}
+
+# Review F3: repairing a broken `current` pruned to ZERO previous versions.
+# prune_kit was handed the tag being installed plus whatever `current` named,
+# and a dangling `current` names something that is not there — so both real
+# versions were swept, one of them the directory the CLI was executing from.
+# §5.2 and §5.3 both say "prune to one previous".
+test_kit_upgrade_repair_keeps_one_previous() {
+  _w=$(mktemp -d "$ROOT/kit-repairprune.XXXXXX")
+  _home=$_w/home
+  _kit=$_w/kit
+  mkdir -p "$_home"
+  write_stub_cli "$_w/cli"
+  make_fixture_release "$_w/release" v0.1.0 "$_w/cli"
+  make_fixture_release "$_w/release" v0.2.0 "$_w/cli"
+
+  for _v in v0.1.0 v0.2.0; do
+    assert_fails "repair prune: install $_v ends at the connect step" -- \
+      env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION="$_v" HOME="$_home" \
+        "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
+        --no-symlink --host nowhere --yes < /dev/null || return 1
+  done
+  assert_file "$_kit/v0.1.0/VERSION" "repair prune: two versions are on disk" || return 1
+  assert_file "$_kit/v0.2.0/VERSION" "repair prune: two versions are on disk" || return 1
+
+  # The damage: a half-finished manual rollback, or the rm/ln window §6.2
+  # documents, or a version directory someone removed by hand.
+  rm -f "$_kit/current"
+  ln -s v9.9.9 "$_kit/current"
+
+  make_fixture_release "$_w/release" v0.3.0 "$_w/cli"
+  set +e
+  ASSERT_OUTPUT=$(env REDOKU_BASE_URL="file://$_w/release" HOME="$_home" \
+    "$KIT_SH" "$_kit/v0.2.0/bin/redoku" upgrade --no-symlink < /dev/null 2>&1)
+  _rp_rc=$?
+  set -e
+  assert_eq 0 "$_rp_rc" "repair prune: the repair exits 0 (output: $ASSERT_OUTPUT)" || return 1
+  assert_eq "v0.3.0" "$(readlink "$_kit/current")" "repair prune: current points at the new version" || return 1
+
+  # Exactly one previous survives, and it is the one the CLI ran from — the
+  # directory that used to be deleted out from under the running process.
+  assert_file "$_kit/v0.2.0/VERSION" \
+    "repair prune: the version this run executed from survived" || return 1
+  assert_no_file "$_kit/v0.1.0" \
+    "repair prune: the older one was pruned, so this is 'one previous' and not 'all of them'" || return 1
+  assert_contains "$ASSERT_OUTPUT" "it is the version this command is running from" \
+    "repair prune: and it says why it kept that one" || return 1
 }
 
 # ---- uninstall --self (design doc §8 test 6) -----------------------------
@@ -2995,6 +3154,14 @@ test_kit_uninstall_self_dry_run() {
 
   assert_contains "$ASSERT_OUTPUT" "            $_kit_resolved" \
     "self dry-run: the plan names the kit root by absolute path" || return 1
+  # Review F2's other half: the plan ENUMERATES the children it will delete
+  # rather than summarising them as "every version directory in it". A summary
+  # read as reassuring on a root where what would actually go was somebody's
+  # source tree, so the contract is now the list.
+  assert_contains "$ASSERT_OUTPUT" "            $_kit_resolved/v0.1.0" \
+    "self dry-run: the plan names each version directory it will delete" || return 1
+  assert_contains "$ASSERT_OUTPUT" "            $_kit_resolved/current" \
+    "self dry-run: and the 'current' symlink" || return 1
   assert_contains "$ASSERT_OUTPUT" "            $_bin/redoku" \
     "self dry-run: the plan names the wrapper by absolute path" || return 1
   assert_contains "$ASSERT_OUTPUT" "on THIS machine (not the device)" \
@@ -3165,6 +3332,45 @@ test_kit_uninstall_self_guards_refuse() {
       --host nowhere < /dev/null || return 1
   assert_contains "$ASSERT_OUTPUT" "--self only applies to uninstall" \
     "self guards: (e) says so" || return 1
+
+  # (f) review F2: a directory of somebody's own projects. It has never held a
+  # kit, has no 'current', and its one VERSION-bearing child is a source tree
+  # whose VERSION says something other than its own name. Under the old guard
+  # all five passed and coolproject-1.2 was recursively deleted, while the plan
+  # block called it "every version directory in it".
+  _docs=$_w/Documents
+  mkdir -p "$_docs/letters" "$_docs/coolproject-1.2"
+  printf '1.2.0\n' > "$_docs/coolproject-1.2/VERSION"
+  printf 'int main(void){}\n' > "$_docs/coolproject-1.2/main.c"
+  printf 'dear sir\n' > "$_docs/letters/a.txt"
+  assert_fails "self guards: (f) a projects directory is refused" -- \
+    env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" uninstall --self \
+      --kit "$_docs" --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "does not look like a reDoku kit" \
+    "self guards: (f) refused, with its own message" || return 1
+  # Needle chosen to sit inside one physical line of the message: the phrase
+  # "named after their own VERSION file" is split across a wrap, so asserting
+  # on it would fail against correct output.
+  assert_contains "$ASSERT_OUTPUT" "containing a VERSION that reads" \
+    "self guards: (f) the message says what a kit root actually looks like" || return 1
+  assert_file "$_docs/coolproject-1.2/main.c" \
+    "self guards: (f) the source tree with a VERSION in it survived" || return 1
+  assert_file "$_docs/letters/a.txt" "self guards: (f) and everything else did too" || return 1
+
+  # (g) review F5: --kit and --bin-dir are about a kit on THIS machine, which a
+  # plain `uninstall` never touches. They used to be accepted and silently
+  # ignored there while the refusal message said they applied to
+  # "uninstall --self" — a message stating a rule the code did not enforce.
+  assert_fails "self guards: (g) --kit on a plain uninstall is refused" -- \
+    env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" uninstall \
+      --kit "$_docs" --dry-run --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "--kit only applies to install, upgrade and uninstall --self" \
+    "self guards: (g) and the message it always claimed is now true" || return 1
+  assert_fails "self guards: (g) --bin-dir on a plain uninstall is refused" -- \
+    env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" uninstall \
+      --bin-dir "$_w/bin" --dry-run --host nowhere --yes < /dev/null || return 1
+  assert_contains "$ASSERT_OUTPUT" "--bin-dir only applies to install, upgrade and uninstall --self" \
+    "self guards: (g) same for --bin-dir" || return 1
 }
 
 # ---- status's kit line (design doc §5.2) ---------------------------------
@@ -3295,6 +3501,8 @@ UPGRADE_TESTS='
 test_kit_upgrade_repoints_and_prunes
 test_kit_upgrade_repairs_current
 test_kit_upgrade_refuses_in_a_checkout
+test_kit_upgrade_refuses_a_hand_unpacked_kit
+test_kit_upgrade_repair_keeps_one_previous
 '
 
 UNINSTALL_SELF_TESTS='
