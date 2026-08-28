@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.2](https://github.com/QuirkQ/reDoku/compare/v0.1.1...v0.1.2) (2026-08-28)
+
+
+### Bug Fixes
+
+* **check:** stop CHECK leaving a progress bar stuck on the board ([236a254](https://github.com/QuirkQ/reDoku/commit/236a254c32f407daeed8fa5308e580b39d63a7a8))
+* **kit:** make artifact trust a property of the run, not of the filesystem ([824aa46](https://github.com/QuirkQ/reDoku/commit/824aa4681f7ddeb59b8f7b4ff253a8b4cd9b9a32))
+* **kit:** resolve both sides of the own-tree test, and finish the V minors ([28572a7](https://github.com/QuirkQ/reDoku/commit/28572a754a8f9993a23809e8f49824c43d35001b))
+* **kit:** the exposure walk stops at the trust anchor, not at $KIT_ROOT ([24fb221](https://github.com/QuirkQ/reDoku/commit/24fb221204faf6ed0e1fdfdde601617901cc01f9))
+* **kit:** the gate now fails closed — reuse cannot mint trust, and the walk covers the subtree ([380fe69](https://github.com/QuirkQ/reDoku/commit/380fe6975d1d8401d1fb4d84b197ea9369c6a75d))
+* **recognizer:** resample along the path, not by vertex index ([9b04ddf](https://github.com/QuirkQ/reDoku/commit/9b04ddf30628614696f4effb93c88d9d0e35f955))
+
 ## [0.1.1](https://github.com/QuirkQ/reDoku/compare/v0.1.0...v0.1.1) (2026-08-28)
 
 
