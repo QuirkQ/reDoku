@@ -36,7 +36,7 @@
 #     <uuid>.thumbnails/ cache — both are xochitl's to write, never
 #     this script's, so they survive every re-run untouched.
 #
-# Expects the built artifacts already staged (see README):
+# Expects the built artifacts already staged (see INSTALL.md):
 #   /home/root/redoku/bin/rm2fb_server_swtcon
 #   /home/root/redoku/bin/rm2fbctl                (optional)
 #   /home/root/redoku/lib/librm2fb_client_swtcon.so
@@ -214,8 +214,8 @@ if [ "$version" != "$TESTED_VERSION" ]; then
   fi
 fi
 
-[ -f "$SERVER_BIN" ] || die "missing $SERVER_BIN — deploy the built artifacts first (see README)"
-[ -f "$CLIENT_LIB" ] || die "missing $CLIENT_LIB — deploy the built artifacts first (see README)"
+[ -f "$SERVER_BIN" ] || die "missing $SERVER_BIN — deploy the built artifacts first (see INSTALL.md)"
+[ -f "$CLIENT_LIB" ] || die "missing $CLIENT_LIB — deploy the built artifacts first (see INSTALL.md)"
 chmod +x "$SERVER_BIN"
 
 # 32-bit ARM ELF check: magic 7f 'E' 'L' 'F' + ELFCLASS32, and e_machine
