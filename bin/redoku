@@ -781,33 +781,6 @@ resolve_tag() {
   valid_tag "$TAG" || TAG=
 }
 
-# kit_tree_is_complete <dir> — is <dir> a complete, usable §3.2 kit tree?
-#
-# design doc §6.3's gate: "if <kit>/<tag>/VERSION already exists and the game
-# binary there passes is_arm_elf, the download is skipped and the existing tree
-# reused". A function because fetch_kit consults it TWICE — once before the
-# download, when steps 1-3 already knew the tag, and once after step 4 has read
-# the tag out of the tarball — and two copies of it would be two answers free
-# to disagree about the same directory.
-#
-# Checked across the WHOLE tree, not just VERSION plus the ARM gate. is_arm_elf
-# reads bytes 0-4 and 18-19 only, so a game binary truncated anywhere past byte
-# 20 passes it — and a tree that got as far as copying VERSION and the head of
-# the game would then be adopted, `current` repointed at it and a truncated
-# binary pushed to the device. This is the gate that decides whether a download
-# is discarded, so it looks at files spread across the tree rather than at a
-# prefix of it.
-kit_tree_is_complete() {
-  [ -f "$1/VERSION" ] && \
-  [ -f "$1/bin/redoku" ] && \
-  [ -f "$1/device/install.sh" ] && \
-  [ -f "$1/device/uninstall.sh" ] && \
-  [ -f "$1/device/redoku-watcher.service" ] && \
-  [ -f "$1/build/decoy/watch.conf" ] && \
-  [ -f "$1/build/rm2fb/dist/rm2fb_server_swtcon" ] && \
-  is_arm_elf "$1/build/rm2/bin/redoku"
-}
-
 # kit_dest <layout> <base> <tag> — where fetch_kit puts the unpacked tree.
 # The two layouts differ only here (and in staging_parent below), which is why
 # fetch_kit itself can be one function serving both — and why plan_download
@@ -1002,18 +975,33 @@ fetch_kit() {
   fi
   FETCH_BASE=$_fk_base
 
-  # design doc §6.3, consulted the FIRST of two times. 'install' is documented
-  # as safe to re-run from any state, and bolting a network fetch onto it must
-  # not weaken that: a version already on disk is reused rather than
-  # re-fetched. This one only fires when steps 1-3 already knew the tag; on the
-  # step-4 path $TAG is still empty here, and the second consultation — after
-  # the tarball has been read — is what keeps the promise there. The repoint
-  # below still runs either way: reusing a tree is not the same as leaving
-  # 'current' where it was.
+  # design doc §6.3. 'install' is documented as safe to re-run from any
+  # state, and bolting a network fetch onto it must not weaken that: a
+  # version already on disk is reused rather than re-fetched. Only reachable
+  # when steps 1-3 already know the tag — step 4 reads it out of the tarball,
+  # by which point the download has happened anyway. The repoint below still
+  # runs: reusing a tree is not the same as leaving 'current' where it was.
+  #
+  # "Already on disk" is checked across the WHOLE §3.2 tree, not just VERSION
+  # plus the ARM gate. is_arm_elf reads bytes 0-4 and 18-19 only, so a game
+  # binary truncated anywhere past byte 20 passes it — and a tree that got as
+  # far as copying VERSION and the head of the game would then be adopted,
+  # `current` repointed at it and a truncated binary pushed to the device.
+  # Since the staging move below made a half-copied destination unreachable
+  # this is belt and braces, but it is the gate that decides whether a
+  # download is skipped, so it checks files spread across the tree rather
+  # than a prefix of it.
   _fk_reuse=0
   if [ -n "$TAG" ]; then
     _fk_dest=$(kit_dest "$_fk_layout" "$_fk_base" "$TAG")
-    if kit_tree_is_complete "$_fk_dest"; then
+    if [ -f "$_fk_dest/VERSION" ] && \
+       [ -f "$_fk_dest/bin/redoku" ] && \
+       [ -f "$_fk_dest/device/install.sh" ] && \
+       [ -f "$_fk_dest/device/uninstall.sh" ] && \
+       [ -f "$_fk_dest/device/redoku-watcher.service" ] && \
+       [ -f "$_fk_dest/build/decoy/watch.conf" ] && \
+       [ -f "$_fk_dest/build/rm2fb/dist/rm2fb_server_swtcon" ] && \
+       is_arm_elf "$_fk_dest/build/rm2/bin/redoku"; then
       say "$TAG is already unpacked at $_fk_dest — reusing it, nothing to download"
       _fk_reuse=1
     fi
@@ -1171,34 +1159,24 @@ EOF
     mkdir -p "$(dirname -- "$_fk_dest")" || \
       die "could not create $(dirname -- "$_fk_dest") — check the path and its permissions"
     if [ -e "$_fk_dest" ] || [ -L "$_fk_dest" ]; then
-      # design doc §6.3, consulted the SECOND time — and on the step-4 path
-      # this is the ONLY time, because $TAG was empty when the gate above ran.
-      # Without it a complete existing tree was deleted and replaced by a
-      # freshly downloaded copy of itself on every unpinned install, which is
-      # §6.3's "install is documented as safe to re-run from any state; adding
-      # a network fetch must not weaken that" not being kept on precisely the
-      # path §8's offline tests exercise.
+      # Whatever is here has to GO, not be merged with: `mv` onto an existing
+      # directory moves the new tree INSIDE it rather than replacing it,
+      # which is how you end up with <tag>/redoku/ and a kit whose every path
+      # resolves one level short.
       #
-      # The DOWNLOAD is not conditional and must not be made so: step 4 cannot
-      # learn the tag without the bytes, and §6.2 already settles that trade —
-      # "one wasted download, still correct". What the bytes buy is the tag;
-      # once the tag says the tree already here is the one being installed,
-      # and the tree passes the same gate, the bytes have done their job and
-      # are discarded.
-      if kit_tree_is_complete "$_fk_dest"; then
-        say "$TAG is already unpacked at $_fk_dest — reusing it"
-        say "  (the download was needed only to learn the tag, and is discarded)"
-        _fk_reuse=1
-      else
-        # Now the message is true: this tree failed the gate a moment ago.
-        # And it has to GO, not be merged with — `mv` onto an existing
-        # directory moves the new tree INSIDE it rather than replacing it,
-        # which is how you end up with <tag>/redoku/ and a kit whose every
-        # path resolves one level short.
-        say "replacing an incomplete earlier download at $_fk_dest"
-        rm -rf "$_fk_dest" || \
-          die "could not remove the incomplete earlier download at $_fk_dest — remove it by hand and try again"
-      fi
+      # It is NOT safe to say it failed the §6.3 reuse check, and the message
+      # below overstates it on one path: that check only runs when steps 1-3
+      # already knew the tag, and on the step-4 path (offline, and every
+      # file:// install) $TAG is empty until the tarball has been unpacked —
+      # so a perfectly complete tree reaches this line and gets replaced with
+      # a freshly downloaded copy of itself. Wasteful rather than wrong, and
+      # measured: two consecutive unpinned installs print "replacing an
+      # incomplete earlier download" on the second. Flagged for the
+      # controller; the wording is not changed here because this round's
+      # instruction was to fix the comment and not the behaviour.
+      say "replacing an incomplete earlier download at $_fk_dest"
+      rm -rf "$_fk_dest" || \
+        die "could not remove the incomplete earlier download at $_fk_dest — remove it by hand and try again"
     fi
     # Staging is a sibling of this destination, so this is a rename, not a
     # copy — see staging_parent. It can still fail (permissions, or a `build/`
@@ -1207,14 +1185,12 @@ EOF
     # lying around is a tree a later run could adopt, and §7's preamble says
     # no failure leaves a partial install behind. The message then says what
     # is true, which is that there is nothing to clean up by hand.
-    if [ "$_fk_reuse" -eq 0 ]; then
-      mv "$FETCH_TMP/redoku" "$_fk_dest" || {
-        rm -rf "$_fk_dest"
-        die "could not move the unpacked kit into $_fk_dest — check permissions and free space.
+    mv "$FETCH_TMP/redoku" "$_fk_dest" || {
+      rm -rf "$_fk_dest"
+      die "could not move the unpacked kit into $_fk_dest — check permissions and free space.
   Anything that had begun to appear there has been removed and nothing else was
   changed, so there is no half-installed version to clean up. Try again."
-      }
-    fi
+    }
 
     # The staging directory has done its job. Drop it and its traps together,
     # here rather than at the end of this function, so that the repoint and
