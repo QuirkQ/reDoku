@@ -19,7 +19,7 @@
 
 set -eu
 
-REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 
 # Exit 2, not 1: 1 is reserved for "some tests legitimately failed" (the
 # summary at the bottom), so a harness-side die — a fixture that couldn't
@@ -1173,7 +1173,7 @@ build_fake_checkout() {
 test_find_game_checkout_mode_message() {
   _w=$(mktemp -d "$ROOT/findgame-checkout.XXXXXX")
   build_fake_checkout "$_w/checkout"
-  _checkout_repo=$(CDPATH= cd -- "$_w/checkout" && pwd) || \
+  _checkout_repo=$(CDPATH='' cd -- "$_w/checkout" && pwd) || \
     die "test_find_game_checkout_mode_message: cd failed"
 
   # 'play' calls find_game before anything else and dies with $GAME_WHY —
@@ -1209,7 +1209,7 @@ test_find_game_kit_mode_message() {
   # mode's.
   rm -f "$_extract/redoku/build/rm2/bin/redoku"
 
-  _kit_repo=$(CDPATH= cd -- "$_extract/redoku" && pwd) || \
+  _kit_repo=$(CDPATH='' cd -- "$_extract/redoku" && pwd) || \
     die "test_find_game_kit_mode_message: cd failed"
 
   assert_fails "find_game kit-mode: play dies with GAME_WHY" -- \
@@ -1313,7 +1313,7 @@ test_kit_bootstrap_end_to_end() {
   # expectation has to be resolved too — on macOS $TMPDIR lives under a
   # /var -> /private/var symlink, and comparing against the unresolved
   # string would fail for a reason that has nothing to do with the code.
-  _kit_resolved=$(CDPATH= cd -- "$_kit" && pwd -P) || \
+  _kit_resolved=$(CDPATH='' cd -- "$_kit" && pwd -P) || \
     die "test_kit_bootstrap_end_to_end: could not resolve $_kit"
   assert_file "$_bin/redoku" "bootstrap e2e: the PATH entry exists" || return 1
   [ -x "$_bin/redoku" ] || {
@@ -2106,6 +2106,12 @@ test_kit_empty_option_values() {
     "empty REDOKU_HOME: the run reached the artifact hunt, not an argument guard" || return 1
   case $ASSERT_OUTPUT in
     *"wants a directory, not an empty value"*)
+      # shellcheck disable=SC2016  # "expressions don't expand in single
+      # quotes" — nothing here wants to expand. $REDOKU_HOME and
+      # $REDOKU_BIN_DIR are the NAMES of the two variables this test is
+      # about, printed for a human reading a failure; expanding them would
+      # print the empty strings the test deliberately set, which is exactly
+      # the information the message is trying to convey by naming them.
       printf 'FAIL: an empty $REDOKU_HOME / $REDOKU_BIN_DIR was treated as an empty flag\n  output: %s\n' "$ASSERT_OUTPUT" >&2
       return 1 ;;
   esac
@@ -2977,7 +2983,7 @@ test_kit_uninstall_self_dry_run() {
   _wrapper=$(kit_digest "$_bin/redoku")
   # The install resolved the kit root before recording it in the wrapper, so
   # the plan prints the resolved form and the expectation has to match it.
-  _kit_resolved=$(CDPATH= cd -- "$_kit" && pwd -P) || \
+  _kit_resolved=$(CDPATH='' cd -- "$_kit" && pwd -P) || \
     die "test_kit_uninstall_self_dry_run: could not resolve $_kit"
 
   set +e
@@ -3177,7 +3183,7 @@ test_kit_status_line() {
   # (a) a checkout has no kit, and must say what IS true there rather than
   # printing an empty value.
   build_fake_checkout "$_w/checkout"
-  _co_repo=$(CDPATH= cd -- "$_w/checkout" && pwd) || die "test_kit_status_line: cd failed"
+  _co_repo=$(CDPATH='' cd -- "$_w/checkout" && pwd) || die "test_kit_status_line: cd failed"
   set +e
   ASSERT_OUTPUT=$(env HOME="$_home" "$KIT_SH" "$_w/checkout/bin/redoku" status \
     --dry-run --host nowhere < /dev/null 2>&1)

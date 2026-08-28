@@ -26,7 +26,7 @@
 
 set -eu
 
-REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
 # Which version am I, and am I a release build? A checkout stays "dev"
 # forever; tools/mkkit.sh stamps this exact line to the real tag in every
@@ -1086,7 +1086,7 @@ fetch_kit() {
     # directory, no 'current', which is what §7's rows promise.
     mkdir -p "$_fk_base" || \
       die "could not create the kit directory $_fk_base — check the path and its permissions, or point somewhere else with --kit DIR"
-    _fk_base=$(CDPATH= cd -- "$_fk_base" && pwd -P) || \
+    _fk_base=$(CDPATH='' cd -- "$_fk_base" && pwd -P) || \
       die "could not resolve the kit directory $_fk_base — check the path and its permissions"
   fi
   FETCH_BASE=$_fk_base
@@ -1226,6 +1226,13 @@ EOF
     say "unpacking"
     tar -xzf "$FETCH_TMP/redoku-rm2.tar.gz" -C "$FETCH_TMP" || \
       die "could not unpack $_fk_url/redoku-rm2.tar.gz (tar's own error is above) — a full disk or a corrupt download. Nothing was installed; free some space or try again."
+    # shellcheck disable=SC2015  # "A && B || C is not if-then-else, C may run
+    # when A is true" — here it is exactly if-then-else, because B is a bare
+    # `[ -f ]` with no side effects: C runs iff the directory is missing OR the
+    # VERSION file is, which is the whole intent. The warning is about a B that
+    # DOES something; keeping the `guard || die` shape also matches every other
+    # precondition in this file. (Only shellcheck <= 0.9 raises this; 0.11 has
+    # narrowed the heuristic. CI's runner image still ships 0.9.)
     [ -d "$FETCH_TMP/redoku" ] && [ -f "$FETCH_TMP/redoku/VERSION" ] || \
       die "$_fk_url/redoku-rm2.tar.gz unpacked with no redoku/VERSION inside it, so it is not a reDoku kit (design doc §3.2). Nothing was installed."
 
@@ -1503,8 +1510,8 @@ resolve_kit_mode() {
   else
     [ "$IN_KIT" -eq 1 ] || return 0
     _rkm_parent=$(dirname -- "$REPO")
-    _rkm_current=$(CDPATH= cd -P -- "$_rkm_parent/current" 2>/dev/null && pwd -P) || _rkm_current=
-    _rkm_repo=$(CDPATH= cd -P -- "$REPO" && pwd -P) || _rkm_repo=
+    _rkm_current=$(CDPATH='' cd -P -- "$_rkm_parent/current" 2>/dev/null && pwd -P) || _rkm_current=
+    _rkm_repo=$(CDPATH='' cd -P -- "$REPO" && pwd -P) || _rkm_repo=
     [ -n "$_rkm_current" ] && [ "$_rkm_current" = "$_rkm_repo" ] || return 0
     KIT_DIR=$_rkm_parent
   fi
@@ -1517,7 +1524,7 @@ resolve_kit_mode() {
   # absolute form when the directory does not exist yet, because --dry-run
   # must not create it just to resolve it.
   if [ -d "$KIT_DIR" ]; then
-    KIT_DIR=$(CDPATH= cd -- "$KIT_DIR" && pwd -P) || \
+    KIT_DIR=$(CDPATH='' cd -- "$KIT_DIR" && pwd -P) || \
       die "could not resolve the kit directory $KIT_DIR — check the path and its permissions, or point somewhere else with --kit DIR"
   fi
 }
@@ -1552,7 +1559,7 @@ resolve_kit_root() {
   # wrapper unrecognisable — and for 'uninstall --self' unrecognisable means
   # "somebody else's file", i.e. left behind forever.
   if [ -d "$KIT_DIR" ]; then
-    KIT_DIR=$(CDPATH= cd -- "$KIT_DIR" && pwd -P) || \
+    KIT_DIR=$(CDPATH='' cd -- "$KIT_DIR" && pwd -P) || \
       die "could not resolve the kit directory $KIT_DIR — check the path and its permissions, or point somewhere else with --kit DIR"
   fi
 }
@@ -1780,7 +1787,7 @@ check_removable_kit_root() {
   #    that only catches one spelling of your home directory is not a guard.
   [ "$_crk_root" != / ] || \
     die "refusing to remove / as a kit root. Point --kit at the kit directory itself, e.g. --kit ~/.redoku"
-  _crk_home=$(CDPATH= cd -P -- "$HOME" 2>/dev/null && pwd -P) || _crk_home=$HOME
+  _crk_home=$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P) || _crk_home=$HOME
   { [ "$_crk_root" != "$HOME" ] && [ "$_crk_root" != "$_crk_home" ]; } || \
     die "refusing to remove your home directory ($_crk_root) as a kit root. A kit
   root is a directory holding version directories and a 'current' symlink —
@@ -1793,7 +1800,7 @@ check_removable_kit_root() {
   #    its versions, i.e. at <root>/<version>/bin/redoku, two components down
   #    or more. A root that is the directory I am running from, or that holds
   #    me directly, is something else that merely has this script inside it.
-  _crk_self=$(CDPATH= cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || _crk_self=
+  _crk_self=$(CDPATH='' cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || _crk_self=
   if [ -n "$_crk_self" ]; then
     case $_crk_self in
       "$_crk_root"/?*/?*) ;;   # <root>/<version>/bin — the expected shape
@@ -2459,7 +2466,7 @@ kit_status_line() {
   # wrote it — and on a machine where /var is a symlink to /private/var, or
   # where anyone's home is reached through one, those two strings differ and a
   # test against $HOME alone silently never abbreviates.
-  _ksl_home=$(CDPATH= cd -P -- "$HOME" 2>/dev/null && pwd -P) || _ksl_home=$HOME
+  _ksl_home=$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd -P) || _ksl_home=$HOME
   case $_ksl_shown in
     "$HOME"/*)      _ksl_rest=${_ksl_shown#"$HOME"};      _ksl_shown="~$_ksl_rest" ;;
     "$_ksl_home"/*) _ksl_rest=${_ksl_shown#"$_ksl_home"}; _ksl_shown="~$_ksl_rest" ;;
@@ -2480,6 +2487,11 @@ kit_status_line() {
 
 cmd_status() {
   connect
+  # shellcheck disable=SC2016  # "expressions don't expand in single quotes"
+  # — that is the whole design. Everything in this string is evaluated by
+  # the DEVICE's shell, not this one: single quotes are what carry the
+  # $(...) and the \n through ssh intact. Double quotes would run the
+  # systemctl calls on the host and ship their answers to the tablet.
   remote 'printf "firmware : %s\n" "$(sed -n "s/^IMG_VERSION=//p" /etc/os-release | tr -d \")"
 if [ -f /etc/systemd/system/rm2fb.service ]; then printf "installed: yes\n"; else printf "installed: no\n"; fi
 printf "rm2fb    : %s\n" "$(systemctl is-active rm2fb.service 2>/dev/null || true)"

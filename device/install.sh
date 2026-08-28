@@ -336,6 +336,13 @@ rollback() {
   # for the same removal applies identically here).
   rm -f "$XOCHITL_DIR/$DECOY_UUID.pdf" "$XOCHITL_DIR/$DECOY_UUID.metadata" \
         "$XOCHITL_DIR/$DECOY_UUID.content" "$XOCHITL_DIR/$DECOY_UUID.pagedata"
+  # shellcheck disable=SC2115  # "use ${var:?} so this can't expand to /" —
+  # the guarantee it asks for is already there, one line after DECOY_UUID is
+  # derived: looks_like_uuid above rejects empty, '..', '/', too-short and
+  # too-long, and preflight dies on the spot if it does. See the paragraph
+  # just above for why no path reaches this line without that check having
+  # passed. Adding ${DECOY_UUID:?} here would be a second, weaker test of
+  # the same thing, and would read as if the real guard were not trusted.
   rm -rf "$XOCHITL_DIR/$DECOY_UUID" "$XOCHITL_DIR/$DECOY_UUID.thumbnails"
   systemctl daemon-reload
   # Leaves the device's failure-counter state clean, not just stopped —

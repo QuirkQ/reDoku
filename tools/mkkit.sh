@@ -38,7 +38,7 @@
 
 set -eu
 
-REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 say() { printf '==> %s\n' "$*"; }
