@@ -294,6 +294,37 @@ empirical question, so:
 > clears the accuracy bar on the corpus, ship stage 1 and delete stage 2.
 > Record the measured numbers here either way.
 
+**The numbers, recorded late (2026-08-28) because the first set was measured
+wrong.** Stage 1 shipped and stage 2 was deleted on a reading of *100%
+accuracy, 0 misreads* over the authored corpus. That number was the template
+set graded against itself: both sides of every comparison ran through the
+identical pipeline, so it could not fall however broken the pipeline was —
+and it was broken twice (index resampling, a noise-sensitive turn count; see
+PLAN.md §6 steps 2–3). Fed the same shapes as a pen delivers them, stage 1
+measured **53%**, which is what the owner met on the device.
+
+Fixed, and measured per regime over the 21 authored templates × 5 seeded
+hands, ink sampled every ~3 px as integer panel pixels:
+
+| regime | accuracy | misreads |
+| --- | --- | --- |
+| clean pen sampling | 100% | 0 |
+| ±2 px tremor | 100% | 0 |
+| ±4 px tremor | 99% | 0 |
+| ±2 px + 10° slant + 0.9/1.1 anisotropic scale | 88% | 0 |
+
+Every failure is a refusal, which is the asymmetry the next section asks for.
+**Stage 2 stays deleted** — nothing here is a misread, which is the failure
+$P's stroke-order invariance would have bought down, and the four orders of
+magnitude are unchanged. What the trade still costs is stroke order and
+direction: of eight plausible *unauthored* ways to write a digit, four read
+and four refuse (a 7 whose diagonal is drawn upward, a 4 with the vertical
+first, a 5 with a separate top bar, an 8 as two circles). That is template
+coverage rather than the matcher, and `redoku --record` is the answer to it.
+
+**All of it is still one author's templates plus modelled distortion.** No
+number here measures a player's hand; §9's holdout split is what would.
+
 The seam is fixed regardless, which is what lets the rest of M3b be built in
 parallel against a stub:
 
