@@ -20,6 +20,31 @@ command -v curl >/dev/null 2>&1 || \
 
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT INT HUP TERM
+# The CLI goes at $T/bin/redoku, one level deeper than the obvious $T/redoku,
+# and the extra directory is load-bearing security rather than tidiness.
+#
+# bin/redoku derives its $REPO as the PARENT of its own directory, because in a
+# checkout it lives at <repo>/bin/redoku and in a kit at <kit>/<tag>/bin/redoku.
+# Placed at $T/redoku it would break that invariant by one level, and $REPO
+# would become the parent of the temp directory — which on Linux, where
+# coreutils mktemp defaults to /tmp, is a world-writable sticky directory any
+# local user can create subdirectories in. bin/redoku then reads $REPO for
+# three things, and one of them EXECUTES: build_decoy runs $REPO/tools/mkdecoy.rb
+# when it exists, so a pre-planted /tmp/tools/mkdecoy.rb ran as the victim, on
+# the headline curl|sh path, before any confirmation. ($REPO/VERSION flipping
+# the kit marker and $REPO/device/* reaching the cmp in
+# warn_device_scripts_replaced are the other two.)
+#
+# One directory deeper puts $REPO on $T itself, which mktemp -d creates 0700.
+# That is also the semantically right answer rather than merely the safe one: a
+# bootstrap CLI genuinely has no checkout around it, so "not in a kit", "no
+# generator" and "no device/ to compare against" are all true there.
+#
+# chmod is belt and braces — mktemp -d is specified to create 0700 — because
+# this is the one line standing between a shared machine and arbitrary code
+# execution, and it costs nothing to stop depending on that being honoured.
+chmod 700 "$T" || die "could not secure the temporary directory $T — refusing to continue"
+mkdir "$T/bin" || die "could not create $T/bin to download into — refusing to continue"
 
 # fetch <url> <dest> — curl -fsSL's own stderr (suppressed by -s, or a bare
 # HTTP/DNS error with -S) can't tell "no release published yet" apart from
@@ -35,7 +60,7 @@ fetch() {
   fi
 }
 
-fetch "$URL/redoku"        "$T/redoku"
+fetch "$URL/redoku"        "$T/bin/redoku"
 fetch "$URL/redoku.sha256" "$T/redoku.sha256"
 
 # Compute the digest (shasum -a 256, then sha256sum, then openssl dgst
@@ -54,16 +79,16 @@ fetch "$URL/redoku.sha256" "$T/redoku.sha256"
 # errexit into a silent, wordless exit — every failure here names its own
 # fix per design doc §7, including this one.
 if command -v shasum >/dev/null 2>&1; then
-  ACTUAL=$(shasum -a 256 "$T/redoku") || die "shasum failed verifying $URL/redoku — try again"
+  ACTUAL=$(shasum -a 256 "$T/bin/redoku") || die "shasum failed verifying $URL/redoku — try again"
   ACTUAL=${ACTUAL%% *}
 elif command -v sha256sum >/dev/null 2>&1; then
-  ACTUAL=$(sha256sum "$T/redoku") || die "sha256sum failed verifying $URL/redoku — try again"
+  ACTUAL=$(sha256sum "$T/bin/redoku") || die "sha256sum failed verifying $URL/redoku — try again"
   ACTUAL=${ACTUAL%% *}
 elif command -v openssl >/dev/null 2>&1; then
   # openssl prints "SHA2-256(<path>)= <hex>" (or "SHA256(...)=" — the
   # label differs between OpenSSL and LibreSSL) — the hex is the LAST
   # field here, not the first, unlike shasum/sha256sum above.
-  ACTUAL=$(openssl dgst -sha256 "$T/redoku") || die "openssl dgst failed verifying $URL/redoku — try again"
+  ACTUAL=$(openssl dgst -sha256 "$T/bin/redoku") || die "openssl dgst failed verifying $URL/redoku — try again"
   ACTUAL=${ACTUAL##* }
 else
   # Never fall through to an unverified install — design doc §7. Names
@@ -137,4 +162,4 @@ fi
 [ -n "${REDOKU_HOME:-}" ] || [ -n "${HOME:-}" ] || \
   die "neither \$REDOKU_HOME nor \$HOME is set, so there's nowhere to default the kit directory to. Set REDOKU_HOME=/path/to/kit (or export \$HOME) and try again."
 KIT_DIR=${REDOKU_HOME:-$HOME/.redoku}
-sh "$T/redoku" install --download --kit "$KIT_DIR" "$@"
+sh "$T/bin/redoku" install --download --kit "$KIT_DIR" "$@"
