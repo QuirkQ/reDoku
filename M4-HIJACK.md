@@ -106,6 +106,10 @@ Design decisions inherited from PLAN.md, restated because they are load-bearing:
   scanning the whole directory.
 - Verify against the real 3.27 on-device formats by dumping an existing
   document trio first — do not guess the metadata grammar.
+- Released kits ship the decoy trio prebuilt — `tools/mkdecoy.rb` stays the
+  single source of truth and CI still runs it once per release; a kit install
+  carries its output, not the tool, which is what lets a kit install skip
+  ruby entirely.
 
 ### Task 3 — `redoku --watch`
 

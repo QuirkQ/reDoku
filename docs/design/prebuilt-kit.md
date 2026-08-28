@@ -190,7 +190,10 @@ curl -fsSL -o "$T/redoku.sha256" "$URL/redoku.sha256"
 # …compute the digest (shasum -a 256 | sha256sum | openssl dgst -sha256),
 #   compare to the first field, die naming both digests and the URL…
 if [ ! -t 0 ] && [ -e /dev/tty ] && (: < /dev/tty) 2>/dev/null; then exec < /dev/tty; fi
-sh "$T/redoku" install --download --kit "${REDOKU_HOME:-$HOME/.redoku}" "$@"
+[ -n "${REDOKU_HOME:-}" ] || [ -n "${HOME:-}" ] || \
+  die "neither \$REDOKU_HOME nor \$HOME is set, so there's nowhere to default the kit directory to. Set REDOKU_HOME=/path/to/kit (or export \$HOME) and try again."
+KIT_DIR=${REDOKU_HOME:-$HOME/.redoku}
+sh "$T/redoku" install --download --kit "$KIT_DIR" "$@"
 ```
 
 Four things in there are load-bearing:
@@ -218,6 +221,14 @@ so the pipe is not a second-class entry point.
 **`REDOKU_BASE_URL`.** The seam §8 tests through, with `file://` URLs and no
 network at all. It also makes a fork or a mirror installable without editing
 the script.
+
+**The guard immediately above the hand-off.** `${REDOKU_HOME:-$HOME/.redoku}`
+still reads `$HOME` the instant `$REDOKU_HOME` is unset, and when `$HOME` is
+*also* unset that trips `set -u` — measured on macOS's `/bin/sh` (bash 3.2),
+the script then exits **0** having installed nothing, because the final exit
+status is the `EXIT` trap's own successful `rm -rf "$T"`, not the failed
+expansion, so a silent success that installed nothing — worse than a crash —
+is exactly what the guard above refuses. **[test]**
 
 ## 5. `bin/redoku`'s new surface
 
@@ -281,15 +292,32 @@ The path is written out absolute and resolved, not as `$HOME/.redoku` — a
 `--kit` elsewhere must still work, and the ownership test below has to compare
 against something concrete.
 
-The wrapper also gives `uninstall --self` an exact ownership test: the file is
-ours only if it contains that `exec` line pointing into *this* kit. A `redoku`
-some package manager put there is never touched. **[owner]**
+The wrapper also gives `uninstall --self` an exact ownership test:
+`is_our_wrapper` is one `grep -qF` for that literal `exec` line, naming this
+exact kit root **[src]** — a file that contains it, verbatim, is ours; a file
+that does not is not, whatever else about it looks like ours. A `redoku` some
+package manager put there is never touched. **[owner]**
 
-Two consequences worth stating: a kit-mode `install` **rewrites the wrapper
-every run**, so a moved `~/.local/bin` or a hand-edited file self-heals and
-re-running stays idempotent; and pruning to one previous version happens
-whenever `current` is repointed — by `upgrade` and by an `install --download`
-of a different version alike, not only by `upgrade`.
+That single test has to answer two claims that used to be stated as if they
+were independent, and are not: a kit-mode `install` **rewrites the wrapper
+every run**, and a `redoku` that "is not our wrapper" is left alone. A
+hand-edited wrapper and a foreign one are the same observable thing — a file
+whose content the test does or does not recognise — so the same rule decides
+both. An edit that leaves the `exec` line itself intact (a comment added above
+it, a `~/.local/bin` recreated after being deleted) still passes the test, so
+it self-heals: silently overwritten back to the canonical two lines on the
+next `install`. An edit that touches the `exec` line — a different path, an
+extra flag, a wrapper of the user's own that happens to live at the same path
+— fails it, and from that point the file is indistinguishable from a package
+manager's `redoku`: left alone, never rewritten, and never removed by
+`uninstall --self` either, since its deletion rides the identical test. **The
+ownership rule wins over the self-heal promise, not the reverse** — a file
+this installer cannot prove it wrote is one it must never overwrite or delete,
+because those are the same guarantee. **[test]**
+
+Pruning to one previous version happens whenever `current` is repointed — by
+`upgrade` and by an `install --download` of a different version alike, not
+only by `upgrade`.
 
 `~/.local/bin` over `/usr/local/bin`: no sudo, ever. A script you piped from
 the internet asking for a root password is the prompt users should refuse.
@@ -356,7 +384,7 @@ digest = expect  or  die naming both digests and the URL
 tar -tzf | reject any entry not matching ^redoku/     (no absolute paths, no ..)
 tar -xzf into the temp dir
 mv temp/redoku  ->  <kit>/<tag>                       never a partial version dir
-ln -s <tag> <kit>/.current.new && mv -f <kit>/.current.new <kit>/current
+rm -f <kit>/current && ln -s <tag> <kit>/current      read back and compared to <tag>
 ```
 
 **Digest-and-compare, not `shasum -c`.** The `-c` input format and exit
@@ -364,11 +392,40 @@ behaviour differ between BSD and GNU implementations, and it forces the local
 filename to match the one in the checksum file. Computing and string-comparing
 is portable and produces a better message. **[owner]**
 
-**`mv` into place, always.** Extraction is to a temp dir so an interrupt, a
-full disk or a truncated stream can never leave `<kit>/<tag>/` half-populated,
-and `current` is repointed by renaming a fresh symlink over it — `ln -sfn`'s
-behaviour on an existing symlink-to-directory differs across implementations.
-**[reasoned]**
+**`mv` into place, always — for the version directory.** Extraction is to a
+temp dir so an interrupt, a full disk or a truncated stream can never leave
+`<kit>/<tag>/` half-populated: nothing lands at the destination until the
+verified tree is renamed over from beside it, and that destination is never
+already occupied by anything but a stray earlier attempt, so the rename has
+nothing surprising to resolve.
+
+**The `current` repoint is not that rename, and cannot be.** The intended form
+was `ln -s <tag> <kit>/.current.new && mv -f <kit>/.current.new <kit>/current`,
+chosen on the grounds that `ln -sfn`'s behaviour on an existing
+symlink-to-directory differs across implementations — but `mv` turned out to
+carry the identical disease it was picked to dodge: BSD `mv` **resolves** a
+destination that is a symlink-to-directory, so the second install of a
+different version moved `.current.new` *inside* the old version's directory
+instead of over `current`. `current` was left pointing at the old tag, and the
+pruner — trusting `current` — deleted the tag that was actually live.
+Silently: every command in the sequence had exited zero. **[test]**
+
+The shipped repoint is two plain commands instead: `rm -f <kit>/current && ln
+-s <tag> <kit>/current`. `rm` then `ln` has no destination left to resolve
+into — there is nothing at `current` for either command to be clever about.
+The read-back that follows it (`readlink current` compared against `$TAG`,
+`die` on any mismatch) is what this bug bought going forward: a check that
+catches the next such surprise instead of trusting a zero exit status.
+
+That form gives up the rename's atomicity, and the trade should be said
+plainly rather than left implicit: for the instant between the `rm` and the
+`ln`, `current` does not exist at all. That window is accepted, not covered,
+because a `current` that is missing or dangling is a state §7 already has an
+answer for — `upgrade` repairs it by installing latest — while `current`
+pointing confidently at the wrong tree, which is what the rename produced, is
+a state nothing detects on its own. Between a symlink that briefly does not
+exist and one that is silently wrong, the first is the failure mode with a fix
+already on the books. **[owner]**
 
 **The `^redoku/` check is not theatre.** It is the same class of guard as
 `push_file`'s refusal to write outside `$REMOTE_DIR` **[src]**: a tarball is
