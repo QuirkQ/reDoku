@@ -276,7 +276,7 @@ neither). A CLI already running from inside a kit derives its root as
 ```
 
 **Why a wrapper and not a symlink.** `bin/redoku:29` computes
-`REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)` **[src]**. Invoked
+`REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)` **[src]**. Invoked
 through a symlink at `~/.local/bin/redoku`, `$0` *is* that symlink, so `REPO`
 becomes `~/.local` and every path in the script is wrong. The alternatives are
 a portable `readlink` chase loop inside a safety-critical script — BSD
