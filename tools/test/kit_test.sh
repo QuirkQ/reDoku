@@ -3509,7 +3509,7 @@ test_standalone_cli_refuses_local_artifacts() {
     assert_fails "standalone: $_cmd is refused" -- \
       env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_plant/dl/redoku" \
         "$@" < /dev/null || return 1
-    assert_contains "$ASSERT_OUTPUT" "this is a standalone copy of redoku" \
+    assert_contains "$ASSERT_OUTPUT" "nothing in this run established where it came from" \
       "standalone: ($_cmd) refused by the shared guard" || return 1
     # Measured, not inferred: with a working fake device, anything that got
     # through would be sitting here.
@@ -3529,7 +3529,7 @@ test_standalone_cli_refuses_local_artifacts() {
   assert_fails "standalone: a planted VERSION marker does not help" -- \
     env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_plant/dl/redoku" \
       uninstall --host nowhere --yes < /dev/null || return 1
-  assert_contains "$ASSERT_OUTPUT" "this is a standalone copy of redoku" \
+  assert_contains "$ASSERT_OUTPUT" "nothing in this run established where it came from" \
     "standalone: the forged kit marker is not believed" || return 1
   assert_no_file "$_w/PWNED_UNINSTALL" "standalone: and still nothing ran" || return 1
   rm -f "$_plant/VERSION"
@@ -3551,7 +3551,7 @@ test_standalone_cli_refuses_local_artifacts() {
     < /dev/null 2>&1)
   set -e
   case $ASSERT_OUTPUT in
-    *"this is a standalone copy of redoku"*)
+    *"nothing in this run established where it came from"*)
       printf 'FAIL: standalone: the guard refused a real kit\n  output: %s\n' "$ASSERT_OUTPUT" >&2
       return 1 ;;
   esac
