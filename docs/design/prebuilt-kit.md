@@ -490,6 +490,11 @@ comparing `VERSION` — one wasted download, still correct.
 
 If `<kit>/<tag>/VERSION` already exists and the game binary there passes
 `is_arm_elf` **[src]**, the download is skipped and the existing tree reused.
+
+**Narrowed in fix round 6.** Reuse also requires that this run has already
+earned trust for the base (§6.5) — a tree we did not download cannot be told
+from one somebody else put there. Where it has not, the fall-through is a
+download, not a refusal.
 `install` is documented as safe to re-run from any state **[src]**; adding a
 network fetch must not weaken that.
 
@@ -575,15 +580,41 @@ refused when `$REPO` is not our own tree — a standalone CLI must pass
 so it is refused in a base other people can write; idempotence survives
 everywhere legitimate.
 
-**The residual, stated rather than implied.** `own` still rests on the CLI's
-own directory not being writable by somebody else. `tree_is_other_writable`
-rejects the case that actually occurs — a world-writable directory such as
-`/tmp`, mode 1777 — but a directory writable by a **group the attacker is in**
-is not detected, and cannot be without an ownership model this script has no
-business implementing. So: **do not run a downloaded CLI out of a directory
-other people can write.** The `bin/`-name check that preceded this was weaker
-still and is gone; it was forgeable by the same actor, since anyone who can
-write `$REPO` can create `$REPO/bin`. **[reasoned]**
+**Reuse mints nothing.** §6.3 skips the download and therefore the checksum,
+so a tree merely sitting at the destination cannot be told from one somebody
+else put there — no property of a directory can establish that this installer
+wrote it. `verified` is therefore set at exactly one line, immediately after
+the `mv` that puts checksum-matched bytes in place, and reuse is permitted
+only where trust was already earned for that base. Everywhere else the
+fall-through is a **download**, not a refusal. §6.3's idempotence was always a
+bandwidth optimisation; it was never a claim about what may be trusted, and it
+is narrower now than it was. **[reasoned]**
+
+**The writability question is asked of the subtree, not the root.** Artifacts
+come from `<root>/device/` and `<root>/build/rm2/bin/`, so a world-writable
+*subdirectory* under a sound root defeated `own` entirely — whoever can write
+`<root>/device` cannot write `<root>/bin/redoku`, which is the whole of `own`'s
+argument. The check walks from each artifact up to the root. It stops there:
+above the root, trustworthiness is what `own` or `verified` established, and
+walking to `/` would condemn every legitimate use of a world-writable `/tmp`,
+the bootstrap's own 0700 directory included.
+
+**The residuals, stated rather than implied.** Two, and neither is closed:
+
+- **Group-writability.** The walk detects *world*-writable directories. A
+  directory writable by a **group the attacker is in** is not detected, and
+  cannot be without an ownership model this script has no business
+  implementing. So: **do not run a downloaded CLI, or point `--kit`, at a
+  directory other people can write.**
+- **TOCTOU.** Between the checksum and the push, someone with write access to
+  a non-sticky `--kit` base can swap the tree. Closing it means holding an open
+  descriptor to every artifact across the device stage, which POSIX `sh` cannot
+  express. It needs write access to a base the user named, and the walk above
+  refuses that base when it is world-writable.
+
+The `bin/`-name check that preceded all of this was weaker still and is gone;
+it was forgeable by the same actor, since anyone who can write `$REPO` can
+create `$REPO/bin`. **[reasoned]**
 
 ## 7. Failure catalogue
 
