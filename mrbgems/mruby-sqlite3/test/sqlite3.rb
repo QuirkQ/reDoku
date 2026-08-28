@@ -69,25 +69,41 @@ end
 # stamped 1970: the binding wrote half a heap address into created_at /
 # updated_at. The correct accessors are mrb_integer / mrb_int_value.
 #
-# The boundary is DERIVED from Integer#size rather than hardcoded, so this
-# exercises the same defect on both builds. Hardcoding the device's 2**30
-# would leave the host asserting nothing: on a 64-bit build every epoch fits
-# as an immediate, which is exactly why the host suite missed this for a
-# whole milestone.
+# Both word sizes' boundaries are asserted, so the host exercises the
+# heap-boxed path at its own 2**62 line instead of asserting nothing: on a
+# 64-bit build every epoch fits as an immediate, which is exactly why the host
+# suite missed this for a whole milestone.
 assert('integers beyond the word-boxing immediate range round-trip') do
   spike_remove_db
   db = SQLite3::Database.open(SPIKE_DB)
   db.exec('CREATE TABLE t (v INTEGER NOT NULL)')
 
-  # MRB_FIXNUM_MAX + 1: the first value mruby has to put on the heap. Both
-  # bounds are built by addition from it so nothing here overflows mrb_int
-  # while being computed.
-  boxed = 1 << (1.size * 8 - 2)
+  # MRB_FIXNUM_MAX + 1 on each word size: the first value mruby has to put on
+  # the heap. Both bounds are built by addition from it so nothing here
+  # overflows mrb_int while being computed.
+  #
+  # Spelled out rather than derived. `1.size` was the derivation and it is a
+  # CRuby-ism: mrbtest has no Integer#size, so this assertion crashed with
+  # `undefined method 'size' for Integer` before it tested anything at all.
+  # (The plain `mruby` binary *does* answer 1.size, which is what made the
+  # derivation look safe.) Deriving it by doubling until the shift turns
+  # negative does not work either — mruby does not wrap on shift overflow,
+  # so that loop never terminates.
+  #
+  # So: 2**62 is this 64-bit host's boxing boundary and is the one that
+  # exercises the heap-boxed path here; 2**30 is the armv7 device's, and is
+  # the line a 2026 epoch (~1.79e9) sits past — the reason saved games came
+  # back stamped 1970. mrbtest only ever runs on the host (the rm2 target is
+  # build_mrbtest_lib_only), so the 2**62 literals never have to fit in a
+  # 32-bit mrb_int.
+  boxed = 1 << 62
   int_max = boxed + (boxed - 1)
+  device_boxed = 1 << 30
 
   [0, 1, -1,
    boxed - 1, boxed, boxed + 1, int_max,
    -boxed, -boxed - 1, -int_max - 1,
+   device_boxed - 1, device_boxed, device_boxed + 1, -device_boxed - 1,
    1787821174 # a 2026 Unix epoch: the value the bug was reported against
   ].each do |v|
     db.execute('INSERT INTO t (v) VALUES (?)', [v])
