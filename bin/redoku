@@ -2069,6 +2069,9 @@ plan_upgrade() { # plan_upgrade <what-current-points-at-now, or empty> <state>
     dangling)
       say "  from    : nothing usable — $KIT_DIR/current points at $_pu_now, which"
       say "            isn't there, so this repairs it" ;;
+    foreign)
+      say "  from    : nothing usable — $KIT_DIR/current points at $_pu_now, which"
+      say "            is there but is not a version of this kit, so this repairs it" ;;
     *)
       say "  from    : nothing usable — $KIT_DIR/current points at $_pu_now, which"
       say "            is there but incomplete, so this repairs it" ;;
@@ -2756,13 +2759,23 @@ cmd_upgrade() {
   _up_ok=0
   _up_state=missing
   if [ -n "$_up_now" ]; then
-    if [ -z "$_up_target" ]; then
-      _up_state=dangling
-    elif kit_tree_is_complete "$_up_target"; then
-      _up_ok=1
-      _up_state=ok
+    if [ -n "$_up_target" ]; then
+      if kit_tree_is_complete "$_up_target"; then
+        _up_ok=1
+        _up_state=ok
+      else
+        _up_state=incomplete
+      fi
+    elif [ -e "$KIT_DIR/current" ]; then
+      # `cd -P` failed but the target IS there, so this is not dangling: the
+      # link points at a regular file, or at a directory that cannot be
+      # searched. Collapsing this into "dangling" is the same mistake guard 5
+      # made, and it produced the same lie — "which isn't there" printed about
+      # a file sitting in plain view. Reachable through the --dry-run plan,
+      # which runs before fetch_kit's own refusal would stop the real thing.
+      _up_state=foreign
     else
-      _up_state=incomplete
+      _up_state=dangling
     fi
   fi
 
@@ -2816,6 +2829,8 @@ cmd_upgrade() {
         say "$KIT_DIR/current was missing — repaired: it now points at $FETCH_TAG" ;;
       dangling)
         say "$KIT_DIR/current was dangling (it pointed at $_up_now, which isn't there) — repaired: it now points at $FETCH_TAG" ;;
+      foreign)
+        say "$KIT_DIR/current pointed at $_up_now, which is there but is not a version of this kit — repaired: it now points at $FETCH_TAG" ;;
       *)
         say "$KIT_DIR/current pointed at $_up_now, which is still there but incomplete — repaired: it now points at $FETCH_TAG" ;;
     esac
