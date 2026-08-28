@@ -2008,6 +2008,13 @@ EOF
       # only remaining guard was a mode bit read off a directory. That is the
       # exact category the invariant abolishes, reintroduced by the line that
       # was supposed to record it.
+      #
+      # Moving it back to the end of the function is now INERT — measured —
+      # because reuse is separately gated on trust already existing, so the
+      # end of the function is unreachable with empty trust. The two fixes are
+      # belt and braces for each other; this one is kept because it is the
+      # honest place for the statement, and because a future edit that
+      # loosens the reuse gate would otherwise silently restore F-1.
       ARTIFACT_TRUST=verified
     fi
 
