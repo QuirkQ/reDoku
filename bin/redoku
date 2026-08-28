@@ -110,6 +110,50 @@ IN_KIT=0
 # Exactly three call sites read it: pick_artifact, find_game, build_decoy.
 KIT_ROOT=$REPO
 
+# ---- the one invariant ---------------------------------------------------
+#
+#   No file is executed, pushed to the device, or read as an installable
+#   artifact unless THIS RUN established that the tree it came from is
+#   trustworthy — and trust is a property of this process, never of the
+#   filesystem.
+#
+# Six code-execution defects in this milestone were the same defect: a path
+# was derived ($REPO from $0, $KIT_ROOT from a download), something about the
+# directory was taken as evidence that its contents were ours — a VERSION
+# file, a directory named bin, a complete-looking tree, "$KIT_ROOT moved so a
+# download must have happened" — and artifacts were then read from it and run,
+# twice as root on the user's tablet. Every one of those inferences is
+# forgeable by whoever can write the directory, because they are all
+# statements ABOUT THE CONTENTS made BY reading the contents. Patching them one
+# at a time produced a seventh.
+#
+# So trust is recorded here, in a variable this process sets and no file can
+# influence, and it is established in exactly two ways:
+#
+#   verified  fetch_kit downloaded this tree and its sha256 matched, in this
+#             run. Provenance from the network plus the checksum, which is the
+#             strongest thing available.
+#   own       the tree IS the one the running CLI is part of — $KIT_ROOT is
+#             $REPO and this very script is $REPO/bin/redoku. The argument is
+#             not that the directory looks right: it is that anyone able to
+#             tamper with it could have tampered with the CLI now executing,
+#             so a gate would be defending a process that is already the
+#             attacker's. That is a real asymmetry rather than another
+#             inference from contents.
+#
+# Empty means neither was established, and every artifact read refuses. The
+# default is the refusing one, so a path that forgets to establish trust fails
+# closed rather than open.
+#
+# One residual, stated rather than implied (design doc §6.4 carries it too):
+# `own` still rests on the CLI's own directory not being writable by somebody
+# else. tree_is_other_writable below rejects the case that actually occurs —
+# a world-writable directory such as /tmp — but a directory writable by a
+# GROUP the attacker is in is not detected, and cannot be without an ownership
+# model this script has no business implementing. Do not run a downloaded CLI
+# out of a directory other people can write.
+ARTIFACT_TRUST=
+
 # Where releases live, derived exactly the way tools/install.sh derives it.
 # The bootstrap and the CLI it hands over to must agree on this, or
 # REDOKU_BASE_URL would only move half of an install — and §8's offline
@@ -567,7 +611,69 @@ confirm() {
 # RUNNING binary fails with ETXTBSY, and truncating a mapped .so can
 # crash its user — a fresh inode has neither problem, so reinstalling
 # over a live install just works.
+# tree_is_other_writable <dir> — can anybody but the owner write here?
+#
+# The one question about a directory that is NOT an inference from its
+# contents, and therefore the only one an attacker who can write it cannot
+# answer for us. /tmp is the case that matters and the case every one of this
+# milestone's exploits used: mode 1777, so `find -perm -0002` reports it.
+# Group-writable is deliberately not treated as hostile — shared group
+# directories are a legitimate way to keep a checkout — which is the residual
+# named at $ARTIFACT_TRUST.
+tree_is_other_writable() {
+  [ -n "$(find "$1" -maxdepth 0 -perm -0002 2>/dev/null)" ]
+}
+
+# establish_own_tree_trust — set ARTIFACT_TRUST=own if, and only if, the tree
+# we are about to read artifacts from is the tree this very script is part of.
+#
+# Two conditions, and the second is the load-bearing one. $KIT_ROOT must still
+# be $REPO (nothing has moved it), and the running script must BE
+# $REPO/bin/redoku — compared as resolved paths, so it is a statement about
+# which file is executing rather than about what a directory is called.
+# `SELF_IN_BIN` asked the second question by NAME, which is why a directory
+# called bin was enough to forge it.
+establish_own_tree_trust() {
+  [ -z "$ARTIFACT_TRUST" ] || return 0
+  [ "$KIT_ROOT" = "$REPO" ] || return 0
+  _eot_self=$(CDPATH='' cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || return 0
+  _eot_repo=$(CDPATH='' cd -P -- "$REPO" 2>/dev/null && pwd -P) || return 0
+  [ "$_eot_self" = "$_eot_repo/bin" ] || return 0
+  ! tree_is_other_writable "$_eot_repo" || return 0
+  ARTIFACT_TRUST=own
+}
+
+# require_trusted_artifacts <what> — the gate. Nothing leaves this machine and
+# nothing is executed without passing it.
+#
+# It is called from push_file, which every one of the twelve files that reach
+# the device goes through, and from build_decoy's `ruby`, which is the only
+# thing this script executes out of a directory it merely found. Placing it at
+# those two choke points rather than at each command is what makes the
+# invariant structural: a future command that pushes a file cannot forget the
+# check, because the check is inside the push.
+#
+# The commands ask earlier as well, to fail with advice instead of this, and
+# that is a courtesy — this one is the guarantee.
+require_trusted_artifacts() {
+  [ -z "$ARTIFACT_TRUST" ] || return 0
+  die "refusing to use $1: nothing in this run established where it came from.
+  A released redoku reads artifacts from a kit it downloaded and checksum-verified,
+  or from the tree it is itself part of ($REPO/bin/redoku). This copy is running
+  from $0, so $KIT_ROOT is a directory it merely found — on a shared machine that
+  is somebody else's to write.
+  Install a kit and use the 'redoku' inside it:
+    sh $0 install --download --kit ~/.redoku
+  Already have one? Run that copy:  ~/.redoku/current/bin/redoku"
+}
+
 push_file() { # push_file <local> <remote-path>
+  # The gate, at the choke point. Everything that reaches the device — the
+  # display server, the client library loaded into xochitl, the game, the
+  # decoy, and the two device scripts run as ROOT there — passes through this
+  # one function, so this is the line that makes the invariant hold rather
+  # than a habit each caller has to remember.
+  require_trusted_artifacts "$1"
   # Belt and braces: every remote path is a hardcoded literal under
   # $REMOTE_DIR — refuse anything else so the rm -f below can never
   # reach outside the redoku directory.
@@ -773,7 +879,15 @@ build_decoy() {
   # checkout, where $REPO/tools/mkdecoy.rb is the file the developer is editing
   # — should ever run it. So the condition that closes the hole is also the one
   # that was semantically right to begin with.
+  # The other choke point, and the only thing this script executes out of a
+  # directory it merely found. The stamp gate stays as the outer condition —
+  # tools/ is not part of the §3.2 kit layout, so a released CLI has no
+  # business running a generator at all — but it was never sufficient on its
+  # own: an UNSTAMPED CLI dropped in a plantable directory ran a planted
+  # mkdecoy.rb on the host, which is the original CRITICAL-1 reached with a
+  # dev build. The trust gate is what actually decides.
   if [ "$KIT_VERSION" = dev ] && [ -f "$REPO/tools/mkdecoy.rb" ]; then
+    require_trusted_artifacts "$REPO/tools/mkdecoy.rb"
     _bd_generated=1
     DECOY_NOTE="regenerated by tools/mkdecoy.rb, same uuid every run"
     command -v ruby >/dev/null 2>&1 || \
@@ -1159,6 +1273,24 @@ fetch_target() {
     FETCH_LAYOUT=kit
     FETCH_TARGET=$KIT_DIR
   else
+    # The checkout layout unpacks into $REPO/build/download/ and, on a later
+    # run, READS BACK from it — so choosing it for a $REPO that is not our own
+    # tree hands a stranger's directory the job of supplying artifacts. That is
+    # V-1's mechanism, and it is reachable with no flags at all: a released CLI
+    # dropped in /tmp/dl running `install --download` treated /tmp as its
+    # checkout, and the next run adopted whatever was planted under it.
+    #
+    # `--kit DIR` is the answer for a standalone CLI, and it is what every
+    # documented standalone flow already passes; this only refuses the shape
+    # where neither a kit nor an own tree says where things belong.
+    establish_own_tree_trust
+    [ -n "$ARTIFACT_TRUST" ] || \
+      die "there is nowhere for this download to go. Without --kit, a download unpacks
+  into <checkout>/build/download/ and is read back from there — but this copy of
+  redoku is running from $0, so that would be $REPO, a directory it merely found
+  rather than a tree of its own.
+  Say where the kit should live:
+    sh $0 install --download --kit ~/.redoku"
     FETCH_LAYOUT=checkout
     FETCH_TARGET=$REPO
   fi
@@ -1229,10 +1361,14 @@ is_version_dir() {
 # version directory that has lost its VERSION file is still unmistakably ours
 # by shape, so a kit in that state is still recognised and still repairable.
 #
-# It must never gate a deletion. Every `rm -rf` in this file goes through
-# is_version_dir, which is the conservative "we certainly named this" test —
-# admitting a directory here only ever decides that the root as a whole is a
-# kit worth operating on.
+# It gates deletions TOGETHER WITH is_version_dir, never instead of it. An
+# earlier version of this header said it must never gate one at all, which was
+# true when it was written and became false the moment the naming test was
+# shown too weak on its own — a directory named after its own VERSION is
+# something people make. Both are required at prune_kit and remove_kit; either
+# alone is enough only to decide that a ROOT is a kit worth operating on.
+# Leaving the old sentence in place two lines above the line it contradicts is
+# the exact trap that cost this milestone two rounds.
 # The evidence is a tag-shaped name holding OUR CLI. device/install.sh was
 # required here too at first, and that was wrong in the direction that matters:
 # §7 exists to repair kits that are damaged, and a version directory which has
@@ -1419,7 +1555,7 @@ EOF
     # `install --download --kit ~/Documents` swept the user's v1.2.3/ and
     # v3.1/ away — the first install having made the root ours, which is all
     # _fk_was_ours can ask about. Structure is what their directories do not
-    # have: our CLI and our device installer inside them.
+    # have: our own bin/redoku inside them.
     #
     # Additional, never a replacement: the conservative direction is still
     # is_version_dir's "we certainly named this". The cost is that a version
@@ -1520,11 +1656,22 @@ fetch_kit() {
     # costs nothing to ask early and means a root we will not finish installing
     # into is one we never write to at all. The repoint keeps its own copy of
     # this check for the states that can only be seen once the tag is known.
-    if [ -L "$_fk_base/current" ] && ! kit_current_is_ours "$_fk_base"; then
-      die "$_fk_base/current is a symlink, but not one this installer wrote: it points
+    # Three shapes, not one. The symlink case was the only one asked early, so
+    # a `current` that is a regular FILE or a DIRECTORY skipped this, got a
+    # version tree unpacked beside it, and was refused only at the repoint —
+    # which is exactly the residue moving the check was meant to stop leaving.
+    if [ -L "$_fk_base/current" ]; then
+      if ! kit_current_is_ours "$_fk_base"; then
+        die "$_fk_base/current is a symlink, but not one this installer wrote: it points
   at $(readlink "$_fk_base/current"), which is not a version directory of this kit.
   Refusing to install here — that would take over a symlink somebody else is
   using. Install somewhere else with --kit DIR, or move it aside first."
+      fi
+    elif [ -e "$_fk_base/current" ]; then
+      die "$_fk_base/current already exists and is not a symlink, so this installer
+  won't replace it. It is meant to point at the version directory that is
+  installed right now. Move it aside and try again, or install somewhere else
+  with --kit DIR."
     fi
   fi
 
@@ -1536,8 +1683,17 @@ fetch_kit() {
   # the tarball has been read — is what keeps the promise there. The repoint
   # below still runs either way: reusing a tree is not the same as leaving
   # 'current' where it was.
+  # Reuse skips the download, and therefore skips the CHECKSUM — so a tree
+  # that is merely sitting at the destination decides what gets pushed to the
+  # device. That is only acceptable where the base is somewhere an attacker
+  # cannot have put it: a released CLI in /tmp/dl found a planted complete tree
+  # at /tmp/build/download/<its own stamp>/redoku, adopted it, and ran its
+  # device/install.sh as root on the tablet, with no download and no checksum
+  # performed at any point. §6.3 buys idempotence; it may not buy it here.
+  _fk_base_open=0
+  ! tree_is_other_writable "$_fk_base" || _fk_base_open=1
   _fk_reuse=0
-  if [ -n "$TAG" ]; then
+  if [ -n "$TAG" ] && [ "$_fk_base_open" -eq 0 ]; then
     _fk_dest=$(kit_dest "$_fk_layout" "$_fk_base" "$TAG")
     if kit_tree_is_complete "$_fk_dest"; then
       say "$TAG is already unpacked at $_fk_dest — reusing it, nothing to download"
@@ -1568,7 +1724,16 @@ fetch_kit() {
     _fk_stage_parent=$(staging_parent "$_fk_layout" "$_fk_base")
     mkdir -p "$_fk_stage_parent" || \
       die "could not create $_fk_stage_parent to download into — check the path and its permissions"
-    clean_stale_staging "$_fk_stage_parent"
+    # Not in a directory other people can write. This is the one recursive
+    # delete in the file that passed through no ownership question at all:
+    # pointed at a stranger's directory it removed their `.staging.*` entries.
+    #
+    # The gate is writability rather than kit_root_is_ours, and the difference
+    # matters: the leftovers this sweep exists for are left by a run that was
+    # SIGKILLed BEFORE it created a version directory, so the root is legitimately
+    # not "ours" yet and an ownership gate would mean never reclaiming them.
+    # Writability asks the question that is actually about somebody else.
+    [ "$_fk_base_open" -eq 1 ] || clean_stale_staging "$_fk_stage_parent"
     FETCH_TMP=$_fk_stage_parent/.staging.$$
     # Same belt-and-braces containment check the destination gets below: this
     # path is handed to rm -rf, by the traps and by the cleanup at the end.
@@ -1720,7 +1885,7 @@ EOF
       # once the tag says the tree already here is the one being installed,
       # and the tree passes the same gate, the bytes have done their job and
       # are discarded.
-      if kit_tree_is_complete "$_fk_dest"; then
+      if [ "$_fk_base_open" -eq 0 ] && kit_tree_is_complete "$_fk_dest"; then
         say "$TAG is already unpacked at $_fk_dest — reusing it"
         say "  (the download was needed only to learn the tag, and is discarded)"
         _fk_reuse=1
@@ -1837,6 +2002,9 @@ EOF
     fi
   fi
 
+  # Provenance, recorded by the one place that can honestly claim it. Reuse
+  # reaches here too, and is allowed only from a base the check above accepted.
+  ARTIFACT_TRUST=verified
   FETCH_TAG=$TAG
   FETCH_TREE=$_fk_dest
 }
@@ -2234,15 +2402,18 @@ plan_upgrade() { # plan_upgrade <what-current-points-at-now, or empty> <state>
 # definition. A dev CLI is a checkout, where $REPO is the working tree and
 # reading it is the whole point.
 require_own_tree() {
-  [ "$KIT_VERSION" != dev ] || return 0
-  in_kit_tree && return 0
-  die "this is a standalone copy of redoku ($0), and the files it would send to
-  the device are not part of it — a release ships the CLI on its own and
-  everything else inside the kit tarball. Whatever is in $KIT_ROOT was put there
-  by something else, so it will not be read.
-  Install a kit and use the 'redoku' that comes with it:
-    sh $0 install --download --kit ~/.redoku
-  Already have one? Run it from there instead, e.g.  ~/.redoku/current/bin/redoku"
+  # Establish trust if this run can, then refuse early with advice if it
+  # cannot. The refusal here is a courtesy, not the guarantee: push_file and
+  # build_decoy hold that line whatever any caller does. This exists so the
+  # user gets a sentence naming the fix, before a device connection is made,
+  # instead of the gate's deeper message three screens later.
+  #
+  # It replaces a `[ "$KIT_VERSION" != dev ] || return 0` that exempted dev
+  # builds outright — which left an unstamped CLI standing alone running
+  # planted code as root on the tablet. The stamp says which version this is;
+  # it never said anything about where this copy may read from.
+  establish_own_tree_trust
+  require_trusted_artifacts "the files under $KIT_ROOT"
 }
 
 require_device_files() {
@@ -2414,15 +2585,15 @@ check_kit_root() {
   #    user's deploy directory whole — `uninstall --self` deleted their symlink,
   #    and `upgrade` wrote a version directory into their project folder and
   #    called their directory "still there but incomplete". So the symlink has
-  #    to point at one of OURS: a resolved target that passes is_version_dir,
+  #    to point at one of OURS: a resolved target that is structurally ours,
   #    or — for the one window §6.2 documents, between the `rm -f` and the
   #    `ln -s` of a repoint, and for the dangling `current` §7 exists to
   #    repair — a target that at least reads like a tag we would have written.
   #    `releases/20240101120000` fails that on the slash alone.
   #
-  #    Arm B, a direct child that passes is_version_dir — named after its own
-  #    VERSION. "Holds a VERSION file" was the earlier test and it was far too
-  #    loose: ~/Documents holding a source tree coolproject-1.2/ with a VERSION
+  #    Arm B, a direct child that is structurally ours — a tag-shaped name
+  #    holding our own bin/redoku. "Holds a VERSION file" was the earlier
+  #    test and it was far too loose: ~/Documents holding a source tree coolproject-1.2/ with a VERSION
   #    at its root passed all five guards and was recursively deleted, while
   #    the plan block called it "every version directory in it".
   #
@@ -2456,7 +2627,7 @@ check_kit_root() {
       # directory has lost its VERSION file. That directory is unmistakably
       # ours by its shape, and admitting it here only decides that the ROOT is
       # a kit — it is never enough to get the directory deleted, because every
-      # deletion goes through is_version_dir alone.
+      # deletion requires is_version_dir AND this predicate together.
       if looks_like_our_tree "$_crk_dir"; then
         _crk_looks=1
         break
@@ -3089,11 +3260,11 @@ cmd_uninstall() {
   # The name the user typed is not the defect here; the sentence is, so
   # cli_name() alone would only have made it read "run redoku from a reDoku
   # checkout".
-  # , not $REPO. They hold the same value here — nothing in this
-  # command moves KIT_ROOT — so this is not the fix for the root-running-as-root
-  # defect (require_own_tree is); it is what makes the invariant true and
-  # greppable: everything that reaches the device comes from $KIT_ROOT. The
-  # $REPO spelling here was the one place that broke it.
+  # $KIT_ROOT, not $REPO. They hold the same value here — nothing in this
+  # command moves KIT_ROOT — so this was never the fix for the
+  # code-running-as-root defect; the trust gate in push_file is. It is what
+  # makes the invariant true and greppable: everything that reaches the device
+  # comes from $KIT_ROOT, and this was the one place that broke it.
   require_own_tree
   if [ ! -f "$KIT_ROOT/device/uninstall.sh" ]; then
     if in_kit_tree; then
@@ -3156,7 +3327,14 @@ cmd_uninstall() {
     # can read the list and stop the run if a name on it surprises you.
     while IFS= read -r _un_v; do
       [ -n "$_un_v" ] || continue
+      # BOTH predicates, matching remove_kit exactly. Listing on
+      # is_version_dir alone made the plan over-list: it promised to delete a
+      # §7-damaged version directory that remove_kit then kept, and the closing
+      # message called that directory "things this installer did not put
+      # there" about a tree this installer plainly made. The plan is a contract
+      # only while it is derived from the same test as the deletion.
       is_version_dir "$_un_v" || continue
+      looks_like_our_tree "$_un_v" || continue
       say "            $_un_v"
     done <<EOF
 $(find "$KIT_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
