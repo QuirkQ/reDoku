@@ -320,6 +320,12 @@ options:
                           DIR/current at it; any kit-mode install also writes
                           the 'redoku' PATH entry for DIR. upgrade and
                           uninstall --self operate on the kit already there.
+                          DIR is a directory redoku OWNS: installing and
+                          upgrading both prune it to two versions, so other
+                          version directories in it are DELETED. Only ones
+                          this installer made — a release-tag name holding its
+                          own bin/redoku — are ever touched, and nothing is
+                          deleted at all in a directory it did not create.
                           The curl|sh installer passes ~/.redoku; set it
                           yourself with --kit or $REDOKU_HOME. Running from
                           inside a kit, it needs no flag at all.
@@ -1286,6 +1292,16 @@ kit_current_is_ours() {
   # so a foreign `current` whose target was gone (a botched Capistrano deploy)
   # skipped the refusal and was silently replaced. Sharing this predicate is
   # what stops the two callers disagreeing about the same symlink.
+  #
+  # The `[ ! -e ]` line below is not pinned by any test on its own, and that is
+  # recorded rather than hidden: with kit_root_holds_only_ours in place, every
+  # shape reaching it is already refused for the other reason — a link to a
+  # file in the root makes that file a child which is not ours, and a link to
+  # anything outside the root carries a slash and fails valid_tag. It is kept
+  # because the two rules are independent and this one states the intent: a
+  # link whose target EXISTS was never dangling, whatever cd -P said.
+  # cmd_upgrade needs the same distinction and there it is NOT redundant — see
+  # its `foreign` state, which is reachable through --dry-run and is pinned.
   [ ! -e "$1/current" ] || return 1
   _kcit=$(readlink "$1/current") || return 1
   valid_tag "$_kcit" || return 1
