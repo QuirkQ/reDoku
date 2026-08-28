@@ -1573,8 +1573,14 @@ test_kit_second_download_repoints_and_prunes() {
     env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.3.0 HOME="$_home" \
       "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
       --no-symlink --host nowhere --yes < /dev/null || return 1
-  assert_contains "$ASSERT_OUTPUT" "already unpacked" \
-    "repoint: a version already on disk is reused, not re-fetched (§6.3)" || return 1
+  # §6.3 changed in fix round 6, deliberately: a tree this run did not
+  # download cannot be told from one somebody else put there, so reuse now
+  # requires trust already earned for the base — which a --kit run from a
+  # checkout CLI never has. The fall-through is a DOWNLOAD, not a refusal, and
+  # what this test is really about is unchanged: the repoint and the prune must
+  # behave the same either way.
+  assert_contains "$ASSERT_OUTPUT" "downloading" \
+    "repoint: re-running an already-installed version re-fetches it (§6.3, round 6)" || return 1
   assert_file "$_kit/v0.2.0/VERSION" \
     "repoint: re-running the current version leaves the rollback target alone" || return 1
   assert_eq "v0.3.0" "$(readlink "$_kit/current")" \
@@ -2412,7 +2418,11 @@ test_kit_reuse_gate_rejects_a_partial_tree() {
     env REDOKU_BASE_URL="file://$_w/release" REDOKU_VERSION=v0.1.0 HOME="$_home" \
       "$KIT_SH" "$REPO/bin/redoku" install --download --kit "$_kit" \
       --no-symlink --host nowhere --yes < /dev/null || return 1
-  assert_contains "$ASSERT_OUTPUT" "already unpacked" "reuse gate: an intact tree is reused" || return 1
+  # Round 6: an intact tree in a base this run has not earned trust for is
+  # re-downloaded rather than adopted, and the message says which of the two
+  # reasons applied rather than calling a complete tree incomplete.
+  assert_contains "$ASSERT_OUTPUT" "nothing in this run vouches for where it came from" \
+    "reuse gate: an intact tree in an unvouched base is replaced, honestly" || return 1
 
   # Third: the shape an interrupted copy leaves — VERSION and the head of the
   # game binary present, everything past it gone. The ARM gate still passes,
@@ -2478,6 +2488,12 @@ test_kit_staging_shaped_tag_is_refused() {
   assert_no_file "$_kit_b/current" "staging-shaped tag: current was not repointed" || return 1
 }
 
+# NOT ROOT-SAFE, by construction: the provocation is chmod 555 on the
+# destination's parent, and root ignores DAC permissions, so as root the `mv`
+# succeeds and this test fails on its own "it is the mv that failed" assertion.
+# CI runs as an unprivileged user and it is green there; a root container will
+# show three failures across the shells and they are this, not a regression.
+#
 # Fix round 2, IMPORTANT D: the `mv`-failure branch, which the previous round
 # claimed had no portable way to be provoked. It does: chmod 555 on the
 # destination's PARENT gives EACCES, while `mkdir -p` on a directory that
@@ -2587,10 +2603,13 @@ test_kit_step4_reuses_a_complete_tree() {
   # Second run: the tag still has to be downloaded to be learned, but the tree
   # it names is already here and complete, so the tree must survive untouched.
   _run "second install ends at the connect step" || return 1
-  assert_file "$_kit/v0.1.0/MARKER" \
-    "step-4 reuse: the existing tree was reused, not deleted and re-unpacked" || return 1
-  assert_contains "$ASSERT_OUTPUT" "reusing it" \
-    "step-4 reuse: the run says it reused the tree" || return 1
+  # Round 6: the tree is REPLACED by the freshly verified one, because
+  # nothing in this run vouches for the one on disk. The marker goes with it —
+  # that is the point, not a regression.
+  assert_no_file "$_kit/v0.1.0/MARKER" \
+    "step-4: an unvouched tree is replaced by the downloaded one" || return 1
+  assert_contains "$ASSERT_OUTPUT" "nothing in this run vouches for where it came from" \
+    "step-4: and the run says so, rather than calling a complete tree incomplete" || return 1
   # The downloaded tree really was discarded rather than moved somewhere. An
   # unguarded `mv` onto the existing directory would not delete anything — it
   # would move the staging tree INSIDE it, leaving <tag>/redoku/ and a kit
@@ -3551,11 +3570,14 @@ test_artifact_trust_fails_closed() {
     "trust gate: (c) nothing reached the device" || return 1
   chmod 755 "$_open"
 
-  # (d) a tree that HAS a bin/ — but the CLI is not the thing in it. Without
-  # this the "is this my tree" comparison is not pinned: cases (b) and (c) both
-  # fail at resolving $REPO/bin at all, so a mutation that deletes only the
-  # comparison still refuses them and survives. Here $REPO/bin resolves fine
-  # and only the identity of the running file separates trusted from not.
+  # (d) a tree that HAS a bin/ — but the CLI is not the thing in it. This is
+  # what pins the identity comparison, and the case it rescues is (b), not (c):
+  # in (b) $REPO is the parent of the aside directory and has no bin/ at all,
+  # so a mutation deleting only the comparison still refuses it through the
+  # failed resolution. (c) pins a different line — the writability check — and
+  # would still refuse with the comparison gone. Here $REPO/bin resolves fine
+  # and is not world-writable, so the identity of the running file is the only
+  # thing separating trusted from not.
   _side=$_w/side
   mkdir -p "$_side/notbin"
   cp -R "$_kit/v0.1.0/." "$_side/" || \
@@ -3572,6 +3594,41 @@ test_artifact_trust_fails_closed() {
     "trust gate: (d) running from <tree>/notbin is not running from <tree>/bin" || return 1
   assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
     "trust gate: (d) nothing reached the device" || return 1
+
+  # (e) the tree is ours and its root is sound — but ONE SUBDIRECTORY under it
+  # is world-writable, and that is where the artifacts come from. Asking the
+  # writability question of the root alone missed this completely: whoever can
+  # write <tree>/device cannot write <tree>/bin/redoku, so `own`'s whole
+  # argument ("they could have replaced the CLI") does not reach them.
+  # Reproduced inside a legitimate developer checkout before this case existed.
+  _sub=$_w/subexposed
+  mkdir -p "$_sub"
+  cp -R "$_kit/v0.1.0/." "$_sub/" || \
+    die "test_artifact_trust_fails_closed: seeding the sub-exposed tree failed"
+  chmod 1777 "$_sub/device"
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  assert_fails "trust gate: (e) a world-writable device/ is refused" -- \
+    env PATH="$_w/fakebin:$PATH" HOME="$_home" "$KIT_SH" "$_sub/bin/redoku" \
+      uninstall --host nowhere --yes < /dev/null || return 1
+  # Needle inside one physical line: the message wraps between "is writable"
+  # and "by other users", so the obvious phrase spans the break.
+  assert_contains "$ASSERT_OUTPUT" "a directory on the way to it is writable" \
+    "trust gate: (e) refused for the directory the file actually came from" || return 1
+  assert_eq 0 "$(find "$_w/device-root" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+    "trust gate: (e) nothing reached the device" || return 1
+  chmod 755 "$_sub/device"
+
+  # (f) the control for (e): the same tree with sane permissions works, so (e)
+  # is refusing the exposure and not the shape.
+  rm -rf "$_w/device-root"
+  mkdir -p "$_w/device-root"
+  set +e
+  ASSERT_OUTPUT=$(env PATH="$_w/fakebin:$PATH" HOME="$_home" \
+    "$KIT_SH" "$_sub/bin/redoku" uninstall --host nowhere --yes < /dev/null 2>&1)
+  set -e
+  assert_file "$_w/device-root/uninstall.sh" \
+    "trust gate: (f) the same tree with sane permissions still reaches the device" || return 1
 }
 
 # Final verification V-1 (critical): §6.3's reuse gate adopted an
@@ -3648,9 +3705,16 @@ test_install_download_refuses_a_planted_tree() {
   # directory holding a planted <tag>/ tree. Here the run is allowed to
   # proceed — the user named the root — but reuse must be refused, so what
   # reaches the device is the DOWNLOADED tree and not the plant.
+  # Mode 0755, NOT 1777. The earlier version of this case set the base
+  # world-writable, which meant it only ever exercised the one spelling the
+  # guard happened to catch — an attacker's directory is 0755 like everybody
+  # else's, and with the base merely populated by someone else the reuse gate
+  # fired, stamped the tree `verified` without a byte downloaded, and ran its
+  # device/install.sh as root. A test that tries only the mode you already
+  # handle is not a test of the guard.
   _shared=$_w/shared
   mkdir -p "$_shared/v0.9.9"
-  chmod 1777 "$_shared"
+  chmod 0755 "$_shared"
   tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_w/unpack" 2>/dev/null || {
     mkdir -p "$_w/unpack"
     tar -xzf "$_w/out/redoku-rm2.tar.gz" -C "$_w/unpack" || \
