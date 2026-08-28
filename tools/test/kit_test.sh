@@ -3038,13 +3038,12 @@ test_kit_uninstall_self_removes_kit_and_wrapper() {
 
   assert_no_file "$_kit" "self removal: the kit root is gone" || return 1
   assert_no_file "$_bin/redoku" "self removal: the PATH entry is gone" || return 1
-  # …and nothing beyond what the plan named: the bin directory itself is not
-  # ours to delete.
-  assert_file "$_bin" "self removal: the bin directory itself was not removed" 2>/dev/null || {
-    [ -d "$_bin" ] || {
-      printf 'FAIL: self removal: the bin directory itself was removed\n' >&2
-      return 1
-    }
+  # …and nothing beyond what the plan named. The bin directory is somebody's
+  # ~/.local/bin, holding whatever else they keep there; only the one file
+  # inside it was ever ours.
+  [ -d "$_bin" ] || {
+    printf 'FAIL: self removal: the bin directory itself was removed, not just our file in it\n' >&2
+    return 1
   }
 }
 
