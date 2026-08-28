@@ -2714,8 +2714,19 @@ cmd_play() {
 }
 
 cmd_uninstall() {
-  [ -f "$REPO/device/uninstall.sh" ] || \
-    die "device/uninstall.sh not found next to me — run bin/redoku from a reDoku checkout"
+  # The same two answers require_device_files gives, for the same reason and in
+  # the same shape: this file is reached two ways, and "go and find a checkout"
+  # is wrong advice to somebody running from a kit — they may well not have
+  # one, and what has actually happened is that their kit arrived incomplete.
+  # The name the user typed is not the defect here; the sentence is, so
+  # cli_name() alone would only have made it read "run redoku from a reDoku
+  # checkout".
+  if [ ! -f "$REPO/device/uninstall.sh" ]; then
+    if in_kit_tree; then
+      die "device/uninstall.sh not found in $REPO — this kit is incomplete or corrupt, re-download it with:  $(refetch_hint)"
+    fi
+    die "device/uninstall.sh not found next to me — run $(cli_name) from a reDoku checkout"
+  fi
 
   # Everything --self needs to know is worked out HERE, before the plan block
   # and therefore before the confirmation, because §5.3's rule is that nothing
@@ -2880,7 +2891,12 @@ kit_status_line() {
   # resolve_kit_root reports this by return code rather than by die().
   if ! resolve_kit_root; then
     printf 'kit      : none — %s was unpacked by hand, not installed\n' "$REPO"
-    printf '           install it with: redoku install --download --kit ~/.redoku\n'
+    # The FULL path, matching resolve_kit_root's refusal for this identical
+    # state and for its reason: in a hand-unpacked tree there is no kit, so
+    # there is no PATH wrapper either, and neither `redoku` nor `bin/redoku`
+    # names anything the reader can run. The one spelling that works is the
+    # one they already used to get here.
+    printf '           install it with: sh %s/bin/redoku install --download --kit ~/.redoku\n' "$REPO"
     return 0
   fi
   _ksl_shown=$KIT_DIR/current
